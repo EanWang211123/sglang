@@ -153,6 +153,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        
+        # Timing variables
+        self._last_draft_time = 0.0
+        self._last_draft_extend_time = 0.0
 
     def init_token_map(self):
         # Load hot token ids
@@ -286,6 +290,10 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
+        # Timing: Draft forward
+        torch.cuda.synchronize()
+        draft_start = time.perf_counter()
+        
         # Run draft
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
@@ -302,6 +310,10 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+        
+        torch.cuda.synchronize()
+        draft_end = time.perf_counter()
+        self._last_draft_time = draft_end - draft_start
 
         if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -518,6 +530,10 @@ class EagleDraftWorker(BaseDraftWorker):
         if forward_batch.spec_info.accept_length is None:
             forward_batch.spec_info.accept_length = batch_result.accept_lens
 
+        # Timing: Draft extend forward
+        torch.cuda.synchronize()
+        draft_extend_start = time.perf_counter()
+        
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -531,6 +547,10 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
+        
+        torch.cuda.synchronize()
+        draft_extend_end = time.perf_counter()
+        self._last_draft_extend_time = draft_extend_end - draft_extend_start
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -600,6 +620,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        
+        # Timing variables
+        self._last_verify_time = 0.0
 
     @property
     def target_worker(self):
@@ -655,6 +678,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+            
+            # Print timing summary (only on rank 0)
+            if self.tp_rank == 0:
+                total_time = (self.draft_worker._last_draft_time + 
+                             self._last_verify_time + 
+                             self.draft_worker._last_draft_extend_time)
+                logger.info(
+                    f"[EAGLE3 Step Timing] draft={self.draft_worker._last_draft_time*1000:.2f}ms, "
+                    f"verify={self._last_verify_time*1000:.2f}ms, "
+                    f"draft_extend={self.draft_worker._last_draft_extend_time*1000:.2f}ms, "
+                    f"total={total_time*1000:.2f}ms"
+                )
+            
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -707,6 +743,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input.retrive_next_token.shape
             ).cpu()
 
+        # Timing: Verify forward
+        torch.cuda.synchronize()
+        verify_start = time.perf_counter()
+        
         # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
@@ -714,6 +754,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        
+        torch.cuda.synchronize()
+        verify_end = time.perf_counter()
+        self._last_verify_time = verify_end - verify_start
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding

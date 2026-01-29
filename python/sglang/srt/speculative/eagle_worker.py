@@ -206,6 +206,11 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        
+        # Timing variables
+        self._last_draft_time = 0.0
+        self._last_verify_time = 0.0
+        self._last_draft_extend_time = 0.0
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -320,6 +325,16 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+            
+            # Print timing summary (only on rank 0)
+            if self.tp_rank == 0:
+                total_time = self._last_draft_time + self._last_verify_time + self._last_draft_extend_time
+                logger.info(
+                    f"[EAGLE Step Timing] draft={self._last_draft_time*1000:.2f}ms, "
+                    f"verify={self._last_verify_time*1000:.2f}ms, "
+                    f"draft_extend={self._last_draft_extend_time*1000:.2f}ms, "
+                    f"total={total_time*1000:.2f}ms"
+                )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -545,6 +560,11 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+        
+        # Timing: Draft forward
+        torch.cuda.synchronize()
+        draft_start = time.perf_counter()
+        
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -561,6 +581,10 @@ class EAGLEWorker(TpModelWorker):
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
+        
+        torch.cuda.synchronize()
+        draft_end = time.perf_counter()
+        self._last_draft_time = draft_end - draft_start
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -704,10 +728,19 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
+        # Timing: Verify forward
+        torch.cuda.synchronize()
+        verify_start = time.perf_counter()
+        
         # Forward
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
+        
+        torch.cuda.synchronize()
+        verify_end = time.perf_counter()
+        self._last_verify_time = verify_end - verify_start
+        
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -938,6 +971,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
 
+        # Timing: Draft extend forward
+        torch.cuda.synchronize()
+        draft_extend_start = time.perf_counter()
+        
         # Run
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -962,6 +999,10 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
+        
+        torch.cuda.synchronize()
+        draft_extend_end = time.perf_counter()
+        self._last_draft_extend_time = draft_extend_end - draft_extend_start
 
         if self.enable_nan_detection:
             detect_nan(logits_output)

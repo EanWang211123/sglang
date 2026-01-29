@@ -1,4 +1,5 @@
 import logging
+import time
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -49,6 +50,10 @@ class DFlashWorker:
 
         self._warned_forced_greedy = False
         self._logged_first_verify = False
+        
+        # Timing variables
+        self._last_draft_time = 0.0
+        self._last_verify_time = 0.0
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -368,10 +373,18 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
+            # Timing: Draft forward
+            torch.cuda.synchronize()
+            draft_start = time.perf_counter()
+            
             with torch.inference_mode():
                 draft_hidden = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
+            
+            torch.cuda.synchronize()
+            draft_end = time.perf_counter()
+            draft_time = draft_end - draft_start
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -413,6 +426,9 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        
+        # Store draft time for logging
+        self._last_draft_time = draft_time
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -783,9 +799,18 @@ class DFlashWorker:
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
 
+        # Timing: Verify forward
+        torch.cuda.synchronize()
+        verify_start = time.perf_counter()
+        
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
+        
+        torch.cuda.synchronize()
+        verify_end = time.perf_counter()
+        self._last_verify_time = verify_end - verify_start
+        
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -818,6 +843,15 @@ class DFlashWorker:
                 accept_length_per_req_cpu,
             )
             self._logged_first_verify = True
+        
+        # Print timing summary (only on rank 0)
+        if self.tp_rank == 0:
+            total_time = self._last_draft_time + self._last_verify_time
+            logger.info(
+                f"[DFLASH Step Timing] draft={self._last_draft_time*1000:.2f}ms, "
+                f"verify={self._last_verify_time*1000:.2f}ms, "
+                f"total={total_time*1000:.2f}ms"
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output,
