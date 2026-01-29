@@ -157,6 +157,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Timing variables
         self._last_draft_time = 0.0
         self._last_draft_extend_time = 0.0
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
 
     def init_token_map(self):
         # Load hot token ids
@@ -291,8 +292,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Timing: Draft forward
-        torch.cuda.synchronize()
-        draft_start = time.perf_counter()
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            draft_start = time.perf_counter()
         
         # Run draft
         if can_cuda_graph:
@@ -311,9 +313,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
         
-        torch.cuda.synchronize()
-        draft_end = time.perf_counter()
-        self._last_draft_time = draft_end - draft_start
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            draft_end = time.perf_counter()
+            self._last_draft_time = draft_end - draft_start
 
         if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -531,8 +534,9 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.spec_info.accept_length = batch_result.accept_lens
 
         # Timing: Draft extend forward
-        torch.cuda.synchronize()
-        draft_extend_start = time.perf_counter()
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            draft_extend_start = time.perf_counter()
         
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -548,9 +552,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
         
-        torch.cuda.synchronize()
-        draft_extend_end = time.perf_counter()
-        self._last_draft_extend_time = draft_extend_end - draft_extend_start
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            draft_extend_end = time.perf_counter()
+            self._last_draft_extend_time = draft_extend_end - draft_extend_start
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -623,6 +628,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         
         # Timing variables
         self._last_verify_time = 0.0
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
 
     @property
     def target_worker(self):
@@ -679,8 +685,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     model_worker_batch, batch_output
                 )
             
-            # Print timing summary (only on rank 0)
-            if self.tp_rank == 0:
+            # Print timing summary (only on rank 0 and when enabled)
+            if self.tp_rank == 0 and self._enable_timing_logging:
                 total_time = (self.draft_worker._last_draft_time + 
                              self._last_verify_time + 
                              self.draft_worker._last_draft_extend_time)
@@ -744,8 +750,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Timing: Verify forward
-        torch.cuda.synchronize()
-        verify_start = time.perf_counter()
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            verify_start = time.perf_counter()
         
         # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
@@ -755,9 +762,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             skip_attn_backend_init=True,
         )
         
-        torch.cuda.synchronize()
-        verify_end = time.perf_counter()
-        self._last_verify_time = verify_end - verify_start
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            verify_end = time.perf_counter()
+            self._last_verify_time = verify_end - verify_start
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding

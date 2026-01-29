@@ -1779,7 +1779,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise RuntimeError("This should not happen")
             else:
                 capture_forward_mode = ForwardMode.TARGET_VERIFY
-                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+                # For DFLASH decoupled mode: use verify_token_num for target worker
+                if (
+                    self.spec_algorithm.is_dflash()
+                    and self.server_args.speculative_verify_token_num is not None
+                ):
+                    num_tokens_per_bs = self.server_args.speculative_verify_token_num
+                else:
+                    num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL

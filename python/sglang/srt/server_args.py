@@ -360,6 +360,7 @@ class ServerArgs:
     gc_warning_threshold_secs: float = 0.0
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    enable_speculative_timing_logging: bool = False
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -428,6 +429,7 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_verify_token_num: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2177,6 +2179,28 @@ class ServerArgs:
                     )
                 self.speculative_num_draft_tokens = int(inferred_block_size)
 
+            # Validate speculative_verify_token_num for DFLASH (after draft_tokens is inferred)
+            if self.speculative_verify_token_num is not None:
+                if int(self.speculative_verify_token_num) <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-verify-token-num to be positive, "
+                        f"got {self.speculative_verify_token_num}."
+                    )
+                # At this point, speculative_num_draft_tokens is guaranteed to be set
+                if int(self.speculative_verify_token_num) > int(
+                    self.speculative_num_draft_tokens
+                ):
+                    raise ValueError(
+                        "DFLASH requires --speculative-verify-token-num <= --speculative-num-draft-tokens. "
+                        f"Got verify={self.speculative_verify_token_num}, draft={self.speculative_num_draft_tokens}. "
+                        "The verify token count cannot exceed the draft token count."
+                    )
+                logger.info(
+                    "DFLASH decoupled mode enabled: draft_tokens=%d, verify_tokens=%d",
+                    self.speculative_num_draft_tokens,
+                    self.speculative_verify_token_num,
+                )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
@@ -3326,6 +3350,12 @@ class ServerArgs:
             help="Enable per request time stats logging",
         )
         parser.add_argument(
+            "--enable-speculative-timing-logging",
+            action="store_true",
+            default=ServerArgs.enable_speculative_timing_logging,
+            help="Enable timing logs for speculative decoding (draft/verify/draft_extend phases)",
+        )
+        parser.add_argument(
             "--kv-events-config",
             type=str,
             default=None,
@@ -3680,6 +3710,14 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-verify-token-num",
+            type=int,
+            help="DFLASH only. Number of tokens to send to target model for verification. "
+                 "If None, uses speculative_num_draft_tokens. Must be <= speculative_num_draft_tokens. "
+                 "Example: draft 16 tokens but verify only 8 tokens for better performance.",
+            default=ServerArgs.speculative_verify_token_num,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

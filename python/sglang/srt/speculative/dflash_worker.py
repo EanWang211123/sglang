@@ -54,6 +54,7 @@ class DFlashWorker:
         # Timing variables
         self._last_draft_time = 0.0
         self._last_verify_time = 0.0
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -120,16 +121,44 @@ class DFlashWorker:
                     model_block_size,
                 )
 
+        # Initialize verify_token_num (number of tokens to actually verify)
+        # This allows decoupling draft length from verify length
+        if server_args.speculative_verify_token_num is not None:
+            self.verify_token_num = int(server_args.speculative_verify_token_num)
+            if self.verify_token_num > self.block_size:
+                raise ValueError(
+                    f"DFLASH verify_token_num ({self.verify_token_num}) must be <= "
+                    f"block_size ({self.block_size}). Cannot verify more tokens than drafted."
+                )
+            if self.verify_token_num <= 0:
+                raise ValueError(
+                    f"DFLASH verify_token_num must be positive, got {self.verify_token_num}."
+                )
+        else:
+            # Default: verify all drafted tokens
+            self.verify_token_num = self.block_size
+
+        if self.tp_rank == 0 and self.verify_token_num != self.block_size:
+            logger.info(
+                "DFLASH decoupled mode: draft_tokens=%s, verify_tokens=%s. "
+                "Will draft %s tokens but only verify first %s tokens.",
+                self.block_size,
+                self.verify_token_num,
+                self.block_size,
+                self.verify_token_num,
+            )
+
         self._mask_token = resolve_dflash_mask_token(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._mask_token_id = self._resolve_mask_token_id(mask_token=self._mask_token)
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, verify_token_num=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
+                self.verify_token_num,
             )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s",
@@ -149,10 +178,12 @@ class DFlashWorker:
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        # Draft spec info uses block_size (full draft length) for draft model forward
+        # The verify_token_num is only used when creating verify_input for target model
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
-            draft_token_num=int(self.block_size),
+            draft_token_num=int(self.block_size),  # Draft forward always uses full block_size
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
@@ -374,17 +405,19 @@ class DFlashWorker:
             )
 
             # Timing: Draft forward
-            torch.cuda.synchronize()
-            draft_start = time.perf_counter()
+            if self._enable_timing_logging:
+                torch.cuda.synchronize()
+                draft_start = time.perf_counter()
             
             with torch.inference_mode():
                 draft_hidden = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
             
-            torch.cuda.synchronize()
-            draft_end = time.perf_counter()
-            draft_time = draft_end - draft_start
+            if self._enable_timing_logging:
+                torch.cuda.synchronize()
+                draft_end = time.perf_counter()
+                draft_time = draft_end - draft_start
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -397,12 +430,21 @@ class DFlashWorker:
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+        
+        # Truncate draft tokens and positions to verify_token_num if decoupled mode is enabled
+        if self.verify_token_num < self.block_size:
+            # Only send the first verify_token_num tokens to target model for verification
+            draft_tokens_verify = draft_tokens[:, :self.verify_token_num].contiguous()
+            positions_verify = positions_2d[:, :self.verify_token_num].reshape(-1)
+        else:
+            # Default mode: verify all drafted tokens
+            draft_tokens_verify = draft_tokens
+            positions_verify = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=draft_tokens_verify.reshape(-1),
+            positions=positions_verify,
+            draft_token_num=self.verify_token_num,  # Use verify_token_num instead of block_size
         )
         backend_name = type(self.model_runner.attn_backend).__name__
         skip_custom_mask = backend_name in {
@@ -428,7 +470,8 @@ class DFlashWorker:
         batch.return_hidden_states = False
         
         # Store draft time for logging
-        self._last_draft_time = draft_time
+        if self._enable_timing_logging:
+            self._last_draft_time = draft_time
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -800,16 +843,18 @@ class DFlashWorker:
         assert isinstance(verify_input, DFlashVerifyInput)
 
         # Timing: Verify forward
-        torch.cuda.synchronize()
-        verify_start = time.perf_counter()
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            verify_start = time.perf_counter()
         
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
         
-        torch.cuda.synchronize()
-        verify_end = time.perf_counter()
-        self._last_verify_time = verify_end - verify_start
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            verify_end = time.perf_counter()
+            self._last_verify_time = verify_end - verify_start
         
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -844,8 +889,8 @@ class DFlashWorker:
             )
             self._logged_first_verify = True
         
-        # Print timing summary (only on rank 0)
-        if self.tp_rank == 0:
+        # Print timing summary (only on rank 0 and when enabled)
+        if self.tp_rank == 0 and self._enable_timing_logging:
             total_time = self._last_draft_time + self._last_verify_time
             logger.info(
                 f"[DFLASH Step Timing] draft={self._last_draft_time*1000:.2f}ms, "

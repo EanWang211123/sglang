@@ -71,9 +71,19 @@ class XPUAttentionBackend(AttentionBackend):
             )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        # For DFLASH decoupled mode: use verify_token_num for target worker  
+        if (
+            model_runner.server_args.speculative_algorithm == "DFLASH"
+            and not model_runner.is_draft_worker
+            and model_runner.server_args.speculative_verify_token_num is not None
+        ):
+            self.speculative_num_draft_tokens = (
+                model_runner.server_args.speculative_verify_token_num
+            )
+        else:
+            self.speculative_num_draft_tokens = (
+                model_runner.server_args.speculative_num_draft_tokens
+            )
         self.speculative_step_id = speculative_step_id
 
         # Local attention settings

@@ -288,9 +288,21 @@ class CudaGraphRunner:
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                self.model_runner.server_args.speculative_num_draft_tokens
-            )
+            # For DFLASH decoupled mode: distinguish between draft worker and target worker
+            # - Draft worker: always uses full block_size for drafting
+            # - Target worker: uses verify_token_num for verification (if specified)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and not self.model_runner.is_draft_worker  # Only target worker uses verify_token_num
+                and self.model_runner.server_args.speculative_verify_token_num is not None
+            ):
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_verify_token_num
+                )
+            else:
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -959,7 +971,8 @@ class CudaGraphRunner:
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                # Use num_tokens_per_bs which respects speculative_verify_token_num for decoupled mode
+                draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or skip_custom_mask)
