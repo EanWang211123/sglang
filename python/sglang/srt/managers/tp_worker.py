@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -298,6 +299,10 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+        
+        # Timing variables for non-speculative decoding
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
+        self._last_forward_time = 0.0
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -445,11 +450,22 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            # Timing: Forward pass (non-speculative decoding)
+            if self._enable_timing_logging and not self.enable_spec:
+                torch.cuda.synchronize()
+                forward_start = time.perf_counter()
+            
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            
+            if self._enable_timing_logging and not self.enable_spec:
+                torch.cuda.synchronize()
+                forward_end = time.perf_counter()
+                self._last_forward_time = forward_end - forward_start
+            
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -497,6 +513,12 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
+
+            # Print timing summary (only on rank 0, when enabled, and not using speculative decoding)
+            if self.tp_rank == 0 and self._enable_timing_logging and not self.enable_spec:
+                logger.info(
+                    f"[Normal Forward Timing] forward={self._last_forward_time*1000:.2f}ms"
+                )
 
             return batch_result
         else:

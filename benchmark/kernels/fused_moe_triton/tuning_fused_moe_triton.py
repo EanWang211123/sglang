@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 import ray
 import torch
 import triton
+
 from common_utils import (
     BenchmarkConfig,
     get_config_filename,
@@ -28,6 +29,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -195,7 +197,9 @@ def benchmark_config(
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
 
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, model_path: str) -> None:
+        # Each Ray worker runs in its own process; ensure global server args are set.
+        set_global_server_args_for_scheduler(ServerArgs(model_path=model_path))
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
@@ -312,6 +316,10 @@ class BenchmarkWorker:
 
 
 def main(args: argparse.Namespace):
+    # Set global server args for tuning mode (independent of server)
+    # This is needed because get_moe_configs() expects global server args to be set
+    set_global_server_args_for_scheduler(ServerArgs(model_path=args.model))
+
     print(args)
 
     model_config = get_model_config(
@@ -337,7 +345,8 @@ def main(args: argparse.Namespace):
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+    print(f"Number of GPUs: {num_gpus}")
+    workers = [BenchmarkWorker.remote(args.seed, args.model) for _ in range(num_gpus)]
 
     def _distribute(method: str, inputs: List[Any]) -> List[Any]:
         outputs = []
