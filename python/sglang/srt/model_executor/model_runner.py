@@ -394,6 +394,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model_config.hf_config, "num_hidden_layers", None
             )
             if target_num_layers is None:
+                # VLM (e.g. Qwen3.5) has num_hidden_layers in text_config, not top-level
+                target_num_layers = self.model_config.num_hidden_layers
+            if target_num_layers is None:
                 raise ValueError(
                     "DFLASH requires target num_hidden_layers in config. "
                     f"Got target={target_num_layers}."

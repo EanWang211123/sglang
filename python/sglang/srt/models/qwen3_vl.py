@@ -1277,6 +1277,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -1284,6 +1288,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)

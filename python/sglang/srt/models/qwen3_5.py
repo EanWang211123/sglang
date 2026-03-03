@@ -352,7 +352,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -543,7 +542,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
         self.alt_stream = alt_stream
@@ -670,6 +668,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
+        # For DFlash / EAGLE3 hidden-state capture
+        self.layers_to_capture = []
+
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
         # Embedding layer
@@ -733,7 +734,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Pass through decoder layers
+        aux_hidden_states = []
         for layer_idx in range(len(self.layers)):
+            if layer_idx in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
@@ -772,7 +779,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1048,6 +1058,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        """DFlash aux hidden capture. Qwen3.5 uses 0-based layer indices."""
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.model.layers_to_capture = list(layer_ids)
+
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -1139,6 +1157,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        """DFlash aux hidden capture. Qwen3.5 uses 0-based layer indices."""
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.model.layers_to_capture = list(layer_ids)
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
