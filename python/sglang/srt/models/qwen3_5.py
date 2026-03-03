@@ -1059,12 +1059,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
-        """DFlash aux hidden capture. Qwen3.5 uses 0-based layer indices."""
+        """DFlash aux hidden capture. SGLang captures before each layer (input =
+        output of prev layer). To get output of layer i, capture before layer i+1."""
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        self.model.layers_to_capture = list(layer_ids)
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -1159,12 +1160,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
-        """DFlash aux hidden capture. Qwen3.5 uses 0-based layer indices."""
+        """DFlash aux hidden capture. SGLang captures before each layer (input =
+        output of prev layer). To get output of layer i, capture before layer i+1."""
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        self.model.layers_to_capture = list(layer_ids)
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
