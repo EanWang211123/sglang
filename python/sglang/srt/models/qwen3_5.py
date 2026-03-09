@@ -30,7 +30,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_pp_indices
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -59,6 +59,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -352,6 +353,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -542,6 +544,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
         self.alt_stream = alt_stream
@@ -681,6 +684,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
             )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
@@ -704,12 +709,35 @@ class Qwen3_5ForCausalLM(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        pp_rank = self.pp_group.rank_in_group
+        pp_size = self.pp_group.world_size
+        num_layers = config.num_hidden_layers
+        self._start_layer, self._end_layer = (
+            get_pp_indices(
+                num_layers,
+                pp_rank,
+                pp_size,
+            )
+            if pp_rank is not None and pp_size is not None
+            else (0, num_layers)
+        )
+
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
-    def get_input_embeddings(self) -> nn.Embedding:
+    def get_input_embeddings(self):
         return self.embed_tokens
+
+    @property
+    def start_layer(self) -> int:
+        return self._start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self._end_layer
 
     @torch.no_grad()
     def forward(
@@ -735,12 +763,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Pass through decoder layers
         aux_hidden_states = []
-        for layer_idx in range(len(self.layers)):
-            if layer_idx in self.layers_to_capture:
+        for layer_idx in range(self.start_layer, self.end_layer):
+            if hasattr(self, 'layers_to_capture') and layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
-
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
@@ -1055,8 +1082,23 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+    @property
+    def start_layer(self) -> int:
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self) -> int:
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None)
+        return int(getattr(cfg, "num_hidden_layers", 0))
+
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         """DFlash aux hidden capture. SGLang captures before each layer (input =
@@ -1068,10 +1110,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if self.pp_group.is_first_rank and embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if self.pp_group.is_last_rank and head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -1157,7 +1201,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         """DFlash aux hidden capture. SGLang captures before each layer (input =
@@ -1169,10 +1215,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if self.pp_group.is_first_rank and embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if self.pp_group.is_last_rank and head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
