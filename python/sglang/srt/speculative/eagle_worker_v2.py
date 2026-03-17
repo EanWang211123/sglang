@@ -42,6 +42,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_new_verified_id,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.spec_decode_stats_recorder import SpecDecodeStatsRecorder
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -623,6 +624,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.tp_rank = tp_rank
+
+        # Stats recorder (activated via SGLANG_SPEC_STATS_DIR env-var). Only rank-0 writes.
+        self._stats_recorder: Optional[SpecDecodeStatsRecorder] = (
+            SpecDecodeStatsRecorder.from_env() if self.tp_rank == 0 else None
+        )
+
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -729,6 +736,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream()
         )
 
+        # Capture sequence lengths before verify (for stats recorder).
+        stats_seq_lens_before_verify: Optional[List[int]] = (
+            batch.seq_lens.cpu().tolist() if self._stats_recorder is not None else None
+        )
+
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
@@ -807,6 +819,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+
+        # Record statistics for this verify step (rank-0 only).
+        # accept_length from sample() includes bonus token; recorder expects draft-only.
+        if (
+            self._stats_recorder is not None
+            and stats_seq_lens_before_verify is not None
+            and batch.reqs
+        ):
+            accept_length_per_req_cpu = [
+                max(0, x - 1) for x in accept_length.cpu().tolist()
+            ]
+            self._stats_recorder.record_verify_step(
+                batch_reqs=batch.reqs,
+                draft_token_num=verify_input.draft_token_num,
+                accept_length_per_req_cpu=accept_length_per_req_cpu,
+                seq_lens_before_verify=stats_seq_lens_before_verify,
+                draft_full_logits=None,  # EAGLE uses topk; full logits not readily available
+            )
+
         new_seq_lens = batch.seq_lens + accept_length
 
         # Update mamba state for hybrid GDN models after verification

@@ -46,6 +46,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.spec_decode_stats_recorder import SpecDecodeStatsRecorder
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
@@ -101,6 +102,12 @@ class EAGLEWorker(TpModelWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        self.tp_rank = tp_rank
+
+        # Stats recorder (activated via SGLANG_SPEC_STATS_DIR env-var). Only rank-0 writes.
+        self._stats_recorder: Optional[SpecDecodeStatsRecorder] = (
+            SpecDecodeStatsRecorder.from_env() if self.tp_rank == 0 else None
         )
 
         # Override the context length of the draft model to be the same as the target model.
@@ -697,6 +704,11 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        # Capture sequence lengths before verify (for stats recorder).
+        stats_seq_lens_before_verify: Optional[List[int]] = (
+            batch.seq_lens_cpu.tolist() if self._stats_recorder is not None else None
+        )
+
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
@@ -759,6 +771,16 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+
+        # Record statistics for this verify step (rank-0 only).
+        if self._stats_recorder is not None and stats_seq_lens_before_verify is not None:
+            self._stats_recorder.record_verify_step(
+                batch_reqs=batch.reqs,
+                draft_token_num=spec_info.draft_token_num,
+                accept_length_per_req_cpu=res.accept_length_per_req_cpu,
+                seq_lens_before_verify=stats_seq_lens_before_verify,
+                draft_full_logits=None,  # EAGLE uses topk; full logits not readily available
+            )
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)

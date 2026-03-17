@@ -1,7 +1,7 @@
 import logging
 import math
 from copy import deepcopy
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -27,6 +27,7 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
 )
+from sglang.srt.speculative.spec_decode_stats_recorder import SpecDecodeStatsRecorder
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
@@ -83,6 +84,21 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+
+        # ── Stats recorder (activated via SGLANG_SPEC_STATS_DIR env-var) ──────
+        # Only rank-0 writes; other ranks keep a None recorder.
+        self._stats_recorder: Optional[SpecDecodeStatsRecorder] = (
+            SpecDecodeStatsRecorder.from_env() if self.tp_rank == 0 else None
+        )
+        # Temporary per-step buffers populated during _prepare_for_speculative_decoding
+        # and consumed (then cleared) in forward_batch_generation after verify.
+        # All shapes: [bs, draft_token_num-1], float32.
+        # max_logits: global max raw logit (available for TP≥1).
+        # max_probs:  max softmax probability 0~1, e.g. 0.9 (TP=1 only, else None).
+        # raw_entropies: Shannon entropy H of draft distribution (TP=1 only, else None).
+        self._stats_draft_max_logits: Optional[torch.Tensor] = None
+        self._stats_draft_max_probs: Optional[torch.Tensor] = None
+        self._stats_draft_raw_entropies: Optional[torch.Tensor] = None
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -610,10 +626,33 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+
+        # Run the LM head on draft positions 1..K-1 to get token ids (and, when the
+        # stats recorder is active, also confidence stats at zero extra LM-head cost).
+        draft_next_flat, raw_max_logits, raw_max_probs, raw_entropies = (
+            self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+                return_max_logit=self._stats_recorder is not None,
+            )
+        )
+        draft_next = draft_next_flat.view(bs, self.block_size - 1)
+
+        if self._stats_recorder is not None:
+            slots = self.block_size - 1
+            self._stats_draft_max_logits = (
+                raw_max_logits.view(bs, slots) if raw_max_logits is not None else None
+            )
+            self._stats_draft_max_probs = (
+                raw_max_probs.view(bs, slots) if raw_max_probs is not None else None
+            )
+            self._stats_draft_raw_entropies = (
+                raw_entropies.view(bs, slots) if raw_entropies is not None else None
+            )
+        else:
+            self._stats_draft_max_logits = None
+            self._stats_draft_max_probs = None
+            self._stats_draft_raw_entropies = None
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -647,16 +686,44 @@ class DFlashWorker:
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_max_logit: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+
+        Args:
+            return_max_logit: When True, also returns confidence statistics computed
+                on the already-materialised ``base_logits`` — no additional LM-head
+                forward pass is performed.
+                * TP=1: returns exact global max logit, max softmax probability
+                  (values like 0.9, 0.8…), and raw Shannon entropy H of the draft
+                  distribution — all as float32 tensors of shape ``[num_tokens]``.
+                * TP>1: returns only the global max logit (exact, from the already-
+                  gathered ``gathered_max``); max_probs and entropies are ``None``
+                  because full vocabulary probabilities are not available without an
+                  expensive all-gather of the complete logit shard.
+                When False (default), all three extra return values are ``None``.
+
+        Returns:
+            (token_ids, max_logits_or_None, max_probs_or_None, raw_entropies_or_None)
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            empty = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            if return_max_logit:
+                empty_f = torch.empty(
+                    (0,), dtype=torch.float32, device=hidden_states.device
+                )
+                return empty, empty_f, empty_f, empty_f
+            return empty, None, None, None
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
@@ -690,18 +757,51 @@ class DFlashWorker:
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
+            max_logit_chunks: Optional[List[torch.Tensor]] = [] if return_max_logit else None
+            max_prob_chunks: Optional[List[torch.Tensor]] = [] if return_max_logit else None
+            entropy_chunks: Optional[List[torch.Tensor]] = [] if return_max_logit else None
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
-                    )
+                    if return_max_logit:
+                        # base_logits is already computed for argmax — piggyback softmax stats.
+                        base_f = base_logits.float()
+                        log_p = torch.log_softmax(base_f, dim=-1)
+                        max_lp, chunk_max_ids = torch.max(log_p, dim=-1)
+                        out_token_ids[start:end] = chunk_max_ids.to(torch.long) + org_vocab_start
+                        assert max_logit_chunks is not None
+                        assert max_prob_chunks is not None
+                        assert entropy_chunks is not None
+                        max_logit_chunks.append(base_f.max(dim=-1).values)
+                        max_prob_chunks.append(torch.exp(max_lp))
+                        probs = torch.exp(log_p)
+                        entropy_chunks.append(-(probs * log_p).sum(dim=-1))
+                    else:
+                        out_token_ids[start:end] = (
+                            torch.argmax(base_logits, dim=-1).to(torch.long)
+                            + org_vocab_start
+                        )
                 else:
                     out_token_ids[start:end] = 0
-            return out_token_ids
+                    if max_logit_chunks is not None:
+                        n = end - start
+                        dev = hidden_states.device
+                        max_logit_chunks.append(
+                            torch.full((n,), float("-inf"), dtype=torch.float32, device=dev)
+                        )
+                        assert max_prob_chunks is not None
+                        assert entropy_chunks is not None
+                        max_prob_chunks.append(torch.zeros(n, dtype=torch.float32, device=dev))
+                        entropy_chunks.append(torch.zeros(n, dtype=torch.float32, device=dev))
+            out_max = torch.cat(max_logit_chunks) if max_logit_chunks else None
+            out_max_prob = torch.cat(max_prob_chunks) if max_prob_chunks else None
+            out_entropy = torch.cat(entropy_chunks) if entropy_chunks else None
+            return out_token_ids, out_max, out_max_prob, out_entropy
+
+        # General path: TP > 1 or added vocab tokens present.
+        max_logit_chunks2: Optional[List[torch.Tensor]] = [] if return_max_logit else None
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -755,6 +855,9 @@ class DFlashWorker:
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids.to(torch.long)
+                # local_max is already the global max when TP=1.
+                if max_logit_chunks2 is not None:
+                    max_logit_chunks2.append(local_max.float())
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -804,6 +907,11 @@ class DFlashWorker:
             gathered_max = gathered_max.view(tp_size, chunk_len)
             gathered_ids = gathered_ids.view(tp_size, chunk_len)
 
+            # Global max logit = max across all shards. gathered_max is already available,
+            # so this is free (no additional communication).
+            if max_logit_chunks2 is not None:
+                max_logit_chunks2.append(gathered_max.max(dim=0).values.float())
+
             best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
             torch.argmax(gathered_max, dim=0, out=best_rank)
 
@@ -813,7 +921,8 @@ class DFlashWorker:
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
-        return out_token_ids
+        out_max2 = torch.cat(max_logit_chunks2) if max_logit_chunks2 else None
+        return out_token_ids, out_max2, None, None
 
     def _append_target_hidden_to_draft_kv(
         self,
@@ -1131,6 +1240,11 @@ class DFlashWorker:
 
         self._prepare_for_speculative_decoding(batch, draft_input)
 
+        # Capture sequence lengths *before* verify commits new tokens (for stats recorder).
+        stats_seq_lens_before_verify: Optional[list] = (
+            batch.seq_lens_cpu.tolist() if self._stats_recorder is not None else None
+        )
+
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
@@ -1161,6 +1275,23 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+
+        # Record statistics for this verify step (rank-0 only).
+        if self._stats_recorder is not None:
+            assert stats_seq_lens_before_verify is not None
+            self._stats_recorder.record_verify_step(
+                batch_reqs=batch.reqs,
+                draft_token_num=self.block_size,
+                accept_length_per_req_cpu=accept_length_per_req_cpu,
+                seq_lens_before_verify=stats_seq_lens_before_verify,
+                draft_max_logits=self._stats_draft_max_logits,
+                draft_max_probs=self._stats_draft_max_probs,
+                draft_raw_entropies=self._stats_draft_raw_entropies,
+            )
+            self._stats_draft_max_logits = None
+            self._stats_draft_max_probs = None
+            self._stats_draft_raw_entropies = None
+
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
