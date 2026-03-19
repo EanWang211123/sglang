@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import time
 from copy import deepcopy
 from typing import List, Optional, Tuple, Union
 
@@ -28,6 +30,7 @@ from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_verify_mask_policy,
 )
 from sglang.srt.speculative.spec_decode_stats_recorder import SpecDecodeStatsRecorder
+from sglang.srt.speculative.spec_timing_stats_recorder import SpeculativeTimingStatsRecorder
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
@@ -99,6 +102,19 @@ class DFlashWorker:
         self._stats_draft_max_logits: Optional[torch.Tensor] = None
         self._stats_draft_max_probs: Optional[torch.Tensor] = None
         self._stats_draft_raw_entropies: Optional[torch.Tensor] = None
+
+        # ── Timing stats: either --enable-speculative-timing-logging OR SGLANG_SPEC_TIMING_STATS_DIR ─
+        # Either one enables sync + timing. Only --enable prints to terminal; env var writes to batchsize_xxx.jsonl.
+        _timing_env_dir = os.environ.get("SGLANG_SPEC_TIMING_STATS_DIR", "").strip()
+        self._timing_enabled: bool = (
+            server_args.enable_speculative_timing_logging or bool(_timing_env_dir)
+        )
+        self._timing_terminal_log: bool = server_args.enable_speculative_timing_logging
+        self._timing_recorder: Optional[SpeculativeTimingStatsRecorder] = (
+            SpeculativeTimingStatsRecorder.from_env(_timing_env_dir)
+            if self.tp_rank == 0 and _timing_env_dir
+            else None
+        )
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -483,9 +499,12 @@ class DFlashWorker:
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
-    ):
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Returns (draft_extend_time, draft_time) when _timing_recorder is active, else None.
+        """
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
-            return
+            return None
 
         if batch.has_grammar:
             raise RuntimeError(
@@ -504,9 +523,22 @@ class DFlashWorker:
                 self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
+        timing = self._timing_enabled
 
-        # --- 1) Append any newly committed tokens into the draft KV cache.
+        def _sync():
+            if is_cuda():
+                torch.cuda.synchronize()
+
+        # --- 1) Append any newly committed tokens into the draft KV cache (draft-extend).
+        if timing:
+            _sync()
+            draft_extend_start = time.perf_counter()
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        if timing:
+            _sync()
+            draft_extend_time = time.perf_counter() - draft_extend_start
+        else:
+            draft_extend_time = 0.0
 
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -522,6 +554,9 @@ class DFlashWorker:
             )
 
         # --- 2) Draft a non-causal block with the draft model.
+        if timing:
+            _sync()
+            draft_start = time.perf_counter()
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -657,6 +692,11 @@ class DFlashWorker:
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
+        if timing:
+            _sync()
+            draft_time = time.perf_counter() - draft_start
+        else:
+            draft_time = 0.0
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens.reshape(-1),
@@ -679,6 +719,10 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+        if timing:
+            return (draft_extend_time, draft_time)
+        return None
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1238,7 +1282,7 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
-        self._prepare_for_speculative_decoding(batch, draft_input)
+        draft_timings = self._prepare_for_speculative_decoding(batch, draft_input)
 
         # Capture sequence lengths *before* verify commits new tokens (for stats recorder).
         stats_seq_lens_before_verify: Optional[list] = (
@@ -1257,9 +1301,22 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        # Timing: verify phase
+        timing = self._timing_enabled
+        if timing and is_cuda():
+            torch.cuda.synchronize()
+        verify_start = time.perf_counter() if timing else 0.0
+
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
+
+        if timing:
+            if is_cuda():
+                torch.cuda.synchronize()
+            verify_time = time.perf_counter() - verify_start
+        else:
+            verify_time = 0.0
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -1291,6 +1348,30 @@ class DFlashWorker:
             self._stats_draft_max_logits = None
             self._stats_draft_max_probs = None
             self._stats_draft_raw_entropies = None
+
+        # Record timing stats: file (when env var set) and/or terminal (when --enable).
+        if draft_timings is not None:
+            draft_extend_time, draft_time = draft_timings
+            if self._timing_terminal_log and self.tp_rank == 0:
+                logger.info(
+                    "[DFLASH Step Timing] draft_extend=%.3fms, draft=%.3fms, verify=%.3fms "
+                    "(batch_size=%d, query_len=%d)",
+                    draft_extend_time * 1000,
+                    draft_time * 1000,
+                    verify_time * 1000,
+                    batch.batch_size(),
+                    self.block_size,
+                )
+            if self._timing_recorder is not None:
+                seq_lens = batch.seq_lens_cpu.tolist()
+                self._timing_recorder.record_batch_timing(
+                    seq_lens=seq_lens,
+                    draft_times=draft_time,
+                    draft_extend_times=draft_extend_time,
+                    verify_times=verify_time,
+                    batch_size=batch.batch_size(),
+                    query_len=self.block_size,  # 1 + verify_step = verification tokens
+                )
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None

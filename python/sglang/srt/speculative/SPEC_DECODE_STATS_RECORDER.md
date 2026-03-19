@@ -214,3 +214,47 @@ if self._stats_recorder is not None:
 ```
 
 若某后端只有 max logit、没有完整 logits，则传 `draft_max_logits`，不传 `draft_full_logits`。
+
+---
+
+## 9. 投机解码时序统计（Speculative Timing Stats）
+
+用于统计每个 run-batch 中 draft、verify、draft-extend 三阶段的耗时，写入 `batchsize_xxx.jsonl`。
+
+### 9.1 激活方式
+
+`--enable-speculative-timing-logging` 或 `SGLANG_SPEC_TIMING_STATS_DIR` 满足其一即可启用同步与耗时统计。仅 `--enable` 会在终端打印日志（rank 0）；设置环境变量时写入 `batchsize_xxx.jsonl`。
+
+```bash
+# 方式一：仅终端日志（rank 0）
+--enable-speculative-timing-logging
+
+# 方式二：仅写入文件，不打印终端
+export SGLANG_SPEC_TIMING_STATS_DIR=/path/to/output
+
+# 方式三：终端 + 文件
+--enable-speculative-timing-logging
+export SGLANG_SPEC_TIMING_STATS_DIR=/path/to/output
+```
+
+### 9.2 输出目录结构
+
+```
+<output_dir>/
+├── querylen_16_batchsize_1.jsonl
+├── querylen_16_batchsize_2.jsonl
+├── querylen_16_batchsize_4.jsonl
+└── ...
+```
+
+### 9.3 每行 JSON 字段
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `seq_lens` | list[int] | 该批次内每个序列的长度 |
+| `avg_lens` | float | 该批次所有序列的平均长度 |
+| `draft_times` | float | 起草时间（ms） |
+| `draft_extend_times` | float | draft-extend 时间（ms） |
+| `verify_times` | float | 大模型验证时间（ms） |
+| `batch_size` | int | 该批次并发数 |
+| `query_len` | int | 验证 tokens（1+验证步长），单批次内统一 |

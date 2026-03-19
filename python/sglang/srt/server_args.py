@@ -405,6 +405,7 @@ class ServerArgs:
     gc_warning_threshold_secs: float = 0.0
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    enable_speculative_timing_logging: bool = False
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -4095,6 +4096,14 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
+        )
+        parser.add_argument(
+            "--enable-speculative-timing-logging",
+            action="store_true",
+            default=ServerArgs.enable_speculative_timing_logging,
+            help="Enable timing logs for speculative decoding (draft/verify/draft_extend phases). "
+            "Either this flag or SGLANG_SPEC_TIMING_STATS_DIR enables sync+timing. "
+            "Only this flag prints to terminal (rank 0); env var writes batchsize_xxx.jsonl.",
         )
         parser.add_argument(
             "--kv-events-config",
