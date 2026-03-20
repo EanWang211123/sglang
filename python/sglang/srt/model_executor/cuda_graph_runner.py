@@ -1163,10 +1163,12 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            # Same as Eagle/NGRAM: length matches CudaGraphRunner.num_tokens_per_bs (from
+            # server_args during capture; DFLASH target temporarily hacks server_args).
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

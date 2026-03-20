@@ -332,6 +332,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # DFLASH target only: tokens per sequence in TARGET_VERIFY graphs / warmup (_dummy_run).
+        # Set in _dflash_target_verify_token_hack_enter when --speculative-dflash-verify-token-num
+        # is used; persists after ServerArgs is restored to block_size.
+        self.dflash_target_verify_num_tokens_per_bs: Optional[int] = None
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -665,16 +669,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
-            self.init_attention_backend()
-            self.kernel_warmup()
-            self.init_device_graphs()
+            # DFLASH target may temporarily override speculative_num_draft_tokens for verify length.
+            saved_speculative_num_draft_tokens = (
+                self._dflash_target_verify_token_hack_enter()
+            )
+            try:
+                self.init_attention_backend()
+                self.kernel_warmup()
+                self.init_device_graphs()
+            finally:
+                self._dflash_target_verify_token_hack_exit(
+                    saved_speculative_num_draft_tokens
+                )
         elif self.device in ["npu", "cpu"]:
-            self.init_attention_backend()
-            self.init_device_graphs()
+            saved_speculative_num_draft_tokens = (
+                self._dflash_target_verify_token_hack_enter()
+            )
+            try:
+                self.init_attention_backend()
+                self.init_device_graphs()
+            finally:
+                self._dflash_target_verify_token_hack_exit(
+                    saved_speculative_num_draft_tokens
+                )
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
-            self.init_attention_backend()
+            saved_speculative_num_draft_tokens = (
+                self._dflash_target_verify_token_hack_enter()
+            )
+            try:
+                self.init_attention_backend()
+            finally:
+                self._dflash_target_verify_token_hack_exit(
+                    saved_speculative_num_draft_tokens
+                )
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
@@ -1247,7 +1276,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_config = load_config
 
         if recapture_cuda_graph and (self.device == "cuda" or self.device == "musa"):
-            self.init_device_graphs()
+            saved_speculative_num_draft_tokens = (
+                self._dflash_target_verify_token_hack_enter()
+            )
+            try:
+                self.init_device_graphs()
+            finally:
+                self._dflash_target_verify_token_hack_exit(
+                    saved_speculative_num_draft_tokens
+                )
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1774,6 +1811,53 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         c = a @ b
         return c
 
+    def _dflash_target_verify_token_hack_enter(self) -> Optional[int]:
+        """Begin DFLASH target verify shaping: temporarily alias ``speculative_num_draft_tokens``.
+
+        Attention backends and ``CudaGraphRunner`` read ``ServerArgs.speculative_num_draft_tokens``
+        when constructed / capturing graphs. For decoupled verify (draft block_size vs
+        ``--speculative-dflash-verify-token-num``), the target must see the **verify** length
+        during that window only—same pattern as AutoSpec (PR #17749).
+
+        - Draft worker never enters this branch (still uses block_size everywhere).
+        - Call :meth:`_dflash_target_verify_token_hack_exit` with the returned value in ``finally``
+          so shared ``ServerArgs`` goes back to **block_size** for draft and other readers.
+
+        Returns:
+            The previous ``speculative_num_draft_tokens`` (typically block_size) if a hack
+            was applied; ``None`` if no change was made.
+        """
+        if (
+            self.spec_algorithm.is_dflash()
+            and not self.is_draft_worker
+            and self.server_args.speculative_dflash_verify_token_num is not None
+        ):
+            original_speculative_num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens
+            )
+            verify_tokens_per_sequence = int(
+                self.server_args.speculative_dflash_verify_token_num
+            )
+            self.server_args.speculative_num_draft_tokens = verify_tokens_per_sequence
+            # After exit, ServerArgs is block_size again; keep verify length for _dummy_run warmup.
+            self.dflash_target_verify_num_tokens_per_bs = verify_tokens_per_sequence
+            return original_speculative_num_draft_tokens
+        return None
+
+    def _dflash_target_verify_token_hack_exit(
+        self, original_speculative_num_draft_tokens: Optional[int]
+    ) -> None:
+        """Restore ``ServerArgs.speculative_num_draft_tokens`` after target verify init/capture.
+
+        Args:
+            original_speculative_num_draft_tokens: Value returned from
+                :meth:`_dflash_target_verify_token_hack_enter`; ``None`` means enter did nothing.
+        """
+        if original_speculative_num_draft_tokens is not None:
+            self.server_args.speculative_num_draft_tokens = (
+                original_speculative_num_draft_tokens
+            )
+
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.enable_pdmux:
@@ -1944,7 +2028,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if not self.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            # DFLASH target with decoupled verify: ServerArgs already restored to block_size;
+            # use the verify length recorded at hack enter (must match captured graph).
+            if self.dflash_target_verify_num_tokens_per_bs is not None:
+                num_tokens_per_bs = self.dflash_target_verify_num_tokens_per_bs
+            else:
+                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2079,10 +2168,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
                 # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+                dflash_verify_draft_token_num = (
+                    self.dflash_target_verify_num_tokens_per_bs
+                    if self.dflash_target_verify_num_tokens_per_bs is not None
+                    else self.server_args.speculative_num_draft_tokens
+                )
                 spec_info = DFlashVerifyInput(
                     draft_token=None,
                     positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    draft_token_num=dflash_verify_draft_token_num,
                     custom_mask=None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL

@@ -486,6 +486,7 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_verify_token_num: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -2793,6 +2794,16 @@ class ServerArgs:
                         f"window_size={window_size}, block_size={draft_tokens}."
                     )
 
+            if self.speculative_dflash_verify_token_num is not None:
+                verify_num = int(self.speculative_dflash_verify_token_num)
+                block_size = int(self.speculative_num_draft_tokens)
+                if verify_num <= 0 or verify_num > block_size:
+                    raise ValueError(
+                        "DFLASH --speculative-dflash-verify-token-num must be in "
+                        f"(0, block_size]. Got verify_token_num={verify_num}, "
+                        f"block_size={block_size}."
+                    )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
@@ -4508,6 +4519,13 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-verify-token-num",
+            type=int,
+            help="DFLASH only. Number of draft tokens to verify (must be <= block_size). "
+            "When set, only the first N tokens are verified; draft still produces block_size tokens.",
+            default=ServerArgs.speculative_dflash_verify_token_num,
         )
         parser.add_argument(
             "--speculative-dflash-draft-window-size",

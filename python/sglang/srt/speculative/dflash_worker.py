@@ -691,17 +691,25 @@ class DFlashWorker:
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
         if timing:
             _sync()
             draft_time = time.perf_counter() - draft_start
         else:
             draft_time = 0.0
 
+        # Target verify may use fewer tokens than block_size (--speculative-dflash-verify-token-num).
+        verify_n = (
+            int(self.server_args.speculative_dflash_verify_token_num)
+            if self.server_args.speculative_dflash_verify_token_num is not None
+            else int(self.block_size)
+        )
+        draft_verify = draft_tokens[:, :verify_n].contiguous()
+        positions_verify = positions_2d[:, :verify_n].reshape(-1)
+
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
+            draft_token=draft_verify.reshape(-1),
+            positions=positions_verify,
+            draft_token_num=verify_n,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
@@ -1338,7 +1346,7 @@ class DFlashWorker:
             assert stats_seq_lens_before_verify is not None
             self._stats_recorder.record_verify_step(
                 batch_reqs=batch.reqs,
-                draft_token_num=self.block_size,
+                draft_token_num=int(verify_input.draft_token_num),
                 accept_length_per_req_cpu=accept_length_per_req_cpu,
                 seq_lens_before_verify=stats_seq_lens_before_verify,
                 draft_max_logits=self._stats_draft_max_logits,
@@ -1360,7 +1368,7 @@ class DFlashWorker:
                     draft_time * 1000,
                     verify_time * 1000,
                     batch.batch_size(),
-                    self.block_size,
+                    int(verify_input.draft_token_num),
                 )
             if self._timing_recorder is not None:
                 seq_lens = batch.seq_lens_cpu.tolist()
