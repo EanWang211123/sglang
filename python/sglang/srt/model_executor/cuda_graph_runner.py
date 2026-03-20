@@ -386,6 +386,19 @@ def set_torch_compile_config():
 def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
+    return get_batch_sizes_to_capture_from_seed(
+        model_runner, capture_bs, num_tokens_per_bs
+    )
+
+
+def get_batch_sizes_to_capture_from_seed(
+    model_runner: ModelRunner,
+    capture_bs: list,
+    num_tokens_per_bs: int,
+):
+    """Like :func:`get_batch_sizes_to_capture` but seed ``capture_bs`` is explicit (sorted unique list)."""
+    server_args = model_runner.server_args
+    capture_bs = list(capture_bs)
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -434,7 +447,13 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        dflash_cuda_graph_capture_bs: Optional[list] = None,
+        dflash_cuda_graph_num_tokens_per_bs: Optional[int] = None,
+    ):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -492,12 +511,31 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
+        if dflash_cuda_graph_num_tokens_per_bs is not None:
+            if not (
+                model_runner.spec_algorithm.is_dflash()
+                and not model_runner.is_draft_worker
+            ):
+                raise ValueError(
+                    "dflash_cuda_graph_num_tokens_per_bs is only valid for DFLASH target runners"
+                )
+            self.num_tokens_per_bs = int(dflash_cuda_graph_num_tokens_per_bs)
+
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.num_tokens_per_bs
+        if dflash_cuda_graph_capture_bs is not None:
+            self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_from_seed(
+                model_runner, list(dflash_cuda_graph_capture_bs), self.num_tokens_per_bs
+            )
+        else:
+            self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+                model_runner, self.num_tokens_per_bs
+            )
+        log_info_on_rank0(
+            logger,
+            f"Capture cuda graph bs {self.capture_bs} (num_tokens_per_bs={self.num_tokens_per_bs})",
         )
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
-        if KTRANSFORMERS_AVAILABLE:
+        # KT registration: caller does it when dflash_cuda_graph_capture_bs (multi-runner case)
+        if KTRANSFORMERS_AVAILABLE and dflash_cuda_graph_capture_bs is None:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup

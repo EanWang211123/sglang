@@ -697,12 +697,16 @@ class DFlashWorker:
         else:
             draft_time = 0.0
 
-        # Target verify may use fewer tokens than block_size (--speculative-dflash-verify-token-num).
-        verify_n = (
-            int(self.server_args.speculative_dflash_verify_token_num)
-            if self.server_args.speculative_dflash_verify_token_num is not None
-            else int(self.block_size)
-        )
+        # Target verify may use fewer tokens than block_size (--speculative-dflash-verify-token-num),
+        # or a batch-size-dependent length (--dynamic-speculative-dflash-verify-tokens-config).
+        if self.model_runner.dflash_dynamic_verify_bs_to_len is not None:
+            verify_n = self.model_runner.resolve_dflash_verify_len_for_batch_size(bs)
+        else:
+            verify_n = (
+                int(self.server_args.speculative_dflash_verify_token_num)
+                if self.server_args.speculative_dflash_verify_token_num is not None
+                else int(self.block_size)
+            )
         draft_verify = draft_tokens[:, :verify_n].contiguous()
         positions_verify = positions_2d[:, :verify_n].reshape(-1)
 

@@ -487,6 +487,7 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_verify_token_num: Optional[int] = None
+    dynamic_speculative_dflash_verify_tokens_config: Optional[str] = None
     speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -2683,6 +2684,13 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.dynamic_speculative_dflash_verify_tokens_config is not None:
+            if self.speculative_algorithm != "DFLASH":
+                raise ValueError(
+                    "--dynamic-speculative-dflash-verify-tokens-config is only valid with "
+                    "--speculative-algorithm DFLASH."
+                )
+
         if self.speculative_algorithm == "DFLASH":
             if self.enable_dp_attention:
                 raise ValueError(
@@ -2803,6 +2811,31 @@ class ServerArgs:
                         f"(0, block_size]. Got verify_token_num={verify_num}, "
                         f"block_size={block_size}."
                     )
+
+            if self.dynamic_speculative_dflash_verify_tokens_config is not None:
+                cfg_path = self.dynamic_speculative_dflash_verify_tokens_config
+                if not os.path.isfile(cfg_path):
+                    raise ValueError(
+                        "DFLASH --dynamic-speculative-dflash-verify-tokens-config must be "
+                        f"a readable JSON file. Not found: {cfg_path}"
+                    )
+                if self.device not in ("cuda", "musa"):
+                    raise ValueError(
+                        "DFLASH dynamic verify CUDA graphs require device cuda or musa."
+                    )
+                try:
+                    with open(cfg_path, encoding="utf-8") as f:
+                        _raw = json.load(f)
+                    if not isinstance(_raw, dict):
+                        raise ValueError(
+                            "JSON root must be an object mapping batch_size -> verify lengths"
+                        )
+                except ValueError:
+                    raise
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to load DFLASH dynamic verify JSON {cfg_path}: {e}"
+                    ) from e
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -4526,6 +4559,15 @@ class ServerArgs:
             help="DFLASH only. Number of draft tokens to verify (must be <= block_size). "
             "When set, only the first N tokens are verified; draft still produces block_size tokens.",
             default=ServerArgs.speculative_dflash_verify_token_num,
+        )
+        parser.add_argument(
+            "--dynamic-speculative-dflash-verify-tokens-config",
+            type=str,
+            help="DFLASH target only (CUDA/MUSA). JSON file mapping batch sizes to verify token "
+            "lengths (per-query length for TARGET_VERIFY CUDA graphs). Merged with --cuda-graph-bs; "
+            "JSON overrides on key intersection; other keys use --speculative-dflash-verify-token-num "
+            "or full block_size. Builds one CudaGraphRunner per distinct verify length.",
+            default=ServerArgs.dynamic_speculative_dflash_verify_tokens_config,
         )
         parser.add_argument(
             "--speculative-dflash-draft-window-size",

@@ -94,4 +94,17 @@ Target 侧大量代码（各 **attention backend**、`CudaGraphRunner` 等）在
 
 ---
 
+## 动态：按 batch size 选择验证长度（`--dynamic-speculative-dflash-verify-tokens-config`）
+
+在静态解耦（单一 `verify-token-num`）之上，可用 **JSON 文件** 为不同 **CUDA graph 捕获 batch size** 指定不同 **TARGET_VERIFY query 长度**（仍满足每个 `CudaGraphRunner` 内 `num_tokens_per_bs` 固定）。
+
+- **CLI**：`--dynamic-speculative-dflash-verify-tokens-config /path/to/config.json`
+- **约束**：仅 **DFLASH target**、**CUDA/MUSA**；与 `--enable-pdmux`、`--enable-two-batch-overlap`、`--enable-lora` 不兼容（启动期校验）。
+- **合并规则**：键集合 = `union(--cuda-graph-bs 种子列表, JSON 键)`；JSON 中有定义的 batch size 用其 **第一个** verify 长度（值为 list 时取 `[0]`，便于后续扩展多候选）；其余键使用默认长度（若设置了 `--speculative-dflash-verify-token-num` 则用该值，否则 `block_size`）。
+- **构图**：按 **verify 长度** 分组 batch size；**每个 verify_len 一对** `attn_backend` + `CudaGraphRunner`（与 [PR #17749](https://github.com/sgl-project/sglang/pull/17749) 的 per-step 模式一致）。捕图前临时设置 `server_args.speculative_num_draft_tokens = verify_len` 并切换 `self.attn_backend`，再构造 runner 完成 capture。
+- **运行时**：`ModelRunner.resolve_dflash_verify_len_for_batch_size(raw_bs)` 在有序键上做 **bisect（向上取整到下一个捕获档）**，与 graph padding 一致；`_forward_raw` 在 TARGET_VERIFY 下调用 `_set_current_graph_and_backend_by_verify_len(vlen)` **同时切换** `attn_backend` 与 `graph_runner`（PR #17749 风格）；`dflash_worker` 中切片 `verify_n` 使用同一解析逻辑。
+- **实现模块**：`python/sglang/srt/speculative/dflash_dynamic_verify_cuda_graph.py`
+
+---
+
 *文档对应实现位于上述 Python 模块；若行为变更，请同步更新本节。*

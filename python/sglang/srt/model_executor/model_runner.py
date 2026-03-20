@@ -13,6 +13,7 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+import bisect
 import datetime
 import gc
 import inspect
@@ -24,7 +25,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -152,6 +153,10 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
+)
+from sglang.srt.speculative.dflash_dynamic_verify_cuda_graph import (
+    build_filtered_merge_and_groups,
+    load_dflash_dynamic_verify_tokens_json,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -335,7 +340,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # DFLASH target only: tokens per sequence in TARGET_VERIFY graphs / warmup (_dummy_run).
         # Set in _dflash_target_verify_token_hack_enter when --speculative-dflash-verify-token-num
         # is used; persists after ServerArgs is restored to block_size.
+        # With --dynamic-speculative-dflash-verify-tokens-config, set to max verify len across BS.
         self.dflash_target_verify_num_tokens_per_bs: Optional[int] = None
+        # DFLASH dynamic TARGET_VERIFY graphs: merged batch_size -> verify_len (JSON + defaults).
+        # Per verify_len: one attn_backend + one graph_runner (mirrors PR #17749 per-step pattern).
+        self.dflash_dynamic_verify_bs_to_len: Optional[Dict[int, int]] = None
+        self.dflash_dynamic_verify_runners_by_len: Optional[Dict[int, CudaGraphRunner]] = None
+        self.dflash_dynamic_verify_sorted_bs_keys: Optional[List[int]] = None
+        self.dflash_dynamic_verify_attn_backend_by_len: Optional[Dict[int, object]] = None
+        self._dflash_dynamic_verify_groups: Optional[Dict[int, List[int]]] = None
+        # Experts capturer: last graph runner that executed replay() this forward (if any).
+        self._cuda_graph_replay_batch_for_capturer: Optional[int] = None
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -1831,6 +1846,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_dflash()
             and not self.is_draft_worker
             and self.server_args.speculative_dflash_verify_token_num is not None
+            and self.server_args.dynamic_speculative_dflash_verify_tokens_config is None
         ):
             original_speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
@@ -1858,8 +1874,130 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 original_speculative_num_draft_tokens
             )
 
+    def _should_init_dflash_dynamic_verify_cuda_graphs(self) -> bool:
+        return bool(
+            self.server_args.dynamic_speculative_dflash_verify_tokens_config
+        ) and (
+            self.spec_algorithm.is_dflash()
+            and not self.is_draft_worker
+            and self.device in ("cuda", "musa")
+        )
+
+    def _init_attention_backend_for_verify_lens(self) -> None:
+        """Init one attn_backend per verify_len (mirrors PR #17749 per-step pattern)."""
+        path = self.server_args.dynamic_speculative_dflash_verify_tokens_config
+        assert path is not None
+        json_map = load_dflash_dynamic_verify_tokens_json(path)
+        merged, groups = build_filtered_merge_and_groups(
+            server_args=self.server_args,
+            model_runner=self,
+            json_map=json_map,
+        )
+        self.dflash_dynamic_verify_bs_to_len = merged
+        self.dflash_dynamic_verify_sorted_bs_keys = sorted(merged.keys())
+        self._dflash_dynamic_verify_groups = groups
+
+        attn_backend_by_len: Dict[int, object] = {}
+        original_draft_tokens = self.server_args.speculative_num_draft_tokens
+        for vlen in sorted(groups.keys()):
+            self.server_args.speculative_num_draft_tokens = vlen
+            attn_backend_by_len[vlen] = self._get_attention_backend(
+                init_new_workspace=True
+            )
+        self.server_args.speculative_num_draft_tokens = original_draft_tokens
+
+        self.dflash_dynamic_verify_attn_backend_by_len = attn_backend_by_len
+        initial_vlen = max(groups.keys())
+        self.attn_backend = attn_backend_by_len[initial_vlen]
+        self.dflash_target_verify_num_tokens_per_bs = initial_vlen
+        logger.info(
+            "DFLASH dynamic verify: init attn_backend per verify_len=%s",
+            list(attn_backend_by_len.keys()),
+        )
+
+    def _set_current_graph_and_backend_by_verify_len(self, verify_len: int) -> None:
+        """Swap attn_backend and graph_runner to the pair for this verify_len (PR #17749 style)."""
+        attn_by_len = self.dflash_dynamic_verify_attn_backend_by_len
+        runners_by_len = self.dflash_dynamic_verify_runners_by_len
+        if attn_by_len is not None and verify_len in attn_by_len:
+            self.attn_backend = attn_by_len[verify_len]
+        if runners_by_len is not None and verify_len in runners_by_len:
+            self.graph_runner = runners_by_len[verify_len]
+
+    def resolve_dflash_verify_len_for_batch_size(self, raw_bs: int) -> int:
+        """Smallest key >= ``raw_bs`` in the merged dynamic-verify table (padding-aware)."""
+        if (
+            self.dflash_dynamic_verify_bs_to_len is None
+            or not self.dflash_dynamic_verify_sorted_bs_keys
+        ):
+            raise RuntimeError("DFLASH dynamic verify tables are not initialized")
+        keys = self.dflash_dynamic_verify_sorted_bs_keys
+        idx = bisect.bisect_left(keys, raw_bs)
+        effective_bs = keys[-1] if idx >= len(keys) else keys[idx]
+        return self.dflash_dynamic_verify_bs_to_len[effective_bs]
+
+    def _maybe_set_current_graph_and_backend_for_forward_batch(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Swap attn_backend + graph_runner to the pair for this batch (PR #17749 style)."""
+        if self.graph_runner is None:
+            return
+        if self.dflash_dynamic_verify_runners_by_len is None:
+            return
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+        ):
+            return
+        vlen = self.resolve_dflash_verify_len_for_batch_size(forward_batch.batch_size)
+        self._set_current_graph_and_backend_by_verify_len(vlen)
+
+    def _init_dflash_dynamic_verify_cuda_graph_runners(self) -> None:
+        """Capture one CudaGraphRunner per verify_len, each with its own attn_backend (PR #17749 style)."""
+        groups = self._dflash_dynamic_verify_groups
+        merged = self.dflash_dynamic_verify_bs_to_len
+        attn_by_len = self.dflash_dynamic_verify_attn_backend_by_len
+        assert groups is not None and merged is not None and attn_by_len is not None
+
+        try:
+            from kt_kernel import KTMoEWrapper
+
+            KTMoEWrapper.set_capture_batch_sizes(sorted(set(merged.keys())))
+        except ImportError:
+            pass
+
+        original_draft_tokens = self.server_args.speculative_num_draft_tokens
+        runners: Dict[int, CudaGraphRunner] = {}
+        for vlen in sorted(groups.keys()):
+            self.server_args.speculative_num_draft_tokens = vlen
+            self.attn_backend = attn_by_len[vlen]
+            bss = groups[vlen]
+            r = CudaGraphRunner(
+                self,
+                dflash_cuda_graph_capture_bs=bss,
+                dflash_cuda_graph_num_tokens_per_bs=vlen,
+            )
+            runners[vlen] = r
+
+        self.server_args.speculative_num_draft_tokens = original_draft_tokens
+        initial_vlen = max(groups.keys())
+        self.attn_backend = attn_by_len[initial_vlen]
+        self.dflash_dynamic_verify_runners_by_len = runners
+        self.graph_runner = runners[initial_vlen]
+        self.dflash_target_verify_num_tokens_per_bs = max(merged.values())
+        logger.info(
+            "DFLASH dynamic verify CUDA graphs (attn+runner per verify_len): "
+            "bs->verify_len=%s runners=%s",
+            merged,
+            {k: r.capture_bs for k, r in runners.items()},
+        )
+
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        if self._should_init_dflash_dynamic_verify_cuda_graphs():
+            self._init_attention_backend_for_verify_lens()
+            return
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -2291,6 +2429,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Capture device graphs."""
         self.graph_runner = None
         self.graph_mem_usage = 0
+        if not self._should_init_dflash_dynamic_verify_cuda_graphs():
+            self.dflash_dynamic_verify_bs_to_len = None
+            self.dflash_dynamic_verify_runners_by_len = None
+            self.dflash_dynamic_verify_sorted_bs_keys = None
+            self.dflash_dynamic_verify_attn_backend_by_len = None
+            self._dflash_dynamic_verify_groups = None
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -2324,7 +2468,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "npu": NPUGraphRunner,
             },
         )
-        self.graph_runner = graph_runners[self.device](self)
+        if self._should_init_dflash_dynamic_verify_cuda_graphs():
+            self._init_dflash_dynamic_verify_cuda_graph_runners()
+        else:
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2577,6 +2724,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        self._cuda_graph_replay_batch_for_capturer = None
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(
@@ -2617,7 +2765,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         get_global_experts_capturer().on_forward_end(
             forward_batch=forward_batch,
             can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+            cuda_graph_batch=(
+                self._cuda_graph_replay_batch_for_capturer
+                if self._cuda_graph_replay_batch_for_capturer is not None
+                else getattr(self.graph_runner, "bs", None)
+            ),
         )
 
         if self.eplb_manager is not None:
@@ -2641,9 +2793,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
+        self._maybe_set_current_graph_and_backend_for_forward_batch(forward_batch)
         can_run_graph = bool(
             mode_check()
-            and self.graph_runner
+            and self.graph_runner is not None
             and self.graph_runner.can_run(forward_batch)
         )
 
@@ -2652,6 +2805,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+            )
+            self._cuda_graph_replay_batch_for_capturer = getattr(
+                self.graph_runner, "bs", None
             )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
