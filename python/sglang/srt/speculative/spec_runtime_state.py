@@ -48,17 +48,12 @@ class AdaptiveRuntimeStateManager:
         self,
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
-        *,
-        draft_backend_factory_cls=DraftBackendFactory,
-        capture_draft_cuda_graphs_fn=None,
     ) -> EAGLERuntimeState:
         worker = self.worker
-        if capture_draft_cuda_graphs_fn is None:
-            capture_draft_cuda_graphs_fn = self._capture_draft_cuda_graphs_for_state
         with self._override_runtime_server_args(
             speculative_num_steps, speculative_num_draft_tokens
         ):
-            draft_backend_factory = draft_backend_factory_cls(
+            draft_backend_factory = DraftBackendFactory(
                 worker.server_args,
                 worker.draft_model_runner,
                 worker.topk,
@@ -69,7 +64,7 @@ class AdaptiveRuntimeStateManager:
                 draft_backend_factory.create_draft_extend_backend()
             )
             cuda_graph_runner, cuda_graph_runner_for_draft_extend = (
-                capture_draft_cuda_graphs_fn(
+                self._capture_draft_cuda_graphs_for_state(
                     draft_attn_backend,
                     draft_extend_attn_backend,
                     speculative_num_steps,
@@ -232,7 +227,7 @@ class AdaptiveRuntimeStateManager:
                 f"steps={speculative_num_steps}, draft_tokens={speculative_num_draft_tokens} "
                 f"end. elapsed={time.perf_counter() - tic:.2f} s, "
                 f"mem usage={(before_mem - after_mem):.2f} GB, avail mem={after_mem:.2f} GB."
-                )
+            )
 
         return cuda_graph_runner, cuda_graph_runner_for_draft_extend
 

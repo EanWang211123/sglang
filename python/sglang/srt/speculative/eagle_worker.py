@@ -46,15 +46,15 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
     EagleVerifyOutput,
 )
-from sglang.srt.speculative.spec_runtime_state import (
-    AdaptiveRuntimeStateManager,
-    EAGLERuntimeState,
-)
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_runtime_state import (
+    AdaptiveRuntimeStateManager,
+    EAGLERuntimeState,
+)
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     draft_tp_context,
@@ -324,22 +324,6 @@ class EAGLEWorker(TpModelWorker):
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
     ) -> EAGLERuntimeState:
         return self._get_runtime_state_manager().build_runtime_state(
-            speculative_num_steps,
-            speculative_num_draft_tokens,
-            draft_backend_factory_cls=DraftBackendFactory,
-            capture_draft_cuda_graphs_fn=self._capture_draft_cuda_graphs_for_state,
-        )
-
-    def _capture_draft_cuda_graphs_for_state(
-        self,
-        draft_attn_backend,
-        draft_extend_attn_backend,
-        speculative_num_steps: int,
-        speculative_num_draft_tokens: int,
-    ):
-        return self._get_runtime_state_manager()._capture_draft_cuda_graphs_for_state(
-            draft_attn_backend,
-            draft_extend_attn_backend,
             speculative_num_steps,
             speculative_num_draft_tokens,
         )
