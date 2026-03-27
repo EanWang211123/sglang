@@ -741,6 +741,83 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
+        # Forward-pass latency simulation (after full init, before real traffic)
+        self.run_forward_latency_simulation()
+
+    def run_forward_latency_simulation(self):
+        """Run forward-pass latency simulation if configured via server args.
+
+        Constructs realistic ForwardBatch instances with per-sequence seq_lens
+        and replays the CUDA graphs to measure attention latency. Distinct from
+        ``_dummy_run``: supports arbitrary per-sequence context lengths.
+
+        Controlled by:
+          --forward-latency-sim-batch-sizes  comma-separated int list
+          --forward-latency-sim-seq-lens     JSON {batch_size: [seq_len, ...]}
+          --forward-latency-sim-warmup       warmup iterations  (default 3)
+          --forward-latency-sim-repeat       measure iterations (default 10)
+        """
+        # Draft ModelRunner (e.g. DFLASH draft) uses a different forward contract
+        # (e.g. requires input_embeds from target); sim is for target decode/verify only.
+        if self.is_draft_worker:
+            return
+
+        from sglang.srt.model_executor.forward_latency_simulator import (
+            ForwardLatencySimulator,
+            parse_sim_batch_sizes,
+            parse_sim_seq_lens,
+        )
+
+        batch_sizes = parse_sim_batch_sizes(
+            self.server_args.forward_latency_sim_batch_sizes
+        )
+        if not batch_sizes:
+            return
+
+        seq_lens_config = parse_sim_seq_lens(
+            self.server_args.forward_latency_sim_seq_lens
+        )
+
+        simulator = ForwardLatencySimulator(self)
+        results = simulator.run(
+            batch_sizes=batch_sizes,
+            seq_lens_config=seq_lens_config,
+            num_warmup=self.server_args.forward_latency_sim_warmup,
+            num_repeat=self.server_args.forward_latency_sim_repeat,
+        )
+
+        # Print a summary table on rank 0
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                "[ForwardLatencySimulator] ===== Latency Summary =====\n"
+                "  %-6s  %-10s  %-10s  %-14s  %-14s  %-14s  %-14s  %-10s\n%s%s",
+                "bs",
+                "query_len",
+                "avg_seqlen",
+                "mean_ms",
+                "std_ms",
+                "min_ms",
+                "max_ms",
+                "cuda_graph",
+                "  " + "-" * 100 + "\n",
+                "\n".join(
+                    "  %-6d  %-10d  %-10.1f  %-14.3f  %-14.3f  %-14.3f  %-14.3f  %-10s"
+                    % (
+                        r.batch_size,
+                        r.query_len,
+                        sum(r.seq_lens) / len(r.seq_lens) if r.seq_lens else 0.0,
+                        r.latency_mean_ms,
+                        r.latency_std_ms,
+                        r.latency_min_ms,
+                        r.latency_max_ms,
+                        str(r.used_cuda_graph),
+                    )
+                    for r in results
+                ),
+            )
+
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"

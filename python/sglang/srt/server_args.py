@@ -406,6 +406,13 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     enable_speculative_timing_logging: bool = False
+
+    # Forward-pass latency simulation (runs after CUDA-graph capture, before traffic)
+    forward_latency_sim_batch_sizes: Optional[str] = None
+    forward_latency_sim_seq_lens: Optional[str] = None
+    forward_latency_sim_warmup: int = 3
+    forward_latency_sim_repeat: int = 10
+
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -4148,6 +4155,34 @@ class ServerArgs:
             help="Enable timing logs for speculative decoding (draft/verify/draft_extend phases). "
             "Either this flag or SGLANG_SPEC_TIMING_STATS_DIR enables sync+timing. "
             "Only this flag prints to terminal (rank 0); env var writes batchsize_xxx.jsonl.",
+        )
+        parser.add_argument(
+            "--forward-latency-sim-batch-sizes",
+            type=str,
+            default=ServerArgs.forward_latency_sim_batch_sizes,
+            help="Comma-separated batch sizes for forward-pass latency simulation after CUDA-graph "
+            "capture, e.g. '1,4,8,16'. Simulates TARGET_VERIFY when speculative decoding is "
+            "enabled, otherwise plain DECODE. Disabled when not set.",
+        )
+        parser.add_argument(
+            "--forward-latency-sim-seq-lens",
+            type=str,
+            default=ServerArgs.forward_latency_sim_seq_lens,
+            help="JSON mapping batch_size -> list of seq_lens for latency simulation. "
+            r'E.g. \'{"4": [1024, 2048, 4096, 512]}\'. '
+            "Unspecified batches / sequences use the model's max context length.",
+        )
+        parser.add_argument(
+            "--forward-latency-sim-warmup",
+            type=int,
+            default=ServerArgs.forward_latency_sim_warmup,
+            help="Number of warmup forward passes before timing in latency simulation (default 3).",
+        )
+        parser.add_argument(
+            "--forward-latency-sim-repeat",
+            type=int,
+            default=ServerArgs.forward_latency_sim_repeat,
+            help="Number of measured forward passes per batch size in latency simulation (default 10).",
         )
         parser.add_argument(
             "--kv-events-config",
