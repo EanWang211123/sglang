@@ -232,7 +232,7 @@ class AdaptiveRuntimeStateManager:
                 f"steps={speculative_num_steps}, draft_tokens={speculative_num_draft_tokens} "
                 f"end. elapsed={time.perf_counter() - tic:.2f} s, "
                 f"mem usage={(before_mem - after_mem):.2f} GB, avail mem={after_mem:.2f} GB."
-            )
+                )
 
         return cuda_graph_runner, cuda_graph_runner_for_draft_extend
 

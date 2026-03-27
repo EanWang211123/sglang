@@ -48,6 +48,7 @@ class AdaptiveSpeculativeParams:
         config: Optional[Dict[str, Any]] = None,
     ):
         cfg = config or {}
+        # TODO: Wider range of candidate_steps (once lazy init is supported).
         self.candidate_steps = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
         assert (
             len(self.candidate_steps) >= 2
@@ -73,11 +74,7 @@ class AdaptiveSpeculativeParams:
 
         logger.info(
             f"AdaptiveSpeculativeParams initialized: "
-            f"steps={self.current_steps}, range=[{self.min_steps}, {self.max_steps}], "
-            f"ema_alpha={self.ema_alpha}, update_interval={self.update_interval}, "
-            f"warmup_batches={self.warmup_batches}, "
-            f"down_hysteresis={self.down_hysteresis}, up_hysteresis={self.up_hysteresis}, "
-            f"candidate_steps={self.candidate_steps}"
+            f"steps={self.current_steps}, candidate_steps={self.candidate_steps}"
         )
 
     def update(self, accept_lengths: List[int]) -> bool:
@@ -108,6 +105,7 @@ class AdaptiveSpeculativeParams:
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
 
+        # TODO: Consider limiting step changes to avoid overshooting.
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             drop_threshold = prev_step - 0.5 + self.down_hysteresis

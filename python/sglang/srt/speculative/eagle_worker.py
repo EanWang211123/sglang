@@ -46,7 +46,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
     EagleVerifyOutput,
 )
-from sglang.srt.speculative.eagle_runtime_state import (
+from sglang.srt.speculative.spec_runtime_state import (
     AdaptiveRuntimeStateManager,
     EAGLERuntimeState,
 )
