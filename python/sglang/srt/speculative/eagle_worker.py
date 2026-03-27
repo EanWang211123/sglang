@@ -114,9 +114,9 @@ class EAGLEWorker(TpModelWorker):
         # Adaptive speculative parameters (topk=1 only)
         if server_args.speculative_adaptive and self.topk == 1:
             adaptive_cfg = load_adaptive_config(server_args.speculative_adaptive_config)
-            self.adaptive_params = AdaptiveSpeculativeParams.create(
+            self.adaptive_params = AdaptiveSpeculativeParams(
                 initial_steps=self.speculative_num_steps,
-                config_overrides=adaptive_cfg,
+                config=adaptive_cfg,
             )
         else:
             self.adaptive_params = None
@@ -348,16 +348,7 @@ class EAGLEWorker(TpModelWorker):
         if self.adaptive_params is None:
             return
 
-        candidate_steps = self.adaptive_params.candidate_steps
-        step_values = (
-            candidate_steps
-            if candidate_steps is not None
-            else range(
-                self.adaptive_params.min_steps, self.adaptive_params.max_steps + 1
-            )
-        )
-
-        for speculative_num_steps in step_values:
+        for speculative_num_steps in self.adaptive_params.candidate_steps:
             if speculative_num_steps in self.runtime_states:
                 continue
             runtime_state = self._build_runtime_state(
