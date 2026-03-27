@@ -5966,10 +5966,6 @@ class ServerArgs:
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
 
-        # speculative_adaptive_config implies speculative_adaptive
-        if self.speculative_adaptive_config is not None:
-            self.speculative_adaptive = True
-
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
