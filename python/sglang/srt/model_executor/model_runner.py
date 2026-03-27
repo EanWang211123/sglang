@@ -2394,11 +2394,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.graph_runner = graph_runners[self.device](self)
 
+        # After runner captures graphs, expose the dynamic verify map for runtime lookup.
+        self.dflash_dynamic_verify_bs_to_qlen: Optional[Dict[int, int]] = None
+        self.dflash_dynamic_verify_sorted_bs_keys: Optional[List[int]] = None
+        if (
+            hasattr(self.graph_runner, "dflash_bs_to_qlen")
+            and self.graph_runner.dflash_bs_to_qlen is not None
+        ):
+            self.dflash_dynamic_verify_bs_to_qlen = self.graph_runner.dflash_bs_to_qlen
+            self.dflash_dynamic_verify_sorted_bs_keys = sorted(
+                self.dflash_dynamic_verify_bs_to_qlen.keys()
+            )
+
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
+    def resolve_dflash_verify_len_for_batch_size(self, raw_bs: int) -> int:
+        """Return the effective verify_token_num for a given raw batch size.
+
+        Used at runtime by DFlashWorker for draft truncation.  If dynamic per-bs
+        verify config is active the correct qlen is looked up via a sorted bisect;
+        otherwise falls back to the fixed verify_token_num / block_size.
+        """
+        if (
+            self.dflash_dynamic_verify_bs_to_qlen is not None
+            and self.dflash_dynamic_verify_sorted_bs_keys is not None
+        ):
+            from sglang.srt.speculative.dflash_dynamic_verify_cuda_graph import (
+                resolve_verify_len_for_batch_size,
+            )
+
+            return resolve_verify_len_for_batch_size(
+                raw_bs,
+                self.dflash_dynamic_verify_sorted_bs_keys,
+                self.dflash_dynamic_verify_bs_to_qlen,
+            )
+        # Static fallback
+        return int(
+            self.server_args.speculative_dflash_verify_token_num
+            or self.server_args.speculative_num_draft_tokens
         )
 
     def init_piecewise_cuda_graphs(self):

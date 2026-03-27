@@ -1749,22 +1749,25 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
+                # Support per-(bs, qlen) graph keys for dynamic verify token num.
+                _qlen = (
+                    spec_info.draft_token_num
+                    if spec_info is not None
+                    and getattr(spec_info, "draft_token_num", None) is not None
+                    else self.speculative_num_draft_tokens
+                )
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
-                )
+                metadata.cache_seqlens_int32.copy_((seq_lens + _qlen))
 
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_q = _qlen
+                metadata.max_seq_len_k = seq_lens.max().item() + _qlen
 
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    bs * _qlen + 1,
+                    _qlen,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1775,7 +1778,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
-                self.target_verify_metadata[bs] = metadata
+                self.target_verify_metadata[(bs, _qlen)] = metadata
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
@@ -1999,14 +2002,17 @@ class FlashAttentionBackend(AttentionBackend):
                 )
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
-                metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                # Retrieve metadata using the (bs, qlen) key written during capture.
+                _qlen = (
+                    spec_info.draft_token_num
+                    if spec_info is not None
+                    and getattr(spec_info, "draft_token_num", None) is not None
+                    else self.speculative_num_draft_tokens
                 )
+                metadata = self.target_verify_metadata[(bs, _qlen)]
+                metadata.cache_seqlens_int32.copy_((seq_lens + _qlen))
 
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-                )
+                metadata.max_seq_len_k = seq_lens_cpu.max().item() + _qlen
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )

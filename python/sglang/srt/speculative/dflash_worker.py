@@ -706,10 +706,10 @@ class DFlashWorker:
         else:
             draft_time = 0.0
 
-        # Truncate to verify_token_num if decoupled verify mode is enabled.
-        # The draft model always produces block_size tokens; only the first
-        # verify_token_num tokens are sent to the target model.
-        verify_n = self.verify_token_num
+        # Resolve per-batch-size verify token num.
+        # With --dynamic-speculative-dflash-verify-tokens-config this performs a bisect
+        # lookup; without it, it returns the fixed verify_token_num.
+        verify_n = self.model_runner.resolve_dflash_verify_len_for_batch_size(bs)
         draft_verify = draft_tokens[:, :verify_n].contiguous()
         positions_verify = positions_2d[:, :verify_n].reshape(-1)
 
