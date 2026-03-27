@@ -324,8 +324,6 @@ class ForwardLatencySimulator:
     def _get_num_tokens_per_bs(self) -> int:
         mr = self.mr
         if mr.spec_algorithm.is_dflash():
-            if mr.dflash_target_verify_num_tokens_per_bs is not None:
-                return mr.dflash_target_verify_num_tokens_per_bs
             return mr.server_args.speculative_num_draft_tokens or 1
         if (
             mr.spec_algorithm.is_eagle()

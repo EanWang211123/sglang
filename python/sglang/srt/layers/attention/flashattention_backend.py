@@ -361,9 +361,20 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        # For DFLASH decoupled verify mode: target worker uses verify_token_num as the
+        # effective query length; draft worker always uses full block_size.
+        if (
+            model_runner.server_args.speculative_algorithm == "DFLASH"
+            and not model_runner.is_draft_worker
+            and model_runner.server_args.speculative_dflash_verify_token_num is not None
+        ):
+            self.speculative_num_draft_tokens = (
+                model_runner.server_args.speculative_dflash_verify_token_num
+            )
+        else:
+            self.speculative_num_draft_tokens = (
+                model_runner.server_args.speculative_num_draft_tokens
+            )
         self.speculative_step_id = speculative_step_id
 
         self.fa_impl_ver = fa_impl_ver

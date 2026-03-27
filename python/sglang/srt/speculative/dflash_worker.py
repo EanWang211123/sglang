@@ -198,6 +198,13 @@ class DFlashWorker:
                     model_block_size,
                 )
 
+        # Number of draft tokens sent to the target for verification.
+        # May be < block_size when --speculative-dflash-verify-token-num is set.
+        if server_args.speculative_dflash_verify_token_num is not None:
+            self.verify_token_num = int(server_args.speculative_dflash_verify_token_num)
+        else:
+            self.verify_token_num = self.block_size
+
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
         self._mask_token_id = self._resolve_mask_token_id(
@@ -206,10 +213,12 @@ class DFlashWorker:
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, "
+                "block_size=%s, verify_token_num=%s, draft_window_size=%s, compact_cache=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
+                self.verify_token_num,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
@@ -697,16 +706,10 @@ class DFlashWorker:
         else:
             draft_time = 0.0
 
-        # Target verify may use fewer tokens than block_size (--speculative-dflash-verify-token-num),
-        # or a batch-size-dependent length (--dynamic-speculative-dflash-verify-tokens-config).
-        if self.model_runner.dflash_dynamic_verify_bs_to_len is not None:
-            verify_n = self.model_runner.resolve_dflash_verify_len_for_batch_size(bs)
-        else:
-            verify_n = (
-                int(self.server_args.speculative_dflash_verify_token_num)
-                if self.server_args.speculative_dflash_verify_token_num is not None
-                else int(self.block_size)
-            )
+        # Truncate to verify_token_num if decoupled verify mode is enabled.
+        # The draft model always produces block_size tokens; only the first
+        # verify_token_num tokens are sent to the target model.
+        verify_n = self.verify_token_num
         draft_verify = draft_tokens[:, :verify_n].contiguous()
         positions_verify = positions_2d[:, :verify_n].reshape(-1)
 

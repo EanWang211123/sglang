@@ -23,7 +23,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -450,9 +450,6 @@ class CudaGraphRunner:
     def __init__(
         self,
         model_runner: ModelRunner,
-        *,
-        dflash_cuda_graph_capture_bs: Optional[list] = None,
-        dflash_cuda_graph_num_tokens_per_bs: Optional[int] = None,
     ):
         # Parse args
         self.model_runner = model_runner
@@ -504,38 +501,35 @@ class CudaGraphRunner:
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                self.model_runner.server_args.speculative_num_draft_tokens
-            )
+            # For DFLASH decoupled verify mode: target worker captures graphs with
+            # verify_token_num query tokens; draft worker always uses full block_size.
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and not self.model_runner.is_draft_worker
+                and self.model_runner.server_args.speculative_dflash_verify_token_num
+                is not None
+            ):
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_dflash_verify_token_num
+                )
+            else:
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
-        if dflash_cuda_graph_num_tokens_per_bs is not None:
-            if not (
-                model_runner.spec_algorithm.is_dflash()
-                and not model_runner.is_draft_worker
-            ):
-                raise ValueError(
-                    "dflash_cuda_graph_num_tokens_per_bs is only valid for DFLASH target runners"
-                )
-            self.num_tokens_per_bs = int(dflash_cuda_graph_num_tokens_per_bs)
-
         # Batch sizes to capture
-        if dflash_cuda_graph_capture_bs is not None:
-            self.capture_bs, self.compile_bs = get_batch_sizes_to_capture_from_seed(
-                model_runner, list(dflash_cuda_graph_capture_bs), self.num_tokens_per_bs
-            )
-        else:
-            self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-                model_runner, self.num_tokens_per_bs
-            )
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, self.num_tokens_per_bs
+        )
+
         log_info_on_rank0(
             logger,
             f"Capture cuda graph bs {self.capture_bs} (num_tokens_per_bs={self.num_tokens_per_bs})",
         )
-        # KT registration: caller does it when dflash_cuda_graph_capture_bs (multi-runner case)
-        if KTRANSFORMERS_AVAILABLE and dflash_cuda_graph_capture_bs is None:
+        if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
@@ -650,7 +644,7 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
-            graph_key in self.graphs
+            (graph_key is not None and graph_key in self.graphs)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -753,10 +747,12 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
+                num_tokens_this_bs = bs * self.num_tokens_per_bs
+
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
+                    num_tokens=num_tokens_this_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
                     (
@@ -1040,7 +1036,9 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
+
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        num_tokens_per_bs_for_batch = self.num_tokens_per_bs
 
         # Pad
         if self.require_mlp_tp_gather:
@@ -1064,7 +1062,7 @@ class CudaGraphRunner:
             bs=bs,
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
+            num_tokens_per_bs=num_tokens_per_bs_for_batch,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(
                 self.model_runner.server_args
@@ -1132,7 +1130,6 @@ class CudaGraphRunner:
                     forward_batch.input_embeds
                 )
 
-        # Replay
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
@@ -1201,8 +1198,6 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
-            # Same as Eagle/NGRAM: length matches CudaGraphRunner.num_tokens_per_bs (from
-            # server_args during capture; DFLASH target temporarily hacks server_args).
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
