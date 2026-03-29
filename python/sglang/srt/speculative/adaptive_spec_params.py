@@ -62,10 +62,9 @@ class AdaptiveSpeculativeParams:
         self.down_hysteresis = cfg.get("down_hysteresis", 0.0)
         self.up_hysteresis = cfg.get("up_hysteresis", -0.25)
 
-        self.current_steps = min(max(initial_steps, self.min_steps), self.max_steps)
         self.current_steps = min(
             self.candidate_steps,
-            key=lambda step: (abs(step - self.current_steps), -step),
+            key=lambda step: (abs(step - initial_steps), -step),
         )
 
         # Initialize EMA at current steps - 1 (neutral starting point)

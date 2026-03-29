@@ -254,11 +254,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
-        is_num_tokens_supported = (
-            forward_batch.input_ids.numel() == cuda_graph_bs * self.num_tokens_per_bs
-        )
-
-        return is_bs_supported and is_num_tokens_supported
+        return is_bs_supported
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()

@@ -134,7 +134,7 @@ class AdaptiveRuntimeStateManager:
             runtime_state.cuda_graph_runner_for_draft_extend
         )
         # draft_attn_backend lives on both worker and draft_model_runner;
-        # set via worker property so both stay in sync.
+        # update both explicitly to keep them in sync.
         worker.draft_attn_backend = runtime_state.draft_attn_backend
         worker.draft_extend_attn_backend = runtime_state.draft_extend_attn_backend
         worker.draft_model_runner.draft_attn_backend = runtime_state.draft_attn_backend
