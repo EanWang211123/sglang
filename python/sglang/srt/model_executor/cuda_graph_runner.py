@@ -727,9 +727,6 @@ class CudaGraphRunner:
             if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
-        is_num_tokens_supported = (
-            forward_batch.input_ids.numel() == cuda_graph_bs * self.num_tokens_per_bs
-        )
 
         return (
             is_bs_supported
@@ -737,7 +734,6 @@ class CudaGraphRunner:
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
-            and is_num_tokens_supported
         )
 
     def _init_profile_context_and_memory_record(self):

@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-
 HIGH_PROMPTS = [
     "Output exactly 256 new lines. Every line must be 1. Do not add numbering, punctuation, or commentary.",
     "Output exactly 256 new lines. Every line must be READY. Do not add numbering, punctuation, or commentary.",
@@ -160,9 +159,7 @@ def summarize_phases(phase_stats):
     total_requests = sum(s["num_requests"] for s in ok_stats)
 
     weighted_latency = sum(s["avg_latency_s"] * s["num_requests"] for s in ok_stats)
-    weighted_accept = sum(
-        s["avg_accept_length"] * s["num_requests"] for s in ok_stats
-    )
+    weighted_accept = sum(s["avg_accept_length"] * s["num_requests"] for s in ok_stats)
 
     return {
         "num_requests": total_requests,
