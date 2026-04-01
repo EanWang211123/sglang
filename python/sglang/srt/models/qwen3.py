@@ -181,7 +181,10 @@ class Qwen3Attention(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
-        if not _is_npu or forward_batch.forward_mode.is_extend():
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -300,7 +303,7 @@ class Qwen3DecoderLayer(nn.Module):
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
                 if _is_npu
-                and not get_global_server_args().enable_piecewise_cuda_graph
+                and not get_global_server_args().disable_piecewise_cuda_graph
                 and (
                     hasattr(self.mlp.gate_up_proj, "weight")
                     and hasattr(self.mlp.down_proj, "weight")
@@ -582,20 +585,6 @@ class Qwen3ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
-
-    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
-
-        if layer_ids is None:
-            raise ValueError(
-                "DFLASH requires explicit layer_ids for aux hidden capture."
-            )
-
-        self.capture_aux_hidden_states = True
-        # SGLang captures "before layer i". To capture the hidden state after target
-        # layer `k` (HF-style), we capture before layer `k + 1`.
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen3ForCausalLM

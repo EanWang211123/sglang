@@ -58,10 +58,12 @@ class DFlashDraftInput(SpecInput):
     It is NOT sent to model attention backends; the DFlash worker uses it to run
     the draft model and to track draft-side cache progress.
 
-    Invariant (per request):
-      - `draft_seq_len + ctx_len == batch.seq_lens[i]`
-        where `ctx_len` is the number of target context-feature tokens carried in
-        `target_hidden` for that request.
+    When draft windowing is disabled, `draft_seq_lens` matches the committed target
+    prefix length already materialized in the draft KV cache. When windowing is
+    enabled, `draft_seq_lens` is the logical resident length in the draft worker's
+    compact req-to-token mapping. In paged mode this may exceed the requested
+    window by up to `page_size - 1` so the local page table remains valid. `ctx_lens`
+    tracks newly committed target tokens that still need draft KV materialization.
     """
 
     # Current token to start the next DFlash block (one per request).
@@ -76,8 +78,7 @@ class DFlashDraftInput(SpecInput):
     # Context lengths per request, used to slice `target_hidden`. Device tensor (int32).
     ctx_lens: torch.Tensor
 
-    # How many tokens are already in the draft KV cache per request.
-    # The next draft step appends ctx_lens[i] tokens starting at draft_seq_lens[i].
+    # How many committed tokens are visible to the draft worker per request.
     draft_seq_lens: torch.Tensor
 
     def __post_init__(self):
@@ -397,64 +398,15 @@ class DFlashVerifyInput(SpecInput):
             ]
 
             appended = 0
-            if (
-                req.grammar is None
-                and not req.sampling_params.stop_strs
-                and not req.sampling_params.stop_regex_strs
-            ):
-                remaining = int(req.sampling_params.max_new_tokens) - len(
-                    req.output_ids
-                )
-                if remaining > 0:
-                    tokens = proposed[:remaining]
-                    if not req.sampling_params.ignore_eos:
-                        stop_token_ids = req.sampling_params.stop_token_ids
-                        eos_token_ids = req.eos_token_ids
-                        tokenizer = req.tokenizer
-                        tokenizer_eos = (
-                            tokenizer.eos_token_id if tokenizer is not None else None
-                        )
-                        additional_stop = (
-                            tokenizer.additional_stop_token_ids
-                            if tokenizer is not None
-                            else None
-                        )
-                        vocab_size = getattr(req, "vocab_size", None)
-
-                        for j, token_id in enumerate(tokens):
-                            if vocab_size is not None and (
-                                int(token_id) >= int(vocab_size) or int(token_id) < 0
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if stop_token_ids and token_id in stop_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if eos_token_ids and token_id in eos_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if tokenizer_eos is not None and int(token_id) == int(
-                                tokenizer_eos
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if additional_stop and token_id in additional_stop:
-                                tokens = tokens[: j + 1]
-                                break
-
-                    req.output_ids.extend(int(tok) for tok in tokens)
-                    appended = len(tokens)
-                    if appended > 0:
-                        req.check_finished(new_accepted_len=appended)
-            else:
-                for tok in proposed:
-                    req.output_ids.append(int(tok))
-                    appended += 1
-                    req.check_finished()
-                    if req.finished():
-                        break
-                    if req.grammar is not None:
-                        req.grammar.accept_token(int(tok))
+            for token_id in proposed:
+                token_id = int(token_id)
+                req.output_ids.append(token_id)
+                appended += 1
+                req.check_finished()
+                if req.finished():
+                    break
+                if req.grammar is not None:
+                    req.grammar.accept_token(token_id)
 
             if req.output_ids:
                 new_verified_token = int(req.output_ids[-1])
