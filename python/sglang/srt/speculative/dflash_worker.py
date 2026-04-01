@@ -2,7 +2,7 @@ import logging
 import time
 import math
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -84,10 +84,6 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
-        
-        # Timing variables
-        self._last_draft_time = 0.0
-        self._last_verify_time = 0.0
         self._enable_timing_logging = server_args.enable_speculative_timing_logging
 
         # Draft runner (separate KV cache + attention backend).
@@ -546,9 +542,9 @@ class DFlashWorker:
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
-    ):
+    ) -> Optional[Tuple[float, float]]:
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
-            return
+            return None
 
         if batch.has_grammar:
             raise RuntimeError(
@@ -567,9 +563,21 @@ class DFlashWorker:
                 self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
+        timing = self._enable_timing_logging
 
-        # --- 1) Append any newly committed tokens into the draft KV cache.
+        def _sync():
+            torch.cuda.synchronize()
+
+        # --- 1) Append any newly committed tokens into the draft KV cache (draft-extend).
+        if timing:
+            _sync()
+            draft_extend_start = time.perf_counter()
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        if timing:
+            _sync()
+            draft_extend_time = time.perf_counter() - draft_extend_start
+        else:
+            draft_extend_time = 0.0
 
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -585,6 +593,9 @@ class DFlashWorker:
             )
 
         # --- 2) Draft a non-causal block with the draft model.
+        if timing:
+            _sync()
+            draft_start = time.perf_counter()
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -680,20 +691,10 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
-            # Timing: Draft forward
-            if self._enable_timing_logging:
-                torch.cuda.synchronize()
-                draft_start = time.perf_counter()
-            
             with torch.inference_mode():
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
-            
-            if self._enable_timing_logging:
-                torch.cuda.synchronize()
-                draft_end = time.perf_counter()
-                draft_time = draft_end - draft_start
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -709,6 +710,11 @@ class DFlashWorker:
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        if timing:
+            _sync()
+            draft_time = time.perf_counter() - draft_start
+        else:
+            draft_time = 0.0
         
         # Truncate draft tokens and positions to verify_token_num if decoupled mode is enabled
         if self.verify_token_num < self.block_size:
@@ -741,10 +747,10 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
-        
-        # Store draft time for logging
-        if self._enable_timing_logging:
-            self._last_draft_time = draft_time
+
+        if timing:
+            return (draft_extend_time, draft_time)
+        return None
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1237,7 +1243,7 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
-        self._prepare_for_speculative_decoding(batch, draft_input)
+        draft_timings = self._prepare_for_speculative_decoding(batch, draft_input)
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
@@ -1255,15 +1261,16 @@ class DFlashWorker:
         if self._enable_timing_logging:
             torch.cuda.synchronize()
             verify_start = time.perf_counter()
-        
+
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
-        
+
         if self._enable_timing_logging:
             torch.cuda.synchronize()
-            verify_end = time.perf_counter()
-            self._last_verify_time = verify_end - verify_start
+            verify_time = time.perf_counter() - verify_start
+        else:
+            verify_time = 0.0
         
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -1306,12 +1313,16 @@ class DFlashWorker:
             self._logged_first_verify = True
         
         # Print timing summary (only on rank 0 and when enabled)
-        if self.tp_rank == 0 and self._enable_timing_logging:
-            total_time = self._last_draft_time + self._last_verify_time
+        if draft_timings is not None and self.tp_rank == 0:
+            draft_extend_time, draft_time = draft_timings
             logger.info(
-                f"[DFLASH Step Timing] draft={self._last_draft_time*1000:.2f}ms, "
-                f"verify={self._last_verify_time*1000:.2f}ms, "
-                f"total={total_time*1000:.2f}ms"
+                "[DFLASH Step Timing] draft_extend=%.3fms, draft=%.3fms, verify=%.3fms "
+                "(batch_size=%d, query_len=%d)",
+                draft_extend_time * 1000,
+                draft_time * 1000,
+                verify_time * 1000,
+                batch.batch_size(),
+                int(verify_input.draft_token_num),
             )
 
         return GenerationBatchResult(
