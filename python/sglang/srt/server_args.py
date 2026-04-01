@@ -4674,9 +4674,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-adaptive-config",
             type=str,
-            help="Path to a JSON config file for adaptive speculative decoding tuning knobs "
-            "(ema_alpha, update_interval, warmup_batches, down_hysteresis, up_hysteresis, candidate_steps). "
-            "Implies --speculative-adaptive.",
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
             default=ServerArgs.speculative_adaptive_config,
         )
         parser.add_argument(
