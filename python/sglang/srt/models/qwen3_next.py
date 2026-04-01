@@ -1171,5 +1171,19 @@ class Qwen3NextForCausalLM(nn.Module):
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # we plus 1 here because in sglang, for the ith layer, it takes the output
+        # of the (i-1)th layer as aux hidden state
+        self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
 
 EntryClass = Qwen3NextForCausalLM
