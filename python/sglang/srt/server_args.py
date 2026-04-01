@@ -410,6 +410,7 @@ class ServerArgs:
     # Forward-pass latency simulation (runs after CUDA-graph capture, before traffic)
     forward_latency_sim_batch_sizes: Optional[str] = None
     forward_latency_sim_seq_lens: Optional[str] = None
+    forward_latency_sim_fixed_seq_len: Optional[int] = None
     forward_latency_sim_warmup: int = 3
     forward_latency_sim_repeat: int = 10
 
@@ -4174,6 +4175,16 @@ class ServerArgs:
             help="JSON mapping batch_size -> list of seq_lens for latency simulation. "
             r'E.g. \'{"4": [1024, 2048, 4096, 512]}\'. '
             "Unspecified batches / sequences use the model's max context length.",
+        )
+        parser.add_argument(
+            "--forward-latency-sim-fixed-seq-len",
+            type=int,
+            default=ServerArgs.forward_latency_sim_fixed_seq_len,
+            help="Fixed KV-cache seq_len applied to ALL simulated sequences across ALL batch sizes "
+            "(overrides the default of context_len - num_tokens_per_bs). "
+            "Still clamped to context_len - num_tokens_per_bs to avoid KV-pool OOB. "
+            "Useful when you want to compare latency at a specific context length regardless of "
+            "the model's maximum context length. E.g. --forward-latency-sim-fixed-seq-len 300.",
         )
         parser.add_argument(
             "--forward-latency-sim-warmup",

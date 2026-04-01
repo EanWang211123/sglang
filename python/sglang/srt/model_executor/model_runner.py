@@ -766,6 +766,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         results = simulator.run(
             batch_sizes=batch_sizes,
             seq_lens_config=seq_lens_config,
+            fixed_seq_len=self.server_args.forward_latency_sim_fixed_seq_len,
             num_warmup=self.server_args.forward_latency_sim_warmup,
             num_repeat=self.server_args.forward_latency_sim_repeat,
         )

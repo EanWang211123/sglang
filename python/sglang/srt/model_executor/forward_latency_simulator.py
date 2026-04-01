@@ -127,8 +127,34 @@ class ForwardLatencySimulator:
         allocated, CUDA graphs captured) before calling :meth:`run`.
     """
 
+    # L2 cache size upper bound (bytes).  H100 has ~50 MB, GH200 ~60 MB.
+    # Using 128 MB guarantees a full flush on all current NVIDIA GPUs.
+    _L2_FLUSH_BYTES = 128 * 1024 * 1024
+
     def __init__(self, model_runner: "ModelRunner") -> None:
         self.mr = model_runner
+        # Pre-allocate a scratch buffer for L2 cache flushing.  Writing to
+        # this buffer before each timing measurement evicts all cached KV
+        # pages from L2, ensuring each run sees realistic HBM-bandwidth
+        # pressure (no carry-over from previous iterations or aliased pages).
+        try:
+            self._l2_flush_buf: Optional[torch.Tensor] = torch.empty(
+                self._L2_FLUSH_BYTES // 4,  # float32 elements
+                dtype=torch.float32,
+                device=model_runner.device,
+            )
+            logger.info(
+                "[ForwardLatencySimulator] L2 flush buffer allocated: %.1f MB on %s",
+                self._L2_FLUSH_BYTES / 1024 / 1024,
+                model_runner.device,
+            )
+        except Exception as e:
+            self._l2_flush_buf = None
+            logger.warning(
+                "[ForwardLatencySimulator] Failed to allocate L2 flush buffer (%s); "
+                "measurements may be overly optimistic when KV aliasing occurs.",
+                e,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -138,6 +164,7 @@ class ForwardLatencySimulator:
         self,
         batch_sizes: List[int],
         seq_lens_config: Optional[Dict[int, List[int]]] = None,
+        fixed_seq_len: Optional[int] = None,
         num_warmup: int = 3,
         num_repeat: int = 10,
     ) -> List[LatencySimResult]:
@@ -150,7 +177,15 @@ class ForwardLatencySimulator:
         seq_lens_config:
             Optional mapping ``{batch_size: [seq_len_per_seq]}``.  Missing entries
             are filled with :meth:`_max_safe_seq_len` (``context_len - num_tokens_per_bs``
-            for TARGET_VERIFY).  Keys can be :class:`int` or string (JSON keys).
+            for TARGET_VERIFY) unless *fixed_seq_len* is set.  Keys can be :class:`int`
+            or string (JSON keys).
+        fixed_seq_len:
+            When set, all sequences that are **not** explicitly specified in
+            *seq_lens_config* use this value as their KV-cache length (clamped to
+            ``_max_safe_seq_len()``).  This allows simulating a fixed context length
+            across all batch sizes without writing a full JSON *seq_lens_config*.
+            E.g. ``fixed_seq_len=300`` simulates every sequence with seq_len=300
+            (or the safe maximum if 300 > context_len - num_tokens_per_bs).
         num_warmup:
             Number of forward passes for GPU warmup before timing starts.
         num_repeat:
@@ -164,19 +199,53 @@ class ForwardLatencySimulator:
         mr = self.mr
         is_spec = not mr.spec_algorithm.is_none()
         query_len = self._get_num_tokens_per_bs()
+        safe_max = self._max_safe_seq_len()
+
+        # If fixed_seq_len is given, clamp it and warn if it was reduced.
+        effective_fixed_seq_len: Optional[int] = None
+        if fixed_seq_len is not None:
+            effective_fixed_seq_len = min(fixed_seq_len, safe_max)
+            if effective_fixed_seq_len != fixed_seq_len:
+                logger.warning(
+                    "[ForwardLatencySimulator] --forward-latency-sim-fixed-seq-len=%d "
+                    "was clamped to %d (= context_len %d - num_tokens_per_bs %d) to "
+                    "avoid KV-pool out-of-bounds. The attention backend computes "
+                    "max_seq_len_k = seq_len + num_tokens_per_bs, so seq_len must be "
+                    "<= context_len - num_tokens_per_bs.",
+                    fixed_seq_len,
+                    effective_fixed_seq_len,
+                    mr.model_config.context_len,
+                    query_len,
+                )
 
         logger.info(
             "[ForwardLatencySimulator] begin: n_configs=%d is_spec=%s mode=%s "
-            "query_len=%d (tokens per sequence in this forward; total_tokens=bs*query_len)",
+            "query_len=%d (tokens per sequence in this forward; total_tokens=bs*query_len) "
+            "default_seq_len=%d (fixed=%s, safe_max=%d, context_len=%d)",
             len(batch_sizes),
             is_spec,
             "TARGET_VERIFY" if is_spec else "DECODE",
             query_len,
+            effective_fixed_seq_len if effective_fixed_seq_len is not None else safe_max,
+            str(effective_fixed_seq_len),
+            safe_max,
+            mr.model_config.context_len,
         )
 
         results: List[LatencySimResult] = []
         for bs in batch_sizes:
-            seq_lens = self._resolve_seq_lens(bs, seq_lens_config)
+            seq_lens = self._resolve_seq_lens(bs, seq_lens_config, effective_fixed_seq_len)
+
+            # --- Aliasing pre-check: skip this bs if KV pool is too small ---
+            skip_reason = self._aliasing_skip_reason(bs, seq_lens)
+            if skip_reason is not None:
+                logger.warning(
+                    "[ForwardLatencySimulator] SKIP bs=%d: %s",
+                    bs,
+                    skip_reason,
+                )
+                continue
+
             # Avoid ambiguous ``...`` in logs: show prefix + explicit ``(+N more)``.
             _max_show = 8
             if len(seq_lens) <= _max_show:
@@ -296,15 +365,21 @@ class ForwardLatencySimulator:
         self,
         bs: int,
         seq_lens_config: Optional[Dict],
+        fixed_seq_len: Optional[int] = None,
     ) -> List[int]:
         """Return a list of ``bs`` seq_lens for the given batch size.
 
-        - Use entries from *seq_lens_config[bs]* (both int and str keys tried).
-        - Pad missing positions with ``_max_safe_seq_len()`` (context_len minus the
-          per-sequence token delta used in TARGET_VERIFY / DECODE).
-        - Truncate to exactly *bs* entries.
+        Priority order:
+        1. Explicit per-sequence values from ``seq_lens_config[bs]``.
+        2. ``fixed_seq_len`` if provided (already clamped by caller to safe_max).
+        3. ``_max_safe_seq_len()`` (context_len − num_tokens_per_bs).
+
+        Both int and str keys are tried for *seq_lens_config* (JSON deserialisation
+        produces string keys).  The result is always truncated / padded to exactly
+        *bs* entries.
         """
         max_len = self._max_safe_seq_len()
+        default_len = fixed_seq_len if fixed_seq_len is not None else max_len
         specified: List[int] = []
 
         if seq_lens_config:
@@ -314,8 +389,56 @@ class ForwardLatencySimulator:
                 specified = list(val)
 
         if len(specified) < bs:
-            specified.extend([max_len] * (bs - len(specified)))
+            specified.extend([default_len] * (bs - len(specified)))
         return specified[:bs]
+
+    def _aliasing_skip_reason(
+        self, bs: int, seq_lens: List[int]
+    ) -> Optional[str]:
+        """Return a human-readable reason string if running bs would cause KV
+        page aliasing (multiple sequences sharing physical pages), or None if
+        the batch is safe to run.
+
+        Called before each batch to gate simulation: aliased measurements are
+        misleading (intra-kernel L2 hits make latency look unrealistically
+        low) so we skip rather than produce bad data.
+        """
+        mr = self.mr
+        page_size = max(1, mr.page_size)
+        try:
+            kv_total_slots = mr.token_to_kv_pool.size
+        except AttributeError:
+            kv_total_slots = getattr(mr, "max_total_num_tokens", 0)
+        if kv_total_slots <= 0:
+            return None  # can't determine pool size; let _prepare handle it
+
+        try:
+            pool_rows = mr.req_to_token_pool.req_to_token.shape[0]
+        except AttributeError:
+            pool_rows = bs
+        effective_bs = min(bs, pool_rows)
+
+        num_tokens_per_bs = self._get_num_tokens_per_bs()
+        max_seq_len = max(seq_lens) if seq_lens else 1
+        max_kv_len = max_seq_len + num_tokens_per_bs
+        max_pages = (max_kv_len + page_size - 1) // page_size
+        kv_total_pages = max(1, kv_total_slots // page_size)
+        pages_needed = effective_bs * max_pages
+
+        if pages_needed > kv_total_pages:
+            safe_pages_per_seq = max(1, kv_total_pages // effective_bs)
+            safe_seq_len = max(1, safe_pages_per_seq * page_size - num_tokens_per_bs)
+            return (
+                f"KV pool aliasing would occur: bs={effective_bs} needs "
+                f"{pages_needed} pages ({max_pages} pages/seq × {effective_bs} seqs) "
+                f"but kv_pool has only {kv_total_pages} pages. "
+                f"Multiple sequences would share physical KV pages → "
+                f"intra-kernel L2 hits → latency underestimated. "
+                f"Fix: use --forward-latency-sim-fixed-seq-len {safe_seq_len} "
+                f"(max non-aliased seq_len at bs={effective_bs}), "
+                f"or increase --mem-fraction-static."
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Forward-mode / spec helpers
@@ -396,28 +519,39 @@ class ForwardLatencySimulator:
     def _prepare_scattered_kv_mapping(
         self, bs: int, seq_lens_clamped: List[int]
     ) -> torch.Tensor:
-        """Write distinct, scattered page-table entries into req_to_token_pool
-        rows 0..bs-1, then return ``req_pool_indices = arange(bs)``.
+        """Assign random, non-overlapping KV pages to each simulated sequence.
 
-        Why this matters
-        ----------------
-        The default (all req_pool_indices = 0) makes every sequence look up the
-        same row in req_to_token_pool, so FlashAttention's page_table entries all
-        point to **page 0** of the KV cache.  Reading the same physical page for
-        10 × 9000 tokens hits L2 cache repeatedly → unrealistically low latency.
+        Why sequential slabs are wrong
+        --------------------------------
+        The old implementation gave sequence i a contiguous slab starting at
+        ``i * slab``.  This caused two problems:
 
-        In production each request has unique, scattered pages.  For a 10-seq
-        batch with avg seq_len ≈ 3086 the KV footprint is ~91 k distinct token
-        locations scattered across HBM → genuine bandwidth pressure.
+        1. **Sequential prefetch**: the GPU's memory prefetcher handles
+           contiguous address streams efficiently, giving lower latency than
+           real workloads where pages are scattered across HBM.
+        2. **Intra-batch aliasing**: when ``bs * slab > kv_pool_size`` the
+           modulo wrapped around, so sequence *k* and sequence *k + N* pointed
+           to the **same physical pages**.  FlashAttention then read identical
+           K/V data for those sequences, which hit L2 on the second access →
+           artificially low latency *within* a single kernel call (L2 flush
+           between runs does **not** help here).
 
-        After this call, sequence i reads KV from a non-overlapping slab starting
-        at token slot ``i * slab`` (mod kv_pool_size), giving scattered HBM
-        accesses that are much closer to real multi-request workloads.
+        This implementation fixes both problems by drawing a random permutation
+        of all available KV pages and assigning disjoint subsets to each
+        sequence.  The resulting access pattern matches production: requests
+        arrive in arbitrary order and their KV pages end up scattered randomly
+        throughout the pool.
 
-        Note: the KV *values* at those locations are still zeros (never computed
-        by a real forward pass), so compute/bandwidth ratios may still differ
-        slightly from production, but the access pattern is meaningfully more
-        realistic.
+        When the pool cannot fit all sequences without overlap (large bs ×
+        seq_len), a cyclic extension of the permutation is used.  Pages are
+        still randomly ordered, so at least the sequential-prefetch bias is
+        eliminated, even though some physical pages are shared.
+
+        Note
+        ----
+        KV *values* at the assigned locations are still zeros (never populated
+        by a real forward pass).  Reading zeros from HBM has the same bandwidth
+        cost as reading real values, so timing is still representative.
         """
         mr = self.mr
         device = mr.device
@@ -444,39 +578,42 @@ class ForwardLatencySimulator:
 
         num_tokens_per_bs = self._get_num_tokens_per_bs()
         max_seq_len = max(seq_lens_clamped) if seq_lens_clamped else 1
-        # max KV length a sequence can attend to in TARGET_VERIFY
         max_kv_len = max_seq_len + num_tokens_per_bs
         max_pages = (max_kv_len + page_size - 1) // page_size
 
-        # Non-overlapping slab size (in token slots) per sequence
-        slab = max_pages * page_size
+        # Total number of KV pages available in the pool.
+        kv_total_pages = max(1, kv_total_slots // page_size)
+        pages_needed = effective_bs * max_pages
 
-        # Vectorised computation on CPU, then one bulk write to GPU
-        # slot(i, j) = (i * slab + j * page_size) % kv_total_slots
-        i_idx = torch.arange(effective_bs, dtype=torch.int64)   # [effective_bs]
-        j_idx = torch.arange(max_pages, dtype=torch.int64)      # [max_pages]
-        slots = (
-            i_idx[:, None] * slab + j_idx[None, :] * page_size
-        ) % max(1, kv_total_slots)                              # [effective_bs, max_pages]
+        # ---- Random page assignment ----------------------------------------
+        # Aliasing is already ruled out by _aliasing_skip_reason() in run().
+        # Use a random permutation for non-overlapping assignment: each
+        # sequence gets a disjoint, randomly-scattered subset of KV pages,
+        # matching production access patterns.
+        perm = torch.randperm(kv_total_pages, dtype=torch.int64)[:pages_needed]
+        page_assignments = perm.view(effective_bs, max_pages)
 
-        # Only strided columns (0, page_size, 2*page_size, ...) are read by
-        # normal_decode_set_metadata / init_forward_metadata_replay_cuda_graph.
-        strided_cols = j_idx * page_size                         # [max_pages], CPU
+        # Convert page indices → token-slot values stored in req_to_token.
+        # req_to_token[i, j*page_size] = page_index * page_size
+        slots = page_assignments * page_size  # [effective_bs, max_pages]
+
+        # Column positions in req_to_token that FlashAttention reads
+        # (strided_indices = [0, page_size, 2*page_size, ...]).
+        j_idx = torch.arange(max_pages, dtype=torch.int64)
+        strided_cols = j_idx * page_size                     # CPU [max_pages]
         valid_mask = strided_cols < max_col
-        valid_cols = strided_cols[valid_mask].to(device)         # GPU
-        valid_slots = slots[:, valid_mask].to(req_pool.dtype).to(device)  # GPU
+        valid_cols_cpu = strided_cols[valid_mask].tolist()
+        valid_slots = slots[:, valid_mask].to(req_pool.dtype).to(device)
 
-        # Write distinct scattered entries for each simulated sequence.
-        # Use a loop over columns to avoid any advanced-indexing ambiguity
-        # on the GPU tensor (num cols = max_pages, typically a few hundred).
-        valid_cols_cpu = valid_cols.cpu().tolist()
         for k, col in enumerate(valid_cols_cpu):
             req_pool[:effective_bs, col] = valid_slots[:, k]
 
         logger.info(
-            f"[ForwardLatencySimulator] scattered KV mapping applied: "
-            f"bs={effective_bs}, max_pages={max_pages}, slab={slab}, "
-            f"kv_pool_size={kv_total_slots}"
+            "[ForwardLatencySimulator] random KV mapping applied: "
+            "bs=%d, max_pages=%d, kv_total_pages=%d (no aliasing)",
+            effective_bs,
+            max_pages,
+            kv_total_pages,
         )
         return torch.arange(effective_bs, dtype=torch.int32, device=device)
 
@@ -618,12 +755,39 @@ class ForwardLatencySimulator:
     # Timing
     # ------------------------------------------------------------------
 
+    def _flush_l2_cache(self) -> None:
+        """Flush GPU L2 cache by writing to a buffer larger than the cache.
+
+        Why this is needed
+        ------------------
+        Without flushing, repeated iterations over the same forward batch
+        cause KV-cache pages to accumulate in L2.  On the 2nd+ iteration the
+        FlashAttention kernel's memory reads are served from L2 rather than
+        HBM, making measured latency unrealistically low—especially when KV
+        aliasing is present (multiple sequences share physical pages).
+
+        In production each decode step processes a *different* batch whose KV
+        pages are not cached, so every read goes to HBM.  Writing _L2_FLUSH_BYTES
+        of data to a scratch buffer before each measurement evicts those pages
+        and restores the "cold-cache" condition that matches production.
+
+        Implementation
+        --------------
+        A single ``fill_(0.0)`` issues a streaming write to every cache line
+        in *_l2_flush_buf* (128 MB > any current GPU L2), which the cache
+        controller must evict all prior occupants to accommodate.  The
+        subsequent ``synchronize()`` in the caller ensures the write completes
+        before the timed kernel starts.
+        """
+        if self._l2_flush_buf is not None:
+            self._l2_flush_buf.fill_(0.0)
+
     def _run_once(self, forward_batch: ForwardBatch) -> bool:
         """Execute one forward pass; returns True when the CUDA graph was used."""
         mr = self.mr
 
-        # DFLASH dynamic-verify may swap graph_runner / attn_backend per batch size.
-        mr._maybe_set_current_graph_and_backend_for_forward_batch(forward_batch)
+        # Graph path matches ModelRunner._forward_raw: single graph_runner; DFLASH
+        # dynamic verify qlen is handled inside CudaGraphRunner.replay/can_run.
 
         use_graph = (
             forward_batch.forward_mode.is_cuda_graph()
@@ -671,12 +835,19 @@ class ForwardLatencySimulator:
         with torch.inference_mode():
             # --- Warmup ---
             for _ in range(num_warmup):
+                self._flush_l2_cache()
                 used_graph = self._run_once(forward_batch)
             device_module.synchronize()
 
             # --- Measure ---
+            # Flush L2 before every timed iteration so each run starts with a
+            # "cold cache" that matches production (each batch has distinct KV
+            # pages that are not pre-loaded in L2).  Without the flush, KV
+            # page aliasing or repeated access to the same physical pages would
+            # give unrealistically low latency.
             latencies: List[float] = []
             for _ in range(num_repeat):
+                self._flush_l2_cache()
                 device_module.synchronize()
                 t0 = time.perf_counter()
                 self._run_once(forward_batch)
