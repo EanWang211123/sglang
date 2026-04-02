@@ -30,7 +30,7 @@ _DEVICE_TO_DRAFT_RUNNER = {
 
 
 @dataclass
-class EAGLERuntimeState:
+class SpecRuntimeState:
     speculative_num_steps: int
     speculative_num_draft_tokens: int
     draft_attn_backend: Optional[object]
@@ -44,16 +44,16 @@ class EAGLERuntimeState:
 class AdaptiveRuntimeStateManager:
     def __init__(self, worker: "EAGLEWorker"):
         self.worker = worker
-        self.runtime_states: Dict[int, EAGLERuntimeState] = {}
+        self.runtime_states: Dict[int, SpecRuntimeState] = {}
 
-    def register(self, state: EAGLERuntimeState):
+    def register(self, state: SpecRuntimeState):
         self.runtime_states[state.speculative_num_steps] = state
 
     def build_runtime_state(
         self,
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
-    ) -> EAGLERuntimeState:
+    ) -> SpecRuntimeState:
         worker = self.worker
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(worker.device, worker.gpu_id)
@@ -100,7 +100,7 @@ class AdaptiveRuntimeStateManager:
             f"mem={(before_mem - after_mem):.2f}GB"
         )
 
-        return EAGLERuntimeState(
+        return SpecRuntimeState(
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             draft_attn_backend=draft_attn_backend,

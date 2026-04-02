@@ -30,6 +30,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveRuntimeStateManager,
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     load_adaptive_config,
@@ -51,10 +55,6 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_runtime_state import (
-    AdaptiveRuntimeStateManager,
-    EAGLERuntimeState,
-)
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     draft_tp_context,
@@ -111,21 +111,16 @@ class EAGLEWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
 
-        # Adaptive speculative parameters (topk=1 only)
-        if server_args.speculative_adaptive and self.topk == 1:
+        # Adaptive speculative
+        self.adaptive_params = None
+        self.adaptive_state_manager = None
+        if server_args.speculative_adaptive:
             adaptive_cfg = load_adaptive_config(server_args.speculative_adaptive_config)
             self.adaptive_params = AdaptiveSpeculativeParams(
                 initial_steps=self.speculative_num_steps,
                 config=adaptive_cfg,
             )
-        else:
-            self.adaptive_params = None
-            if server_args.speculative_adaptive and self.topk != 1:
-                logger.warning(
-                    "speculative_adaptive is only supported with topk=1. "
-                    f"Current topk={self.topk}. Falling back to static params."
-                )
-        self.runtime_state_manager = AdaptiveRuntimeStateManager(self)
+            self.adaptive_state_manager = AdaptiveRuntimeStateManager(self)
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -228,20 +223,21 @@ class EAGLEWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
-            self.runtime_state_manager.register(
-                EAGLERuntimeState(
-                    speculative_num_steps=self.speculative_num_steps,
-                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                    draft_attn_backend=self.draft_attn_backend,
-                    draft_extend_attn_backend=self.draft_extend_attn_backend,
-                    cuda_graph_runner=self.cuda_graph_runner,
-                    cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
-                    target_attn_backend=self.target_worker.model_runner.attn_backend,
-                    target_graph_runner=self.target_worker.model_runner.graph_runner,
+            if self.adaptive_params is not None:
+                self.adaptive_state_manager.register(
+                    SpecRuntimeState(
+                        speculative_num_steps=self.speculative_num_steps,
+                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        draft_attn_backend=self.draft_attn_backend,
+                        draft_extend_attn_backend=self.draft_extend_attn_backend,
+                        cuda_graph_runner=self.cuda_graph_runner,
+                        cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
+                        target_attn_backend=self.target_worker.model_runner.attn_backend,
+                        target_graph_runner=self.target_worker.model_runner.graph_runner,
+                    )
                 )
-            )
-            self._init_adaptive_runtime_states()
-            self._activate_runtime_state(self.speculative_num_steps)
+                self._init_adaptive_runtime_states()
+                self._activate_runtime_state(self.speculative_num_steps)
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -312,27 +308,24 @@ class EAGLEWorker(TpModelWorker):
 
     def _build_runtime_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
-    ) -> EAGLERuntimeState:
-        return self.runtime_state_manager.build_runtime_state(
+    ) -> SpecRuntimeState:
+        return self.adaptive_state_manager.build_runtime_state(
             speculative_num_steps,
             speculative_num_draft_tokens,
         )
 
     def _init_adaptive_runtime_states(self):
-        if self.adaptive_params is None:
-            return
-
         for speculative_num_steps in self.adaptive_params.candidate_steps:
-            if speculative_num_steps in self.runtime_state_manager.runtime_states:
+            if speculative_num_steps in self.adaptive_state_manager.runtime_states:
                 continue
             runtime_state = self._build_runtime_state(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_steps + 1,
             )
-            self.runtime_state_manager.register(runtime_state)
+            self.adaptive_state_manager.register(runtime_state)
 
     def _activate_runtime_state(self, speculative_num_steps: int):
-        self.runtime_state_manager.activate_runtime_state(speculative_num_steps)
+        self.adaptive_state_manager.activate_runtime_state(speculative_num_steps)
 
     @property
     def draft_model_runner(self):
