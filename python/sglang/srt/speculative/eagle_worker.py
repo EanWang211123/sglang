@@ -1,5 +1,6 @@
 import logging
 import time
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -31,12 +33,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
-    AdaptiveRuntimeStateManager,
+    AdaptiveController,
     SpecRuntimeState,
-)
-from sglang.srt.speculative.adaptive_spec_params import (
-    AdaptiveSpeculativeParams,
-    load_adaptive_config,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -78,6 +76,11 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 
+_DEVICE_TO_DRAFT_RUNNER = {
+    "npu": EAGLEDraftNpuGraphRunner,
+    "cuda": EAGLEDraftCudaGraphRunner,
+}
+
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
@@ -112,15 +115,11 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Adaptive speculative
-        self.adaptive_params = None
-        self.adaptive_state_manager = None
+        self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
-            adaptive_cfg = load_adaptive_config(server_args.speculative_adaptive_config)
-            self.adaptive_params = AdaptiveSpeculativeParams(
-                initial_steps=self.speculative_num_steps,
-                config=adaptive_cfg,
+            self.adaptive_controller = AdaptiveController(
+                self, config_path=server_args.speculative_adaptive_config
             )
-            self.adaptive_state_manager = AdaptiveRuntimeStateManager(self)
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -223,8 +222,8 @@ class EAGLEWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
-            if self.adaptive_params is not None:
-                self.adaptive_state_manager.register(
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.register(
                     SpecRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
@@ -236,8 +235,7 @@ class EAGLEWorker(TpModelWorker):
                         target_graph_runner=self.target_worker.model_runner.graph_runner,
                     )
                 )
-                self._init_adaptive_runtime_states()
-                self._activate_runtime_state(self.speculative_num_steps)
+                self.adaptive_controller.init_states()
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -306,19 +304,152 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def _init_adaptive_runtime_states(self):
-        for speculative_num_steps in self.adaptive_params.candidate_steps:
-            if speculative_num_steps in self.adaptive_state_manager.runtime_states:
-                continue
+    def apply_runtime_state(self, state: SpecRuntimeState):
+        """Apply a pre-built runtime state to this worker.
 
-            runtime_state = self.adaptive_state_manager.build_runtime_state(
-                speculative_num_steps=speculative_num_steps,
-                speculative_num_draft_tokens=speculative_num_steps + 1,
+        This is the single place that knows which worker fields correspond
+        to a SpecRuntimeState.  Called by AdaptiveController when switching.
+        """
+        if self.speculative_num_steps == state.speculative_num_steps:
+            return
+
+        logger.info(
+            "Switch adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}"
+        )
+
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        self.cuda_graph_runner = state.cuda_graph_runner
+        self.cuda_graph_runner_for_draft_extend = (
+            state.cuda_graph_runner_for_draft_extend
+        )
+        self.draft_attn_backend = state.draft_attn_backend
+        self.draft_extend_attn_backend = state.draft_extend_attn_backend
+        self.draft_model_runner.draft_attn_backend = state.draft_attn_backend
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        self.server_args.speculative_num_steps = state.speculative_num_steps
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> SpecRuntimeState:
+        """Build a SpecRuntimeState for the given step configuration."""
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
+        with self._override_worker_state(
+            speculative_num_steps, speculative_num_draft_tokens
+        ):
+            draft_backend_factory = DraftBackendFactory(
+                self.server_args,
+                self.draft_model_runner,
+                self.topk,
+                speculative_num_steps,
             )
-            self.adaptive_state_manager.register(runtime_state)
+            draft_attn_backend = draft_backend_factory.create_decode_backend()
+            draft_extend_attn_backend = (
+                draft_backend_factory.create_draft_extend_backend()
+            )
+            self.draft_attn_backend = draft_attn_backend
+            self.draft_extend_attn_backend = draft_extend_attn_backend
+            self.draft_model_runner.draft_attn_backend = draft_attn_backend
 
-    def _activate_runtime_state(self, speculative_num_steps: int):
-        self.adaptive_state_manager.activate_runtime_state(speculative_num_steps)
+            # Capture draft CUDA graphs
+            cuda_graph_runner = None
+            cuda_graph_runner_for_draft_extend = None
+            if not self.server_args.disable_cuda_graph:
+                if speculative_num_steps > 1:
+                    draft_runner_cls = _DEVICE_TO_DRAFT_RUNNER[
+                        self.target_worker.device
+                    ]
+                    cuda_graph_runner = draft_runner_cls(
+                        self,
+                        draft_attn_backend=draft_attn_backend,
+                        speculative_num_steps=speculative_num_steps,
+                    )
+                if draft_extend_attn_backend and not _is_npu:
+                    cuda_graph_runner_for_draft_extend = (
+                        EAGLEDraftExtendCudaGraphRunner(
+                            self,
+                            draft_extend_attn_backend=draft_extend_attn_backend,
+                            speculative_num_steps=speculative_num_steps,
+                        )
+                    )
+
+            # Capture target CUDA graph
+            target_model_runner = self.target_worker.model_runner
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not self.server_args.disable_cuda_graph:
+                target_graph_runner = CudaGraphRunner(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Built adaptive runtime state steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB"
+        )
+
+        return SpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            draft_attn_backend=draft_attn_backend,
+            draft_extend_attn_backend=draft_extend_attn_backend,
+            cuda_graph_runner=cuda_graph_runner,
+            cuda_graph_runner_for_draft_extend=cuda_graph_runner_for_draft_extend,
+            target_attn_backend=target_attn_backend,
+            target_graph_runner=target_graph_runner,
+        )
+
+    @contextmanager
+    def _override_worker_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ):
+        """Temporarily override server_args and worker attributes for graph capture."""
+        sa = self.server_args
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            self.draft_attn_backend,
+            self.draft_extend_attn_backend,
+            getattr(self.draft_model_runner, "draft_attn_backend", None),
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+        )
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.speculative_num_steps = speculative_num_steps
+        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.draft_attn_backend,
+                self.draft_extend_attn_backend,
+                self.draft_model_runner.draft_attn_backend,
+                sa.speculative_num_steps,
+                sa.speculative_num_draft_tokens,
+            ) = backup
 
     @property
     def draft_model_runner(self):
@@ -368,11 +499,6 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
-            should_switch = (
-                self.adaptive_params is not None
-                and self.adaptive_params.update(verify_output.accept_length_per_req_cpu)
-            )
-
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -385,8 +511,10 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
-            if should_switch:
-                self._activate_runtime_state(self.adaptive_params.current_steps)
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.on_verify_complete(
+                    verify_output.accept_length_per_req_cpu
+                )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
