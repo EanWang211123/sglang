@@ -3018,14 +3018,6 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
-            if self.speculative_adaptive and self.speculative_eagle_topk != 1:
-                logger.warning(
-                    "speculative_adaptive is only supported with topk=1. "
-                    f"Current topk={self.speculative_eagle_topk}. "
-                    "Falling back to static params."
-                )
-                self.speculative_adaptive = False
-
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
@@ -3066,6 +3058,22 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        if self.speculative_adaptive:
+            if self.speculative_algorithm != "EAGLE":
+                logger.warning(
+                    "speculative_adaptive is only supported with EAGLE algorithm and topk=1. "
+                    f"Current algorithm={self.speculative_algorithm}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
+            elif self.speculative_eagle_topk != 1:
+                logger.warning(
+                    "speculative_adaptive is only supported with topk=1. "
+                    f"Current topk={self.speculative_eagle_topk}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
 
     def _handle_load_format(self):
         if (

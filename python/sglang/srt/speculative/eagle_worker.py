@@ -306,19 +306,12 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def _build_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
-    ) -> SpecRuntimeState:
-        return self.adaptive_state_manager.build_runtime_state(
-            speculative_num_steps,
-            speculative_num_draft_tokens,
-        )
-
     def _init_adaptive_runtime_states(self):
         for speculative_num_steps in self.adaptive_params.candidate_steps:
             if speculative_num_steps in self.adaptive_state_manager.runtime_states:
                 continue
-            runtime_state = self._build_runtime_state(
+
+            runtime_state = self.adaptive_state_manager.build_runtime_state(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_steps + 1,
             )
@@ -343,9 +336,6 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        if self.adaptive_params is not None:
-            self._activate_runtime_state(self.adaptive_params.current_steps)
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             (
                 logits_output,
@@ -989,11 +979,7 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = (
-            batch.spec_info.accept_length.clone()
-            if batch.spec_info.accept_length is not None
-            else None
-        )
+        accept_length_backup = batch.spec_info.accept_length.clone()
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()

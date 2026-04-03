@@ -6,7 +6,7 @@ servers, then compare throughput, latency, and acceptance length.
 Workloads:
 - low: steady-state low-acceptance generation
 - high: steady-state high-acceptance generation
-- transition: low-acceptance plateau followed by a shift to high acceptance
+- transition: alternating low/high acceptance shifts to stress runtime switching
 """
 
 import argparse
@@ -18,13 +18,6 @@ import requests
 HIGH_PROMPTS = [
     "Output exactly 256 new lines. Every line must be 1. Do not add numbering, punctuation, or commentary.",
     "Output exactly 256 new lines. Every line must be READY. Do not add numbering, punctuation, or commentary.",
-]
-
-MID_PROMPTS = [
-    "Write a CSV with header n,double,triple and rows for n=1 through 80. Do not add any explanation.",
-    "Write a JSON schema for a User object with fields: id (integer), name (string), email (string), age (integer).",
-    "Implement binary search in Python and include 3 small doctest examples.",
-    "Write a Python function that merges overlapping intervals. Include type hints and a short explanation.",
 ]
 
 LOW_PROMPTS = [
@@ -43,9 +36,8 @@ WORKLOADS = {
     ],
     "transition": [
         ("low_1", LOW_PROMPTS),
-        ("low_2", LOW_PROMPTS),
-        ("mid", MID_PROMPTS),
         ("high_1", HIGH_PROMPTS),
+        ("low_2", LOW_PROMPTS),
         ("high_2", HIGH_PROMPTS),
     ],
 }

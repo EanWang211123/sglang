@@ -2,7 +2,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
@@ -113,19 +113,21 @@ class AdaptiveRuntimeStateManager:
 
     def activate_runtime_state(self, speculative_num_steps: int):
         worker = self.worker
+        if worker.speculative_num_steps == speculative_num_steps:
+            return
+
         runtime_state = self.runtime_states.get(speculative_num_steps)
         if runtime_state is None:
             raise ValueError(
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
 
-        if worker.speculative_num_steps != runtime_state.speculative_num_steps:
-            logger.info(
-                "Switch adaptive runtime state: "
-                f"steps {worker.speculative_num_steps} -> {runtime_state.speculative_num_steps}, "
-                f"draft_tokens {worker.speculative_num_draft_tokens} -> "
-                f"{runtime_state.speculative_num_draft_tokens}"
-            )
+        logger.info(
+            "Switch adaptive runtime state: "
+            f"steps {worker.speculative_num_steps} -> {runtime_state.speculative_num_steps}, "
+            f"draft_tokens {worker.speculative_num_draft_tokens} -> "
+            f"{runtime_state.speculative_num_draft_tokens}"
+        )
 
         worker.speculative_num_steps = runtime_state.speculative_num_steps
         worker.speculative_num_draft_tokens = runtime_state.speculative_num_draft_tokens
@@ -133,8 +135,6 @@ class AdaptiveRuntimeStateManager:
         worker.cuda_graph_runner_for_draft_extend = (
             runtime_state.cuda_graph_runner_for_draft_extend
         )
-        # draft_attn_backend lives on both worker and draft_model_runner;
-        # update both explicitly to keep them in sync.
         worker.draft_attn_backend = runtime_state.draft_attn_backend
         worker.draft_extend_attn_backend = runtime_state.draft_extend_attn_backend
         worker.draft_model_runner.draft_attn_backend = runtime_state.draft_attn_backend
@@ -144,9 +144,9 @@ class AdaptiveRuntimeStateManager:
         worker.target_worker.model_runner.graph_runner = (
             runtime_state.target_graph_runner
         )
-        self._sync_server_args(
-            runtime_state.speculative_num_steps,
-            runtime_state.speculative_num_draft_tokens,
+        worker.server_args.speculative_num_steps = runtime_state.speculative_num_steps
+        worker.server_args.speculative_num_draft_tokens = (
+            runtime_state.speculative_num_draft_tokens
         )
 
     def _build_target_attn_backend(self):
@@ -211,74 +211,40 @@ class AdaptiveRuntimeStateManager:
 
         return cuda_graph_runner, cuda_graph_runner_for_draft_extend
 
-    def _iter_server_args(self) -> Iterator[object]:
-        worker = self.worker
-        candidates = [
-            worker.server_args,
-            getattr(worker.draft_model_runner, "server_args", None),
-            getattr(worker.target_worker, "server_args", None),
-            getattr(worker.target_worker.model_runner, "server_args", None),
-        ]
-        seen = set()
-        for server_args in candidates:
-            if server_args is None or id(server_args) in seen:
-                continue
-            seen.add(id(server_args))
-            yield server_args
-
     @contextmanager
     def _override_worker_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
     ):
-        """Temporarily override both server_args and worker attributes.
-
-        This is a single unified backup/restore so that ``build_runtime_state``
-        and ``_capture_draft_cuda_graphs`` don't need separate backup logic.
-        """
+        """Temporarily override both server_args and worker attributes."""
         worker = self.worker
+        sa = worker.server_args
 
-        # Backup worker attributes
-        backup_steps = worker.speculative_num_steps
-        backup_draft_tokens = worker.speculative_num_draft_tokens
-        backup_draft_attn_backend = worker.draft_attn_backend
-        backup_draft_extend_attn_backend = worker.draft_extend_attn_backend
-        backup_draft_model_runner_attn_backend = getattr(
-            worker.draft_model_runner, "draft_attn_backend", None
+        # Backup
+        backup = (
+            worker.speculative_num_steps,
+            worker.speculative_num_draft_tokens,
+            worker.draft_attn_backend,
+            worker.draft_extend_attn_backend,
+            getattr(worker.draft_model_runner, "draft_attn_backend", None),
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
         )
 
-        # Backup server_args
-        server_args_backups = []
-        for server_args in self._iter_server_args():
-            server_args_backups.append(
-                (
-                    server_args,
-                    server_args.speculative_num_steps,
-                    server_args.speculative_num_draft_tokens,
-                )
-            )
-            server_args.speculative_num_steps = speculative_num_steps
-            server_args.speculative_num_draft_tokens = speculative_num_draft_tokens
-
+        # Override
         worker.speculative_num_steps = speculative_num_steps
         worker.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.speculative_num_steps = speculative_num_steps
+        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
 
         try:
             yield
         finally:
-            worker.speculative_num_steps = backup_steps
-            worker.speculative_num_draft_tokens = backup_draft_tokens
-            worker.draft_attn_backend = backup_draft_attn_backend
-            worker.draft_extend_attn_backend = backup_draft_extend_attn_backend
-            worker.draft_model_runner.draft_attn_backend = (
-                backup_draft_model_runner_attn_backend
-            )
-            for sa, prev_steps, prev_tokens in reversed(server_args_backups):
-                sa.speculative_num_steps = prev_steps
-                sa.speculative_num_draft_tokens = prev_tokens
-
-    def _sync_server_args(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
-    ):
-        for server_args in self._iter_server_args():
-            server_args.speculative_num_steps = speculative_num_steps
-            server_args.speculative_num_draft_tokens = speculative_num_draft_tokens
+            (
+                worker.speculative_num_steps,
+                worker.speculative_num_draft_tokens,
+                worker.draft_attn_backend,
+                worker.draft_extend_attn_backend,
+                worker.draft_model_runner.draft_attn_backend,
+                sa.speculative_num_steps,
+                sa.speculative_num_draft_tokens,
+            ) = backup
