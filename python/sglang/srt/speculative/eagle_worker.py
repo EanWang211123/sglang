@@ -76,11 +76,6 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 
-_DEVICE_TO_DRAFT_RUNNER = {
-    "npu": EAGLEDraftNpuGraphRunner,
-    "cuda": EAGLEDraftCudaGraphRunner,
-}
-
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
@@ -270,6 +265,10 @@ class EAGLEWorker(TpModelWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        Device2DraftCudaGraphRunner = {
+            "npu": EAGLEDraftNpuGraphRunner,
+            "cuda": EAGLEDraftCudaGraphRunner,
+        }
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -277,9 +276,9 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner = _DEVICE_TO_DRAFT_RUNNER[self.target_worker.device](
-                self
-            )
+            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                self.target_worker.device
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
@@ -338,43 +337,11 @@ class EAGLEWorker(TpModelWorker):
         with self._override_worker_state(
             speculative_num_steps, speculative_num_draft_tokens
         ):
-            draft_backend_factory = DraftBackendFactory(
-                self.server_args,
-                self.draft_model_runner,
-                self.topk,
-                speculative_num_steps,
-            )
-            draft_attn_backend = draft_backend_factory.create_decode_backend()
-            draft_extend_attn_backend = (
-                draft_backend_factory.create_draft_extend_backend()
-            )
-            self.draft_attn_backend = draft_attn_backend
-            self.draft_extend_attn_backend = draft_extend_attn_backend
-            self.draft_model_runner.draft_attn_backend = draft_attn_backend
+            # Reuse existing init methods for draft attention backend and cuda graphs
+            self.init_attention_backend()
+            self.init_cuda_graphs()
 
-            # Capture draft CUDA graphs
-            cuda_graph_runner = None
-            cuda_graph_runner_for_draft_extend = None
-            if not self.server_args.disable_cuda_graph:
-                if speculative_num_steps > 1:
-                    draft_runner_cls = _DEVICE_TO_DRAFT_RUNNER[
-                        self.target_worker.device
-                    ]
-                    cuda_graph_runner = draft_runner_cls(
-                        self,
-                        draft_attn_backend=draft_attn_backend,
-                        speculative_num_steps=speculative_num_steps,
-                    )
-                if draft_extend_attn_backend and not _is_npu:
-                    cuda_graph_runner_for_draft_extend = (
-                        EAGLEDraftExtendCudaGraphRunner(
-                            self,
-                            draft_extend_attn_backend=draft_extend_attn_backend,
-                            speculative_num_steps=speculative_num_steps,
-                        )
-                    )
-
-            # Capture target CUDA graph
+            # Capture target attention backend and CUDA graph
             target_model_runner = self.target_worker.model_runner
             backup_init = target_model_runner.init_new_workspace
             try:
@@ -393,6 +360,17 @@ class EAGLEWorker(TpModelWorker):
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
                 )
 
+            state = SpecRuntimeState(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                draft_attn_backend=self.draft_attn_backend,
+                draft_extend_attn_backend=self.draft_extend_attn_backend,
+                cuda_graph_runner=self.cuda_graph_runner,
+                cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+            )
+
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Built adaptive runtime state steps={speculative_num_steps}: "
@@ -400,16 +378,7 @@ class EAGLEWorker(TpModelWorker):
             f"mem={(before_mem - after_mem):.2f}GB"
         )
 
-        return SpecRuntimeState(
-            speculative_num_steps=speculative_num_steps,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-            draft_attn_backend=draft_attn_backend,
-            draft_extend_attn_backend=draft_extend_attn_backend,
-            cuda_graph_runner=cuda_graph_runner,
-            cuda_graph_runner_for_draft_extend=cuda_graph_runner_for_draft_extend,
-            target_attn_backend=target_attn_backend,
-            target_graph_runner=target_graph_runner,
-        )
+        return state
 
     @contextmanager
     def _override_worker_state(
@@ -423,6 +392,8 @@ class EAGLEWorker(TpModelWorker):
             self.draft_attn_backend,
             self.draft_extend_attn_backend,
             getattr(self.draft_model_runner, "draft_attn_backend", None),
+            self.cuda_graph_runner,
+            self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
         )
@@ -439,6 +410,8 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend,
                 self.draft_extend_attn_backend,
                 self.draft_model_runner.draft_attn_backend,
+                self.cuda_graph_runner,
+                self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
             ) = backup
