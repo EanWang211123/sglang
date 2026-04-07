@@ -12,8 +12,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpecRuntimeState:
-    """Runtime state for EAGLE1/2 workers."""
-
     speculative_num_steps: int
     speculative_num_draft_tokens: int
     draft_attn_backend: Optional[object]

@@ -392,8 +392,8 @@ class EAGLEWorker(TpModelWorker):
             self.draft_attn_backend,
             self.draft_extend_attn_backend,
             getattr(self.draft_model_runner, "draft_attn_backend", None),
-            self.cuda_graph_runner,
-            self.cuda_graph_runner_for_draft_extend,
+            getattr(self, "cuda_graph_runner", None),
+            getattr(self, "cuda_graph_runner_for_draft_extend", None),
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
         )
