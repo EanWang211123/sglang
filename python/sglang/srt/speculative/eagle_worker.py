@@ -223,11 +223,11 @@ class EAGLEWorker(TpModelWorker):
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                         draft_attn_backend=self.draft_attn_backend,
-                        draft_extend_attn_backend=self.draft_extend_attn_backend,
                         cuda_graph_runner=self.cuda_graph_runner,
-                        cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                         target_attn_backend=self.target_worker.model_runner.attn_backend,
                         target_graph_runner=self.target_worker.model_runner.graph_runner,
+                        draft_extend_attn_backend=self.draft_extend_attn_backend,
+                        cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                     )
                 )
                 self.adaptive_controller.init_states()
@@ -313,15 +313,19 @@ class EAGLEWorker(TpModelWorker):
 
         self.speculative_num_steps = state.speculative_num_steps
         self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        # Draft stage
+        self.draft_attn_backend = state.draft_attn_backend
+        self.draft_model_runner.draft_attn_backend = state.draft_attn_backend
         self.cuda_graph_runner = state.cuda_graph_runner
+        # Verify stage
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        # Extend stage
+        self.draft_extend_attn_backend = state.draft_extend_attn_backend
         self.cuda_graph_runner_for_draft_extend = (
             state.cuda_graph_runner_for_draft_extend
         )
-        self.draft_attn_backend = state.draft_attn_backend
-        self.draft_extend_attn_backend = state.draft_extend_attn_backend
-        self.draft_model_runner.draft_attn_backend = state.draft_attn_backend
-        self.target_worker.model_runner.attn_backend = state.target_attn_backend
-        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        # Sync server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
         self.server_args.speculative_num_draft_tokens = (
             state.speculative_num_draft_tokens
@@ -363,12 +367,15 @@ class EAGLEWorker(TpModelWorker):
             state = SpecRuntimeState(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
+                # Draft stage
                 draft_attn_backend=self.draft_attn_backend,
-                draft_extend_attn_backend=self.draft_extend_attn_backend,
                 cuda_graph_runner=self.cuda_graph_runner,
-                cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
+                # Verify stage
                 target_attn_backend=target_attn_backend,
                 target_graph_runner=target_graph_runner,
+                # Extend stage
+                draft_extend_attn_backend=self.draft_extend_attn_backend,
+                cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)

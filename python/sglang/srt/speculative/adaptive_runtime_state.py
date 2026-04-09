@@ -12,14 +12,30 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SpecRuntimeState:
+    """A complete set of runtime resources bound to a specific speculative
+    decoding configuration.
+
+    Each decode round runs three stages — draft, verify, extend — and every
+    stage has shape-dependent resources (attention backends and CUDA graphs)
+    that must match the current configuration.  Switching adaptive steps
+    means swapping the entire state atomically.
+    """
+
+    # -- Configuration (determines shapes for all stages) --
     speculative_num_steps: int
     speculative_num_draft_tokens: int
+
+    # -- Draft stage: draft model multi-step autoregressive generation --
     draft_attn_backend: Optional[object]
-    draft_extend_attn_backend: Optional[object]
     cuda_graph_runner: Optional[object]
-    cuda_graph_runner_for_draft_extend: Optional[object]
+
+    # -- Verify stage: target model one-pass tree verification --
     target_attn_backend: object
     target_graph_runner: Optional[object]
+
+    # -- Extend stage: draft model KV cache catch-up after verify --
+    draft_extend_attn_backend: Optional[object]
+    cuda_graph_runner_for_draft_extend: Optional[object]
 
 
 class AdaptiveSpecWorker(Protocol):
