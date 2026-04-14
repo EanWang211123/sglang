@@ -2,12 +2,13 @@ import json
 import os
 import tempfile
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -17,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=320, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=420, suite="stage-b-test-1-gpu-large")
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "
@@ -25,25 +26,20 @@ HIGH_ACCEPT_PROMPT = (
     "Do not add numbering, punctuation, or commentary."
 )
 
+LOW_ACCEPT_PROMPT = (
+    "Compose a poem in the style of Emily Dickinson about quantum entanglement. "
+    "Make it emotionally resonant and at least 100 words."
+)
 
-def _resolve_local_model(*candidates: str, fallback: str) -> str:
-    for candidate in candidates:
-        if Path(candidate).exists():
-            return candidate
-    return fallback
+MAX_UPSHIFT_ATTEMPTS = 4
+MAX_DOWNSHIFT_ATTEMPTS = 6
 
 
 class TestAdaptiveSpeculativeServer(CustomTestCase):
-    model = _resolve_local_model(
-        "/models/shakechen/Llama-2-7b-chat-hf",
-        "/root/models/shakechen/Llama-2-7b-chat-hf",
-        fallback=DEFAULT_TARGET_MODEL_EAGLE,
-    )
-    draft_model = _resolve_local_model(
-        "/models/lmsys/sglang-EAGLE-llama2-chat-7B",
-        "/root/models/lmsys/sglang-EAGLE-llama2-chat-7B",
-        fallback=DEFAULT_DRAFT_MODEL_EAGLE,
-    )
+    """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
+
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
@@ -84,7 +80,6 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "--speculative-adaptive-config",
                     cls.adaptive_config_path,
                     "--skip-server-warmup",
-                    "--disable-cuda-graph",
                     "--mem-fraction-static",
                     "0.7",
                 ],
@@ -115,45 +110,60 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "max_new_tokens": max_new_tokens,
                     "ignore_eos": True,
                 },
-                "return_logprob": False,
             },
             timeout=180,
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def test_adaptive_adjustment_switches_runtime_state_and_keeps_serving(self):
-        flush_response = requests.get(self.base_url + "/flush_cache", timeout=30)
-        self.assertEqual(flush_response.status_code, 200, flush_response.text)
+    def _drive_upshift(self) -> dict:
+        """Send high-acceptance prompts until steps upshift to 3."""
+        state = self._get_internal_state()
+        for _ in range(MAX_UPSHIFT_ATTEMPTS):
+            self._generate(HIGH_ACCEPT_PROMPT)
+            state = self._get_internal_state()
+            if state["speculative_num_steps"] == 3:
+                return state
+        return state
 
-        initial_state = self._get_internal_state()
-        self.assertEqual(initial_state["speculative_num_steps"], 1)
-        self.assertEqual(initial_state["speculative_num_draft_tokens"], 2)
+    def _drive_downshift(self) -> dict:
+        """Send low-acceptance prompts until steps downshift to 1."""
+        state = self._get_internal_state()
+        for _ in range(MAX_DOWNSHIFT_ATTEMPTS):
+            self._generate(LOW_ACCEPT_PROMPT)
+            state = self._get_internal_state()
+            if state["speculative_num_steps"] == 1:
+                return state
+        return state
 
-        switched_state = initial_state
-        switched = False
-        for _ in range(4):
-            result = self._generate(HIGH_ACCEPT_PROMPT)
-            self.assertGreater(result["meta_info"].get("spec_verify_ct", 0), 0)
+    def test_gsm8k_after_adaptive_switches(self):
+        """Exercise up/down/up adaptive switches, then verify GSM8K accuracy."""
+        state = self._drive_upshift()
+        self.assertEqual(state["speculative_num_steps"], 3, f"Never upshifted: {state}")
 
-            switched_state = self._get_internal_state()
-            print(
-                "adaptive state:",
-                switched_state["speculative_num_steps"],
-                switched_state.get("avg_spec_accept_length"),
-            )
-            if switched_state["speculative_num_steps"] == 3:
-                switched = True
-                break
-
-        self.assertTrue(
-            switched, msg=f"Adaptive steps never switched: {switched_state}"
+        state = self._drive_downshift()
+        self.assertEqual(
+            state["speculative_num_steps"], 1, f"Never downshifted: {state}"
         )
-        self.assertEqual(switched_state["speculative_num_draft_tokens"], 4)
 
-        follow_up = self._generate("Today is a sunny day and I like", max_new_tokens=16)
-        self.assertIsInstance(follow_up["text"], str)
-        self.assertGreater(len(follow_up["text"]), 0)
+        self._drive_upshift()
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=100,
+            num_threads=64,
+        )
+        metrics = run_eval(args)
+        print(f"GSM8K after adaptive switches: {metrics}")
+        self.assertGreater(metrics["score"], 0.20)
+
+        server_info = requests.get(self.base_url + "/server_info").json()
+        avg_accept_len = server_info["internal_states"][0]["avg_spec_accept_length"]
+        print(f"avg_spec_accept_length={avg_accept_len:.4f}")
 
 
 if __name__ == "__main__":
