@@ -5,12 +5,11 @@ Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def load_adaptive_config(path: Optional[str]) -> Dict[str, Any]:
+def load_adaptive_config(path: str | None) -> dict[str, object]:
     """Load adaptive speculative config from a JSON file.
 
     The file may contain any subset of the following keys:
@@ -25,7 +24,8 @@ def load_adaptive_config(path: Optional[str]) -> Dict[str, Any]:
         cfg = json.load(f)
     if not isinstance(cfg, dict):
         raise ValueError(
-            f"speculative_adaptive_config must be a JSON object, got {type(cfg).__name__}"
+            "speculative_adaptive_config must be a JSON object, "
+            f"got {type(cfg).__name__}"
         )
     return cfg
 
@@ -45,7 +45,7 @@ class AdaptiveSpeculativeParams:
     def __init__(
         self,
         initial_steps: int,
-        config: Optional[Dict[str, Any]] = None,
+        config: dict[str, object] | None = None,
     ):
         cfg = config or {}
         # TODO: Wider range of candidate_steps (once lazy init is supported).
@@ -76,7 +76,7 @@ class AdaptiveSpeculativeParams:
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}"
         )
 
-    def update(self, accept_lengths: List[int]) -> bool:
+    def update(self, accept_lengths: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
 
         Args:
