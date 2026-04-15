@@ -1,6 +1,6 @@
 # Adaptive Speculative Decoding
 
-Adaptive speculative decoding lets SGLang adjust `speculative_num_steps/speculative_num_draft_tokens` at runtime instead of keeping a single fixed value for the whole server lifetime. 
+Adaptive speculative decoding lets SGLang adjust `speculative_num_steps/speculative_num_draft_tokens` at runtime instead of keeping a single fixed value for the whole server lifetime.
 It is designed for workloads whose accept length changes over time, where one static step count is rarely optimal.
 
 ## Current support
