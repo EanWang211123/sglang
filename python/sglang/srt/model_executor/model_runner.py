@@ -507,6 +507,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_draft_model=is_draft_model,
         )
 
+    def _get_effective_hybrid_layer_ids(self) -> tuple[list[int], list[int]]:
+        """Return PP-scoped full/SWA layer ids for the instantiated model."""
+        source_full_attention_layer_ids = getattr(
+            self.mambaish_config, "full_attention_layer_ids", None
+        )
+        if source_full_attention_layer_ids is None:
+            source_full_attention_layer_ids = getattr(
+                self.model_config, "full_attention_layer_ids", None
+            )
+
+        source_swa_attention_layer_ids = getattr(
+            self.model_config.hf_text_config, "swa_attention_layer_ids", None
+        )
+        if source_swa_attention_layer_ids is None:
+            source_swa_attention_layer_ids = getattr(
+                self.model_config, "swa_attention_layer_ids", None
+            )
+
+        full_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if source_full_attention_layer_ids is not None
+            and layer_idx in source_full_attention_layer_ids
+        ]
+        swa_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if source_swa_attention_layer_ids is not None
+            and layer_idx in source_swa_attention_layer_ids
+        ]
+        return full_attention_layer_ids, swa_attention_layer_ids
+
+    def get_effective_full_attention_layer_ids(self) -> list[int]:
+        return self.model_config.full_attention_layer_ids
+
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -624,19 +659,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         ), "PP is not compatible with MTP models."
 
-        # Consider PP, so use start_layer and end_layer.
-        full_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "full_attention_layer_ids")
-            and layer_idx in self.model_config.full_attention_layer_ids
-        ]
-        swa_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "swa_attention_layer_ids")
-            and layer_idx in self.model_config.swa_attention_layer_ids
-        ]
+        # Recompute PP-scoped hybrid layer ids from the active model config.
+        full_attention_layer_ids, swa_attention_layer_ids = (
+            self._get_effective_hybrid_layer_ids()
+        )
         # Update back to model_config.
         self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
