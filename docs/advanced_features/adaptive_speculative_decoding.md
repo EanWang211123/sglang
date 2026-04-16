@@ -104,7 +104,7 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-path lmsys/sglang-EAGLE-llama2-chat-7B \
     --speculative-eagle-topk 1 \
     --speculative-num-steps 3 \
-    --speculative-num-draft-tokens 3 \
+    --speculative-num-draft-tokens 4 \
     --speculative-adaptive
 ```
 

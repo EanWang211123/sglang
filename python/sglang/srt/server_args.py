@@ -3430,9 +3430,9 @@ class ServerArgs:
                 )
 
         if self.speculative_adaptive:
-            if self.speculative_algorithm != "EAGLE":
+            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
                 logger.warning(
-                    "speculative_adaptive is only supported with EAGLE algorithm and topk=1. "
+                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
                     f"Current algorithm={self.speculative_algorithm}. "
                     "Falling back to static params."
                 )
@@ -5283,7 +5283,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-adaptive",
             action="store_true",
-            help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate. Only supports topk=1.",
+            help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
             default=ServerArgs.speculative_adaptive,
         )
         parser.add_argument(
