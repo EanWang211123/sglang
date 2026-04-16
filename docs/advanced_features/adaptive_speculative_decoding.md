@@ -131,8 +131,8 @@ The config file is optional. Any omitted keys use defaults.
 | `ema_alpha` | `0.2` | EMA smoothing factor for accepted draft length |
 | `update_interval` | `5` | Recompute interval, in verify batches, after warmup |
 | `warmup_batches` | `10` | Number of verify batches to observe before switching |
-| `down_hysteresis` | `0.0` | Extra margin before moving to a smaller step |
-| `up_hysteresis` | `-0.25` | Extra margin before moving to a larger step |
+| `down_hysteresis` | `-0.25` | Extra margin before moving to a smaller step |
+| `up_hysteresis` | `0.0` | Extra margin before moving to a larger step |
 
 The initial `--speculative-num-steps` is snapped to the nearest value in `candidate_steps`.
 
