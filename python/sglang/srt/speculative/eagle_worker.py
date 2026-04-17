@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
@@ -68,6 +69,9 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.spec_timing_warmup_sim_recorder import (
+    SpecTimingWarmupSimRecorder,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
@@ -112,6 +116,7 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.spec_timing_warmup_sim_recorder: Optional[SpecTimingWarmupSimRecorder] = None
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -172,6 +177,14 @@ class EAGLEWorker(TpModelWorker):
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
+            )
+
+        spec_timing_warmup_sim_results = os.getenv("SPEC_TIMING_WARMUP_SIM_RESULTS")
+        if spec_timing_warmup_sim_results and self.tp_rank == 0 and (
+            self.dp_rank is None or self.dp_rank == 0
+        ):
+            self.spec_timing_warmup_sim_recorder = SpecTimingWarmupSimRecorder(
+                spec_timing_warmup_sim_results
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -517,25 +530,113 @@ class EAGLEWorker(TpModelWorker):
                     batch_size=batch.batch_size()
                 )
 
+            enable_log_time = self.server_args.enable_speculative_time_logging
+            should_record_time = (
+                enable_log_time or self.spec_timing_warmup_sim_recorder is not None
+            )
+            should_log_time = enable_log_time and self.tp_rank == 0 and (
+                self.dp_rank is None or self.dp_rank == 0
+            )
+            device_module = (
+                torch.get_device_module(self.device) if should_record_time else None
+            )
+            draft_elapsed_ms = None
+            verify_elapsed_ms = None
+            draft_extend_elapsed_ms = None
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                if should_record_time:
+                    device_module.synchronize()
+                    draft_start = time.perf_counter()
                 spec_info = self.draft(batch)
+                if should_record_time:
+                    device_module.synchronize()
+                    draft_elapsed_ms = (time.perf_counter() - draft_start) * 1000.0
+
+            if should_record_time:
+                device_module.synchronize()
+                verify_start = time.perf_counter()
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            if should_record_time:
+                device_module.synchronize()
+                verify_elapsed_ms = (time.perf_counter() - verify_start) * 1000.0
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
-                if (
+                should_run_draft_extend = (
                     self.server_args.enable_dp_attention
                     or batch.spec_info.verified_id.shape[0] > 0
-                ):
+                )
+                if should_run_draft_extend:
                     # decode is not finished
+                    if should_record_time:
+                        device_module.synchronize()
+                        draft_extend_start = time.perf_counter()
                     self.forward_draft_extend_after_decode(batch)
+                    if should_record_time:
+                        device_module.synchronize()
+                        draft_extend_elapsed_ms = (
+                            time.perf_counter() - draft_extend_start
+                        ) * 1000.0
+
+            if self.spec_timing_warmup_sim_recorder is not None:
+                draft_bs = batch.batch_size()
+                draft_steps = self.speculative_num_steps
+                verify_bs = batch.batch_size()
+                verify_query_len = (
+                    spec_info.draft_token.numel() // verify_bs if verify_bs > 0 else 0
+                )
+                draft_extend_bs = batch.batch_size()
+                draft_extend_query_len = self.speculative_num_steps + 1
+                self.spec_timing_warmup_sim_recorder.update(
+                    "draft", draft_bs, draft_steps, draft_elapsed_ms
+                )
+                self.spec_timing_warmup_sim_recorder.update(
+                    "verify", verify_bs, verify_query_len, verify_elapsed_ms
+                )
+                if draft_extend_elapsed_ms is not None:
+                    self.spec_timing_warmup_sim_recorder.update(
+                        "draft_extend",
+                        draft_extend_bs,
+                        draft_extend_query_len,
+                        draft_extend_elapsed_ms,
+                    )
+
+            if should_log_time:
+                draft_bs = batch.batch_size()
+                draft_steps = self.speculative_num_steps
+                verify_bs = batch.batch_size()
+                verify_query_len = (
+                    spec_info.draft_token.numel() // verify_bs if verify_bs > 0 else 0
+                )
+                draft_extend_bs = batch.batch_size()
+                draft_extend_query_len = self.speculative_num_steps + 1
+                logger.info(
+                    "run_batch speculative timing: "
+                    "draft(bs=%s, draft_steps=%s, time_ms=%.3f) "
+                    "verify(bs=%s, query_len=%s, time_ms=%.3f) "
+                    "draft_extend(bs=%s, query_len=%s, time_ms=%s)",
+                    draft_bs,
+                    draft_steps,
+                    draft_elapsed_ms,
+                    verify_bs,
+                    verify_query_len,
+                    verify_elapsed_ms,
+                    draft_extend_bs,
+                    draft_extend_query_len,
+                    (
+                        f"{draft_extend_elapsed_ms:.3f}"
+                        if draft_extend_elapsed_ms is not None
+                        else "skipped"
+                    ),
+                )
 
             # For ema strategy: update EMA after verify results are available.
             # For batch_size_aware strategy: this call is a no-op (batch_size not given).
