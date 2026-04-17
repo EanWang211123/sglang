@@ -59,8 +59,8 @@ class AdaptiveSpeculativeParams:
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
         self.warmup_batches = cfg.get("warmup_batches", 10)
-        self.down_hysteresis = cfg.get("down_hysteresis", 0.0)
-        self.up_hysteresis = cfg.get("up_hysteresis", -0.25)
+        self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
+        self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
 
         self.current_steps = min(
             self.candidate_steps,

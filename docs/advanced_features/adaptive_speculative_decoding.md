@@ -16,31 +16,7 @@ It is designed for workloads whose accept length changes over time, where one st
 - If `num_steps` is too small, the draft model could have produced more accepted tokens, but the round stops too early.
 - If `num_steps` is too large, the draft model produces many candidate tokens that the target model rejects, so extra draft work is wasted.
 
-The tables below are adapted from the benchmark examples in PR #21599. They are illustrative rather than universal.
-
-### Case 1: `num_steps` too small
-
-Here, acceptance is high, so a larger step count helps:
-
-| Mode | Throughput | Avg latency | Avg accept len |
-|---|---:|---:|---:|
-| baseline | 460.7 tok/s | 4.442 s | nan |
-| static1 | 620.6 tok/s | 3.299 s | 2.00 |
-| static3 | 954.8 tok/s | 2.117 s | 3.88 |
-| static7 | 999.0 tok/s | 1.914 s | 6.25 |
-
-### Case 2: `num_steps` too large
-
-Here, acceptance is low, so a larger step count hurts:
-
-| Mode | Throughput | Avg latency | Avg accept len |
-|---|---:|---:|---:|
-| baseline | 453.1 tok/s | 4.515 s | nan |
-| static1 | 473.5 tok/s | 4.130 s | 1.74 |
-| static3 | 505.1 tok/s | 3.797 s | 2.28 |
-| static7 | 425.8 tok/s | 4.292 s | 2.42 |
-
-Adaptive mode is useful when real traffic moves between these regimes.
+Real traffic often moves between high-acceptance and low-acceptance phases, so one fixed step count is usually a compromise. Adaptive mode tries to follow the workload instead of hard-coding a single global `num_steps`.
 
 ## Design overview
 
@@ -128,6 +104,7 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-path lmsys/sglang-EAGLE-llama2-chat-7B \
     --speculative-eagle-topk 1 \
     --speculative-num-steps 3 \
+    --speculative-num-draft-tokens 4 \
     --speculative-adaptive
 ```
 
@@ -154,8 +131,8 @@ The config file is optional. Any omitted keys use defaults.
 | `ema_alpha` | `0.2` | EMA smoothing factor for accepted draft length |
 | `update_interval` | `5` | Recompute interval, in verify batches, after warmup |
 | `warmup_batches` | `10` | Number of verify batches to observe before switching |
-| `down_hysteresis` | `0.0` | Extra margin before moving to a smaller step |
-| `up_hysteresis` | `-0.25` | Extra margin before moving to a larger step |
+| `down_hysteresis` | `-0.25` | Extra margin before moving to a smaller step |
+| `up_hysteresis` | `0.0` | Extra margin before moving to a larger step |
 
 The initial `--speculative-num-steps` is snapped to the nearest value in `candidate_steps`.
 

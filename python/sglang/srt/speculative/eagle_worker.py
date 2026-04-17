@@ -539,10 +539,9 @@ class EAGLEWorker(TpModelWorker):
 
             # For ema strategy: update EMA after verify results are available.
             # For batch_size_aware strategy: this call is a no-op (batch_size not given).
-            if self.adaptive_controller is not None:
-                self.adaptive_controller.on_verify_complete(
-                    accept_lengths=verify_output.accept_length_per_req_cpu
-                )
+            controller = getattr(self, "adaptive_controller", None)
+            if controller is not None:
+                controller.on_verify_complete(verify_output.accept_length_per_req_cpu)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
