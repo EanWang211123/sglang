@@ -1,16 +1,21 @@
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, Union
 
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     load_adaptive_config,
+)
+from sglang.srt.speculative.batch_size_aware_spec_params import (
+    BatchSizeAwareSpecParams,
+    load_batch_size_aware_config,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
     from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
@@ -53,12 +58,21 @@ class AdaptiveSpecWorker(Protocol):
     """Protocol that a worker must implement to use AdaptiveController."""
 
     speculative_num_steps: int
+    server_args: "ServerArgs"
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState: ...
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
+
+
+_STRATEGY_EMA = "ema"
+_STRATEGY_BATCH_SIZE_AWARE = "batch_size_aware"
+_VALID_STRATEGIES = (_STRATEGY_EMA, _STRATEGY_BATCH_SIZE_AWARE)
 
 
 class AdaptiveController:
@@ -71,16 +85,51 @@ class AdaptiveController:
     The worker only needs to:
       1. Call ``register()`` for the initial state, then ``init_states()``
          once during startup.
-      2. Call ``on_verify_complete(accept_lengths)`` after each decode verify.
+      2. Call ``on_verify_complete(accept_lengths, batch_size)`` after each
+         decode verify.
+
+    Supported strategies
+    --------------------
+    ``"ema"`` (default)
+        Uses EMA of observed acceptance lengths to adapt num_steps.
+        Config is loaded from *config_path* via :func:`load_adaptive_config`.
+
+    ``"batch_size_aware"``
+        Resolves num_steps directly from the current batch size via a
+        user-supplied lookup table.
+        Config is loaded from *config_path* via
+        :func:`load_batch_size_aware_config`.
     """
 
-    def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
+    def __init__(
+        self,
+        worker: AdaptiveSpecWorker,
+        config_path: str | None = None,
+        strategy: str = _STRATEGY_EMA,
+    ):
+        if strategy not in _VALID_STRATEGIES:
+            raise ValueError(
+                f"Unknown adaptive speculative strategy {strategy!r}. "
+                f"Valid choices: {_VALID_STRATEGIES}"
+            )
         self.worker = worker
-        cfg = load_adaptive_config(config_path)
-        self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
-            config=cfg,
-        )
+        self._strategy = strategy
+
+        if strategy == _STRATEGY_BATCH_SIZE_AWARE:
+            cfg = load_batch_size_aware_config(config_path)
+            self.params: Union[AdaptiveSpeculativeParams, BatchSizeAwareSpecParams] = (
+                BatchSizeAwareSpecParams(
+                    default_steps=worker.speculative_num_steps,
+                    config=cfg,
+                )
+            )
+        else:
+            cfg = load_adaptive_config(config_path)
+            self.params = AdaptiveSpeculativeParams(
+                initial_steps=worker.speculative_num_steps,
+                config=cfg,
+            )
+
         self._states: dict[int, SpecRuntimeState] = {}
 
     @property
@@ -97,20 +146,67 @@ class AdaptiveController:
 
     def init_states(self) -> None:
         """Build and register runtime states for all candidate steps."""
+        if self._strategy == _STRATEGY_BATCH_SIZE_AWARE:
+            self._init_states_batch_size_aware()
+        else:
+            self._init_states_ema()
+        self._activate(self.params.current_steps)
+
+    def _init_states_ema(self) -> None:
+        """Build states for the EMA strategy.
+
+        The initial default state was already captured during worker init and
+        registered via ``register()``.  It covers all batch sizes, which is
+        exactly what EMA needs, so we skip rebuilding it and only build the
+        remaining candidate steps.
+        """
         for steps in self.params.candidate_steps:
             if steps in self._states:
                 continue
-            state = self.worker.build_adaptive_runtime_state(
+            self._states[steps] = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
             )
-            self._states[steps] = state
-        self._activate(self.params.current_steps)
 
-    def on_verify_complete(self, accept_lengths: list[int]) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
-        if self.params.update(accept_lengths):
-            self._activate(self.params.current_steps)
+    def _init_states_batch_size_aware(self) -> None:
+        """Build states for the batch_size_aware strategy.
+
+        Every candidate step — including the default one that was pre-registered
+        during worker init — must be rebuilt so that each step only captures the
+        batch sizes actually routed to it.  After all states are replaced the
+        old full-batch-size CUDA graphs are dereferenced; an explicit GC pass
+        reclaims the GPU memory before the server starts serving requests.
+        """
+        assert isinstance(self.params, BatchSizeAwareSpecParams)
+        all_bs: list[int] = self.worker.server_args.cuda_graph_bs or []
+        for steps in self.params.candidate_steps:
+            cuda_graph_bs = self.params.batch_sizes_for_step(steps, all_bs)
+            if not cuda_graph_bs:
+                logger.warning(
+                    f"batch_size_aware: no batch sizes in cuda_graph_bs={all_bs} "
+                    f"are routed to steps={steps}; skipping state build."
+                )
+                continue
+            self._states[steps] = self.worker.build_adaptive_runtime_state(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                cuda_graph_bs=cuda_graph_bs,
+            )
+
+    def on_verify_complete(
+        self,
+        accept_lengths: list[int] | None = None,
+        batch_size: int | None = None,
+    ) -> None:
+        """Call this method in one of two ways depending on the active strategy"""
+        if self._strategy == _STRATEGY_BATCH_SIZE_AWARE:
+            assert isinstance(self.params, BatchSizeAwareSpecParams)
+            if batch_size is not None and self.params.update(batch_size):
+                self._activate(self.params.current_steps)
+        else:
+            assert isinstance(self.params, AdaptiveSpeculativeParams)
+            if accept_lengths is not None and self.params.update(accept_lengths):
+                self._activate(self.params.current_steps)
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

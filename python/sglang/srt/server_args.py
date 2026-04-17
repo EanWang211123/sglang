@@ -515,6 +515,7 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
+    speculative_adaptive_strategy: str = "ema"
     speculative_adaptive_config: Optional[str] = None
 
     # Speculative decoding (ngram)
@@ -5272,9 +5273,28 @@ class ServerArgs:
             default=ServerArgs.speculative_adaptive,
         )
         parser.add_argument(
+            "--speculative-adaptive-strategy",
+            type=str,
+            choices=["ema", "batch_size_aware"],
+            default=ServerArgs.speculative_adaptive_strategy,
+            help=(
+                "Strategy for adaptive speculative decoding (requires "
+                "--speculative-adaptive). "
+                "'ema' (default): adjusts num_steps via EMA of acceptance lengths. "
+                "'batch_size_aware': resolves num_steps from a static batch-size "
+                "lookup table supplied via --speculative-adaptive-config."
+            ),
+        )
+        parser.add_argument(
             "--speculative-adaptive-config",
             type=str,
-            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            help=(
+                "Path to a JSON config file for adaptive speculative decoding. "
+                "For 'ema' strategy: tuning knobs (ema_alpha, update_interval, etc.). "
+                "For 'batch_size_aware' strategy: a JSON object with a "
+                "'batch_size_to_steps' key mapping batch-size strings to step counts, "
+                'e.g. {"batch_size_to_steps": {"1": 7, "2": 5, "4": 3}}.'
+            ),
             default=ServerArgs.speculative_adaptive_config,
         )
 

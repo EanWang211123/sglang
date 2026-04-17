@@ -25,7 +25,11 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import (
+    CudaGraphRunner,
+    get_batch_sizes_to_capture,
+)
+from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -113,7 +117,9 @@ class EAGLEWorker(TpModelWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
+                strategy=server_args.speculative_adaptive_strategy,
             )
 
         # Override the context length of the draft model to be the same as the target model.
@@ -332,15 +338,32 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState:
-        """Build a SpecRuntimeState for the given step configuration."""
+        """Build a SpecRuntimeState for the given step configuration.
+
+        Args:
+            speculative_num_steps: Number of draft steps for this state.
+            speculative_num_draft_tokens: Total draft tokens (= steps + 1).
+            cuda_graph_bs: When provided, only these batch sizes are captured
+                for all three CUDA graph runners (draft / extend / verify).
+                ``None`` falls back to the full ``server_args.cuda_graph_bs``.
+        """
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs
         ):
+            capture_bs, _ = get_batch_sizes_to_capture(self.draft_model_runner)
+            logger.info(
+                f"Adaptive cuda graph capture (steps={speculative_num_steps}): "
+                f"batch_sizes={capture_bs}"
+            )
+
             # Reuse existing init methods for draft attention backend and cuda graphs
             self.init_attention_backend()
             self.init_cuda_graphs()
@@ -389,9 +412,18 @@ class EAGLEWorker(TpModelWorker):
 
     @contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ):
-        """Temporarily override server_args and worker attributes for graph capture."""
+        """Temporarily override server_args and worker attributes for graph capture.
+
+        Args:
+            cuda_graph_bs: When not ``None``, temporarily replaces
+                ``server_args.cuda_graph_bs`` so that all three graph runners
+                (draft / extend / verify) capture only this subset of batch sizes.
+        """
         sa = self.server_args
         backup = (
             self.speculative_num_steps,
@@ -403,11 +435,21 @@ class EAGLEWorker(TpModelWorker):
             getattr(self, "cuda_graph_runner_for_draft_extend", None),
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
         )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+        # Each adaptive build must start with a clean buffer pool so that
+        # runners with different num_tokens_per_bs (= speculative_num_steps+1)
+        # do NOT accidentally reuse each other's "accept_length" / "extend_seq_lens"
+        # buffers (share_buffers picks the largest old buffer, which would carry
+        # the wrong fill-value from a previous build).
+        pool_snapshot = dict(_forward_input_buffer_pool)
+        _forward_input_buffer_pool.clear()
         try:
             yield
         finally:
@@ -421,7 +463,12 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
             ) = backup
+            # Restore the buffer pool to its pre-build state so subsequent
+            # builds always start clean.
+            _forward_input_buffer_pool.clear()
+            _forward_input_buffer_pool.update(pool_snapshot)
 
     @property
     def draft_model_runner(self):
@@ -463,6 +510,13 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            # For batch_size_aware strategy: resolve steps before drafting.
+            # For ema strategy: this call is a no-op (accept_lengths not given).
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.on_verify_complete(
+                    batch_size=batch.batch_size()
+                )
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -483,9 +537,11 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
+            # For ema strategy: update EMA after verify results are available.
+            # For batch_size_aware strategy: this call is a no-op (batch_size not given).
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
-                    verify_output.accept_length_per_req_cpu
+                    accept_lengths=verify_output.accept_length_per_req_cpu
                 )
 
             return GenerationBatchResult(
