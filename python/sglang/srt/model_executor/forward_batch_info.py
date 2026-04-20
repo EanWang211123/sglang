@@ -322,6 +322,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     temperature: torch.Tensor = None
     top_p_normalized_logprobs: bool = False
     top_p: torch.Tensor = None
+    use_local_spec_draft_top1: bool = False
 
     # Position information
     positions: torch.Tensor = None

@@ -375,6 +375,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
+            use_local_spec_draft_top1=self.eagle_worker._should_use_local_spec_draft_top1(),
             attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
         )
@@ -409,8 +410,15 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            probs = torch.softmax(ret.next_token_logits, dim=-1)
-            ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.eagle_worker._should_use_local_spec_draft_top1():
+                ret.topk_p, ret.topk_index = (
+                    self.eagle_worker._distributed_draft_top1_from_local_logits(
+                        ret.next_token_logits
+                    )
+                )
+            else:
+                probs = torch.softmax(ret.next_token_logits, dim=-1)
+                ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup

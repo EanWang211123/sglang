@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_gather
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
@@ -214,6 +214,30 @@ class EAGLEWorker(TpModelWorker):
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
+
+        # Single packed (max, id-as-fp32) tensor for the cross-rank all_gather
+        # so we issue one NCCL call per draft step instead of two.
+        self._draft_top1_local_pack_buf: Optional[torch.Tensor] = None
+        self._draft_top1_gathered_pack_buf: Optional[torch.Tensor] = None
+        self._draft_top1_best_rank_buf: Optional[torch.Tensor] = None
+        self._draft_top1_rank_index_buf: Optional[torch.Tensor] = None
+        self._draft_top1_winner_f32_buf: Optional[torch.Tensor] = None
+        # Pre-filled `ones` returned as `topk_p` so we skip a per-call alloc.
+        self._draft_top1_ones_buf: Optional[torch.Tensor] = None
+        self._draft_top1_token_cap: int = 0
+        self._draft_top1_gather_cap: int = 0
+        # Pre-built `local_pos -> global_vocab_id` lookup table for the
+        # local-top1 path; see `_build_local_pos_to_global_id_lut`.
+        self._draft_top1_local_to_global_id_lut: Optional[torch.Tensor] = None
+
+        # Pre-allocate local-top1 scratch buffers ONCE, up-front. They are
+        # referenced by captured CUDA graphs (draft decode and draft extend);
+        # re-allocating later via torch.empty would drop the old tensor's
+        # Python reference and let another tensor silently reuse the memory
+        # while captured graphs still write/read through the baked-in
+        # pointer. Size them for the largest bs any subsequent graph capture
+        # can request and forbid re-allocation afterwards.
+        self._preallocate_draft_top1_buffers(server_args)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -525,10 +549,9 @@ class EAGLEWorker(TpModelWorker):
         else:
             # For batch_size_aware strategy: resolve steps before drafting.
             # For ema strategy: this call is a no-op (accept_lengths not given).
-            if self.adaptive_controller is not None:
-                self.adaptive_controller.on_verify_complete(
-                    batch_size=batch.batch_size()
-                )
+            controller = getattr(self, "adaptive_controller", None)
+            if controller is not None:
+                controller.on_verify_complete(batch_size=batch.batch_size())
 
             enable_log_time = self.server_args.enable_speculative_time_logging
             should_record_time = (
@@ -931,6 +954,259 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
+    def _should_use_local_spec_draft_top1(self) -> bool:
+        if not self.server_args.speculative_local_draft_top1:
+            return False
+        if self.topk != 1:
+            return False
+        # When speculative_token_map/hot_token_id is active, the shared lm_head can be
+        # remapped to a hot-vocab subset, so lm_head.shard_indices no longer describe the
+        # actual local logits layout. The local-top1 optimization would decode wrong ids.
+        if self.hot_token_id is not None:
+            return False
+        lm_head = getattr(self.draft_model_runner.model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "shard_indices"):
+            return False
+        return get_tp_group().world_size > 1
+
+    def _preallocate_draft_top1_buffers(self, server_args: ServerArgs) -> None:
+        """Allocate local-top1 scratch buffers with a safe upper bound.
+
+        Called exactly once before any CUDA graph is captured. The capacity
+        must cover the largest num_tokens any draft-decode / draft-extend
+        CUDA graph will pass in (for topk=1 this is the capture-time bs,
+        bounded by cuda_graph_max_bs / max_running_requests).
+        """
+        if not server_args.speculative_local_draft_top1:
+            return
+
+        tp_size = int(get_tp_group().world_size)
+        if tp_size <= 1:
+            return
+
+        max_bs_candidates = [
+            server_args.cuda_graph_max_bs,
+            server_args.max_running_requests,
+        ]
+        max_bs_candidates = [x for x in max_bs_candidates if x is not None and x > 0]
+        max_num_tokens = max(max_bs_candidates) if max_bs_candidates else 0
+        # Hard safety floor so that we always have enough room.
+        max_num_tokens = max(max_num_tokens, 1024)
+
+        device = torch.device(self.device)
+        gather_cap = max_num_tokens * tp_size
+
+        # (N, 2) fp32 pack: [:, 0] = local_max, [:, 1] = global_id-as-fp32.
+        self._draft_top1_local_pack_buf = torch.empty(
+            (max_num_tokens, 2), dtype=torch.float32, device=device
+        )
+        self._draft_top1_gathered_pack_buf = torch.empty(
+            (gather_cap, 2), dtype=torch.float32, device=device
+        )
+        self._draft_top1_gather_cap = gather_cap
+
+        self._draft_top1_best_rank_buf = torch.empty(
+            (max_num_tokens,), dtype=torch.int64, device=device
+        )
+        self._draft_top1_rank_index_buf = torch.empty(
+            (1, max_num_tokens), dtype=torch.int64, device=device
+        )
+        self._draft_top1_winner_f32_buf = torch.empty(
+            (1, max_num_tokens), dtype=torch.float32, device=device
+        )
+        self._draft_top1_ones_buf = torch.ones(
+            (max_num_tokens, 1), dtype=torch.float32, device=device
+        )
+        self._draft_top1_token_cap = max_num_tokens
+
+        self._build_local_pos_to_global_id_lut(device=device)
+
+    def _build_local_pos_to_global_id_lut(self, device: torch.device) -> None:
+        """Precompute local-shard-position -> global-vocab-id for local top-1.
+
+        `_distributed_draft_top1_from_local_logits` takes argmax within the
+        two valid regions of the padded local shard (base: [0, num_org),
+        added: [num_org_padded, num_org_padded + num_added)). A flat LUT of
+        length `num_org_padded + num_added_padded` lets us map the winning
+        local position to its global vocab id with a single gather, removing
+        the runtime base/added branch.
+        """
+        lm_head = getattr(self.draft_model_runner.model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "shard_indices"):
+            self._draft_top1_local_to_global_id_lut = None
+            return
+        shard = lm_head.shard_indices
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        num_added_padded = int(shard.num_added_elements_padded)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        total = num_org_padded + num_added_padded
+        # Padding slots are filled with 0 for safety — argmax is restricted to
+        # the valid regions above, so these entries are never read.
+        lut = torch.zeros((total,), dtype=torch.int64, device=device)
+        if num_org > 0:
+            lut[:num_org] = (
+                torch.arange(num_org, dtype=torch.int64, device=device)
+                + org_vocab_start
+            )
+        if num_added > 0:
+            lut[num_org_padded : num_org_padded + num_added] = (
+                torch.arange(num_added, dtype=torch.int64, device=device)
+                + added_vocab_start
+            )
+        # The cross-rank all_gather packs ids into fp32 alongside the max
+        # value to halve NCCL calls. fp32 has 24 mantissa bits, so ids must
+        # fit in [0, 2**24) for a lossless round-trip. This covers every
+        # real-world LLM vocabulary (the largest known is ~256K).
+        _FP32_INT_EXACT_MAX = 1 << 24
+        assert int(lut.max().item()) < _FP32_INT_EXACT_MAX, (
+            f"Global vocab id >= 2**24 is not exactly representable in fp32; "
+            f"local-top1 all_gather packing would be lossy. "
+            f"Max id = {int(lut.max().item())}."
+        )
+        self._draft_top1_local_to_global_id_lut = lut
+
+    def _ensure_draft_top1_buffers(
+        self, *, num_tokens: int, tp_size: int, device: torch.device
+    ) -> None:
+        # Buffers MUST have been preallocated in __init__ (before any CUDA
+        # graph capture). If we ever need more capacity than was preallocated
+        # it means the preallocation upper bound was wrong — we fail loudly
+        # rather than silently re-allocating, because re-allocating here would
+        # invalidate already-captured CUDA graphs (see the note at the
+        # _preallocate_draft_top1_buffers call site).
+        needed_gather_cap = num_tokens * tp_size
+        assert (
+            self._draft_top1_local_pack_buf is not None
+            and self._draft_top1_gathered_pack_buf is not None
+            and self._draft_top1_best_rank_buf is not None
+            and self._draft_top1_rank_index_buf is not None
+            and self._draft_top1_winner_f32_buf is not None
+            and self._draft_top1_ones_buf is not None
+        ), (
+            "Local-top1 scratch buffers were not preallocated. "
+            "speculative_local_draft_top1 should have triggered "
+            "_preallocate_draft_top1_buffers in __init__."
+        )
+        assert self._draft_top1_gather_cap >= needed_gather_cap, (
+            f"Local-top1 gather buffer too small: need {needed_gather_cap}, "
+            f"have {self._draft_top1_gather_cap}. Increase --cuda-graph-max-bs "
+            f"or the internal safety floor in _preallocate_draft_top1_buffers."
+        )
+        assert self._draft_top1_token_cap >= num_tokens, (
+            f"Local-top1 token buffer too small: need {num_tokens}, "
+            f"have {self._draft_top1_token_cap}."
+        )
+        assert self._draft_top1_local_pack_buf.device == device, (
+            f"Local-top1 buffer device mismatch: "
+            f"buffer on {self._draft_top1_local_pack_buf.device}, request on {device}."
+        )
+
+    def _distributed_draft_top1_from_local_logits(
+        self, local_logits: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Global draft top-1 computed from per-rank sharded logits.
+
+        Skips the vocab-size all_gather by taking argmax within each rank's
+        local shard, gathering only the (max, global_id) pair, and selecting
+        the winning rank per token. The caller is expected to pass
+        `logits_output.next_token_logits`, which — when
+        `forward_batch.use_local_spec_draft_top1` is set — is the untouched
+        local shard produced by `LogitsProcessor._get_logits` (no fp32 copy,
+        no softcap; both are argmax-invariant).
+        """
+        lm_head = self.draft_model_runner.model.lm_head
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "EAGLE local draft top1 requires a vocab-parallel lm_head with "
+                "`weight` and `shard_indices`."
+            )
+        shard = lm_head.shard_indices
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        num_tokens = int(local_logits.shape[0])
+        device = local_logits.device
+
+        if num_tokens == 0:
+            empty_probs = torch.empty((0, 1), dtype=torch.float32, device=device)
+            empty_ids = torch.empty((0, 1), dtype=torch.int64, device=device)
+            return empty_probs, empty_ids
+
+        self._ensure_draft_top1_buffers(
+            num_tokens=num_tokens, tp_size=tp_size, device=device
+        )
+
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+
+        # Argmax is restricted to the two valid regions of the padded local
+        # shard so `local_arg` always indexes a real vocab entry.
+        if num_added > 0:
+            base_max, base_arg = torch.max(local_logits[:, :num_org], dim=-1)
+            added_max, added_arg = torch.max(
+                local_logits[:, num_org_padded : num_org_padded + num_added], dim=-1
+            )
+            use_added = added_max > base_max
+            local_max = torch.where(use_added, added_max, base_max)
+            local_arg = torch.where(use_added, added_arg + num_org_padded, base_arg)
+        elif num_org > 0:
+            local_max, local_arg = torch.max(local_logits[:, :num_org], dim=-1)
+        else:
+            # This rank owns no real vocab entries — force -inf so every other
+            # rank wins during the cross-rank argmax.
+            local_max = torch.full(
+                (num_tokens,),
+                torch.finfo(local_logits.dtype).min,
+                dtype=local_logits.dtype,
+                device=device,
+            )
+            local_arg = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
+
+        # Single gather via a pre-built LUT instead of runtime base/added branching.
+        assert self._draft_top1_local_to_global_id_lut is not None, (
+            "Local top-1 LUT was not built. _preallocate_draft_top1_buffers "
+            "must be called in EAGLEWorker.__init__ before this path is used."
+        )
+        global_ids = self._draft_top1_local_to_global_id_lut[local_arg]
+
+        if tp_size > 1:
+            # Single NCCL call instead of two: pack `(local_max, global_id)`
+            # into one (N, 2) fp32 tensor and all_gather it whole. This is the
+            # latency-dominant cost of the local-top1 path, so halving the
+            # call count matters more than trimming volume.
+            local_pack = self._draft_top1_local_pack_buf[:num_tokens]
+            local_pack[:, 0].copy_(local_max)
+            local_pack[:, 1].copy_(global_ids)
+
+            gathered_pack = self._draft_top1_gathered_pack_buf[: num_tokens * tp_size]
+            tp_group.all_gather_into_tensor(gathered_pack, local_pack)
+
+            packed = gathered_pack.view(tp_size, num_tokens, 2)
+            best_rank = self._draft_top1_best_rank_buf[:num_tokens]
+            torch.argmax(packed[..., 0], dim=0, out=best_rank)
+
+            rank_index = self._draft_top1_rank_index_buf[:, :num_tokens]
+            rank_index[0].copy_(best_rank)
+            winner_f32 = self._draft_top1_winner_f32_buf[:, :num_tokens]
+            torch.gather(packed[..., 1], 0, rank_index, out=winner_f32)
+
+            # `.to(int64)` always returns a fresh tensor (different dtype),
+            # which both casts back from the fp32-packed id and breaks any
+            # aliasing with the reused scratch buffers above — no extra clone.
+            selected_ids_out = winner_f32.to(torch.int64).view(-1, 1)
+        else:
+            # Unreachable: `_should_use_local_spec_draft_top1` gates this path
+            # on tp_size > 1. Kept as a minimal correctness fallback.
+            selected_ids_out = global_ids.view(-1, 1).clone()
+
+        # Pre-filled ones, shared read-only across calls.
+        top1_p = self._draft_top1_ones_buf[:num_tokens]
+        return top1_p, selected_ids_out
+
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info = forward_batch.spec_info
@@ -961,6 +1237,8 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        use_local_spec_draft_top1 = self._should_use_local_spec_draft_top1()
+        draft_vocab_size = self.draft_model_runner.model.lm_head.num_embeddings
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -987,19 +1265,25 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+            forward_batch.use_local_spec_draft_top1 = use_local_spec_draft_top1
 
             # Run forward
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if use_local_spec_draft_top1:
+                topk_p, topk_index = self._distributed_draft_top1_from_local_logits(
+                    logits_output.next_token_logits
+                )
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                draft_vocab_size,
+                f"draft_forward step {i}: topk_index OOB vs vocab_size={draft_vocab_size}",
             )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
@@ -1221,6 +1505,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
+        forward_batch.use_local_spec_draft_top1 = self._should_use_local_spec_draft_top1()
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
@@ -1275,6 +1560,7 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        forward_batch.use_local_spec_draft_top1 = self._should_use_local_spec_draft_top1()
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
@@ -1327,8 +1613,17 @@ class EAGLEWorker(TpModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        if self._should_use_local_spec_draft_top1():
+            draft_input.topk_p, draft_input.topk_index = (
+                self._distributed_draft_top1_from_local_logits(
+                    logits_output.next_token_logits
+                )
+            )
+        else:
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            draft_input.topk_p, draft_input.topk_index = fast_topk(
+                probs, self.topk, dim=-1
+            )
         draft_input.hidden_states = logits_output.hidden_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

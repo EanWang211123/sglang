@@ -47,6 +47,10 @@ class StandaloneWorker(EAGLEWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # StandaloneWorker bypasses EAGLEWorker.__init__, so define optional
+        # runtime helpers that forward_batch_generation may read.
+        self.adaptive_controller = None
+        self.spec_timing_warmup_sim_recorder = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -88,6 +92,24 @@ class StandaloneWorker(EAGLEWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
+
+        # Mirror the local-top1 scratch buffer declarations from
+        # EAGLEWorker.__init__ — StandaloneWorker bypasses that constructor,
+        # so we must declare them here before any CUDA graph capture sees
+        # `_distributed_draft_top1_from_local_logits`.
+        self._draft_top1_local_pack_buf: Optional[torch.Tensor] = None
+        self._draft_top1_gathered_pack_buf: Optional[torch.Tensor] = None
+        self._draft_top1_best_rank_buf: Optional[torch.Tensor] = None
+        self._draft_top1_rank_index_buf: Optional[torch.Tensor] = None
+        self._draft_top1_winner_f32_buf: Optional[torch.Tensor] = None
+        self._draft_top1_ones_buf: Optional[torch.Tensor] = None
+        self._draft_top1_token_cap: int = 0
+        self._draft_top1_gather_cap: int = 0
+        self._draft_top1_local_to_global_id_lut: Optional[torch.Tensor] = None
+
+        # Pre-allocate local-top1 scratch buffers once, up-front, for the
+        # same CUDA-graph aliasing reason explained in EAGLEWorker.__init__.
+        self._preallocate_draft_top1_buffers(server_args)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (

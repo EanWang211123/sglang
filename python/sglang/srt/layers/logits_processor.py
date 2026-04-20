@@ -112,6 +112,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    use_local_spec_draft_top1: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -181,6 +182,7 @@ class LogitsMetadata:
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            use_local_spec_draft_top1=forward_batch.use_local_spec_draft_top1,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -853,7 +855,10 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.do_tensor_parallel_all_gather:
+        if (
+            self.do_tensor_parallel_all_gather
+            and not logits_metadata.use_local_spec_draft_top1
+        ):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
@@ -865,7 +870,11 @@ class LogitsProcessor(nn.Module):
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
-        if self.final_logit_softcapping:
+        # The local-top1 path only consumes logits via argmax, which is
+        # invariant under the monotone `final_logit_softcapping` map, so we
+        # intentionally skip the softcap (and the fp32 copy inside
+        # `_copy_logits_to_buffer`) to save one full-vocab pass.
+        if self.final_logit_softcapping and not logits_metadata.use_local_spec_draft_top1:
             if not _is_npu:
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
@@ -978,6 +987,11 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
+        if logits_metadata.use_local_spec_draft_top1:
+            # Hand the local shard logits back in their native dtype — the
+            # local-top1 consumer only needs argmax, so a full-vocab fp32 copy
+            # would be pure overhead here.
+            return logits
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float

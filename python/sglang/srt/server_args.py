@@ -515,6 +515,7 @@ class ServerArgs:
     speculative_adaptive_strategy: str = "ema"
     speculative_adaptive_config: Optional[str] = None
     enable_speculative_time_logging: bool = False
+    speculative_local_draft_top1: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -5236,6 +5237,16 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_speculative_time_logging,
             help="Synchronize CPU/GPU around draft, verify, and draft-extend, then log per-batch stage timings.",
+        )
+        parser.add_argument(
+            "--speculative-local-draft-top1",
+            default=ServerArgs.speculative_local_draft_top1,
+            action=argparse.BooleanOptionalAction,
+            help=(
+                "Enable the local-top1 optimization for speculative drafting when "
+                "running EAGLE with speculative_eagle_topk=1 on tensor-parallel "
+                "sharded vocabularies. Disable to force the original full-logits path."
+            ),
         )
 
         # Speculative decoding (ngram)
