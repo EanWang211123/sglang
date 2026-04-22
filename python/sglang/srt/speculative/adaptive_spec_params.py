@@ -8,6 +8,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CANDIDATE_STEPS: tuple[int, ...] = (1, 3, 7)
+
 
 def load_adaptive_config(path: str | None) -> dict[str, object]:
     """Load adaptive speculative config from a JSON file.
@@ -30,6 +32,15 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
     return cfg
 
 
+def resolve_candidate_steps(
+    config: dict[str, object] | str | None = None,
+) -> list[int]:
+    """Return normalized ``candidate_steps`` from a config dict or JSON path (``None`` -> defaults)."""
+    cfg = config if isinstance(config, dict) else load_adaptive_config(config)
+    raw = cfg.get("candidate_steps") or _DEFAULT_CANDIDATE_STEPS
+    return sorted(set(raw))
+
+
 class AdaptiveSpeculativeParams:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
@@ -49,7 +60,7 @@ class AdaptiveSpeculativeParams:
     ):
         cfg = config or {}
         # TODO: Wider range of candidate_steps (once lazy init is supported).
-        self.candidate_steps = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
+        self.candidate_steps = resolve_candidate_steps(cfg)
         assert (
             len(self.candidate_steps) >= 2
         ), "candidate_steps must have at least 2 distinct values"
