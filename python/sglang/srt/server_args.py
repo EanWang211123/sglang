@@ -6554,7 +6554,9 @@ class ServerArgs:
             resolve_candidate_steps,
         )
 
-        max_draft_tokens = max(resolve_candidate_steps(self.speculative_adaptive_config)) + 1
+        max_draft_tokens = (
+            max(resolve_candidate_steps(self.speculative_adaptive_config)) + 1
+        )
         return max(max_draft_tokens, self.speculative_num_draft_tokens)
 
     @property

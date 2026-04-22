@@ -258,7 +258,9 @@ def fused_sigmoid_gating_delta_rule_update(
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
-    cache_steps: Optional[int] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
+    cache_steps: Optional[
+        int
+    ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ):
     """
