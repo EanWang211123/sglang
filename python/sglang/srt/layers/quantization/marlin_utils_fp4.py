@@ -16,14 +16,22 @@ if _is_cuda:
 
 
 def mxfp4_marlin_process_scales(
-    marlin_scales: torch.Tensor, input_dtype: torch.dtype | None = None
+    marlin_scales: torch.Tensor,
+    input_dtype: torch.dtype | None = None,
+    apply_swizzle: bool = True,
 ) -> torch.Tensor:
-    # Match vLLM's MXFP4 Marlin scale preparation exactly for fp16/bf16 inputs.
-    if input_dtype is None or input_dtype.itemsize == 2:
+    if apply_swizzle and (input_dtype is None or input_dtype.itemsize == 2):
         marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
             marlin_scales.size(0), -1
         )
-    return marlin_scales.to(torch.float8_e8m0fnu)
+    marlin_scales = marlin_scales.to(torch.float8_e8m0fnu)
+    if input_dtype == torch.float8_e4m3fn:
+        marlin_scales = marlin_scales.view(torch.uint8)
+        assert marlin_scales.max() <= 249
+        # exponent_bias (fp4->fp8) = 2 ** 3 - 2 ** 1 = 6
+        marlin_scales = marlin_scales + 6
+        marlin_scales = marlin_scales.view(torch.float8_e8m0fnu)
+    return marlin_scales
 
 
 def _normalize_scale_tensor(
@@ -76,7 +84,11 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
         tensor_list = []
         for i in range(num_experts):
-            qweight = weight[i].view(torch.int32).T.contiguous()
+            qweight = weight[i].view(torch.int32)
+            expected_packed_k = size_k // (32 // 4)
+            if qweight.size(0) != expected_packed_k:
+                qweight = qweight.T
+            qweight = qweight.contiguous()
             marlin_qweight = gptq_marlin_repack(
                 b_q_weight=qweight,
                 perm=perm,
@@ -97,7 +109,8 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
         tensor_list = []
         for i in range(num_experts):
-            scale = scales[i].T.contiguous()
+            scale = scales[i].T
+            scale = scale.contiguous()
             marlin_scales = marlin_permute_scales(
                 s=scale,
                 size_k=size_k,
@@ -105,7 +118,10 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
                 group_size=group_size,
             )
             tensor_list.append(
-                mxfp4_marlin_process_scales(marlin_scales, input_dtype=param_dtype)
+                mxfp4_marlin_process_scales(
+                    marlin_scales,
+                    input_dtype=param_dtype,
+                )
             )
         return torch.stack(tensor_list)
 
