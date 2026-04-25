@@ -1,16 +1,15 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 if _is_cuda:
+    from sgl_kernel import silu_and_mul
     from sgl_kernel.scalar_type import scalar_types
-
-if _is_cuda:
-    from sgl_kernel import moe_sum_reduce, silu_and_mul
 
 
 def get_scalar_type(
@@ -28,6 +27,22 @@ def get_scalar_type(
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+
+
+def swiglu_limit_func(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    swiglu_limit: float = 0.0,
+) -> None:
+    d = input.shape[1] // 2
+    gate = input[:, :d]
+    up = input[:, d:]
+
+    if swiglu_limit > 0:
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+
+    output.copy_(F.silu(gate) * up)
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -53,6 +68,7 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -163,11 +179,6 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
-    use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    )
-
     intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
         hidden_states,
         intermediate_cache1,
@@ -192,12 +203,19 @@ def fused_marlin_moe(
         size_n=2 * N,
         size_k=K,
         is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
+        use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
 
-    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    if clamp_limit is not None:
+        swiglu_limit_func(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, 2 * N),
+            clamp_limit,
+        )
+    else:
+        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -226,22 +244,10 @@ def fused_marlin_moe(
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
+        use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
 
     output = hidden_states if inplace else torch.empty_like(hidden_states)
-
-    # NOTE: Do NOT pass routed_scaling_factor into moe_sum_reduce here.
-    # The caller (deepseek_v2.py) already multiplies final_hidden_states by
-    # routed_scaling_factor via either `final_hidden_states *= rsf` or
-    # `shared_output.add_(final_hidden_states, alpha=rsf)`. Passing rsf here
-    # would cause a double-multiply (e.g. 2.5 * 2.5 = 6.25x amplification),
-    # which corrupts MoE outputs for the Marlin backend.
-    moe_sum_reduce(
-        intermediate_cache3,
-        output,
-        1.0,
-    )
-    return output
+    return torch.sum(intermediate_cache3, dim=1, out=output)
