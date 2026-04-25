@@ -107,7 +107,9 @@ def fused_experts_none_to_marlin(
         deepseek_v4_moe_code_path_checker.observed += 1
 
     marlin_hidden_states = hidden_states
-    marlin_inplace = runner_config.inplace
+    # Avoid aliasing the MoE input buffer until Marlin output semantics are
+    # fully validated across shared-expert and overlap paths.
+    marlin_inplace = False
     if (
         quant_info.weight_bits == 4
         and quant_info.w13_qzeros is None
