@@ -28,6 +28,8 @@
 #include "gemm/marlin/marlin_dtypes.cuh"
 #include "scalar_type.hpp"
 
+#include <type_traits>
+
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
   static_assert(                                                                         \
       std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value, \
@@ -1246,17 +1248,27 @@ __global__ void Marlin(
       }
     }
 
-    // Commented out FP4/FP8 scale dequantization since we don't generate
-    // kFE2M1f kernels to reduce compilation time
-    // if constexpr (w_type == sglang::kFE2M1f) {
-    //   int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
-    //   int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+    // FP4/FP8 scale dequantization (E4M3 for NVFP4 and E8M0 for MXFP4).
+    // Aligns with vLLM's single-shot marlin_template.h path: convert the raw
+    // FP8 scale bytes packed into frag_s back to real bf16/half values before
+    // they multiply the dequantized weights.
     //
-    //   dequant_fp8_scales<scalar_t2, s_type_id>(
-    //       s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-    //   dequant_fp8_scales<scalar_t2, s_type_id>(
-    //       s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
-    // }
+    // The half2 + kFE8M0fnu specialization of dequant_fp8_scales is not
+    // defined on purpose (fp16 cannot safely represent 2^e for large |e|, so
+    // fp16+MXFP4 kernels are intentionally not instantiated in
+    // generate_kernels.py). Guard that combination at compile time so the
+    // unused code path is eliminated and no unresolved extern is emitted.
+    if constexpr ((s_type == sglang::kFE4M3fn || s_type == sglang::kFE8M0fnu) &&
+                  !(std::is_same<scalar_t2, half2>::value &&
+                    s_type == sglang::kFE8M0fnu)) {
+      int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
+      int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+
+      dequant_fp8_scales<scalar_t2, s_type_id>(
+          s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+      dequant_fp8_scales<scalar_t2, s_type_id>(
+          s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+    }
 
 // We have the m dimension as the inner loop in order to encourage overlapping
 // dequantization and matmul operations.
@@ -1897,3 +1909,4 @@ __global__ void Marlin(
 }  // namespace MARLIN_NAMESPACE_NAME
 
 #endif
+
