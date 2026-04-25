@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -96,6 +100,11 @@ def fused_experts_none_to_marlin(
         MARLIN_MOE_WORKSPACE = marlin_make_workspace(
             hidden_states.device, max_blocks_per_sm=4
         )
+
+    if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
+        runner_config.swiglu_limit is not None
+    ):
+        deepseek_v4_moe_code_path_checker.observed += 1
 
     output = fused_marlin_moe(
         hidden_states=hidden_states,
