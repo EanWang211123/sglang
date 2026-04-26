@@ -536,3 +536,4 @@ class DeepSeekMxfp4MoEMethod:
                 output.mul_(rsf)
 
         return StandardCombineInput(hidden_states=output)
+
