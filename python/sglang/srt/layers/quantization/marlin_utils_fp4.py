@@ -8,8 +8,28 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
 )
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import get_bool_env_var
 
 _is_cuda = is_cuda()
+_INVERT_MXFP4_MARLIN_SCALES = get_bool_env_var("SGLANG_MXFP4_MARLIN_INVERT_SCALE")
+_SKIP_MXFP4_MARLIN_SCALE_TRANSPOSE = get_bool_env_var(
+    "SGLANG_MXFP4_MARLIN_SKIP_SCALE_TRANSPOSE"
+)
+_SKIP_MXFP4_MARLIN_SCALE_SWIZZLE = get_bool_env_var(
+    "SGLANG_MXFP4_MARLIN_SKIP_SCALE_SWIZZLE"
+)
+_SKIP_MXFP4_MARLIN_W13_SCALE_TRANSPOSE = get_bool_env_var(
+    "SGLANG_MXFP4_MARLIN_W13_SKIP_SCALE_TRANSPOSE"
+)
+_SKIP_MXFP4_MARLIN_W13_SCALE_PERMUTE = get_bool_env_var(
+    "SGLANG_MXFP4_MARLIN_W13_SKIP_SCALE_PERMUTE"
+)
+_SKIP_MXFP4_MARLIN_W13_SCALE_SWIZZLE = get_bool_env_var(
+    "SGLANG_MXFP4_MARLIN_W13_SKIP_SCALE_SWIZZLE"
+)
+_SKIP_MXFP4_MARLIN_WEIGHT_REPACK_TRANSPOSE = get_bool_env_var(
+    "SGLANG_MXFP4_MARLIN_SKIP_WEIGHT_REPACK_TRANSPOSE"
+)
 
 if _is_cuda:
     from sgl_kernel import gptq_marlin_repack
@@ -20,7 +40,11 @@ def mxfp4_marlin_process_scales(
     input_dtype: torch.dtype | None = None,
     apply_swizzle: bool = True,
 ) -> torch.Tensor:
-    if apply_swizzle and (input_dtype is None or input_dtype.itemsize == 2):
+    if (
+        apply_swizzle
+        and not _SKIP_MXFP4_MARLIN_SCALE_SWIZZLE
+        and (input_dtype is None or input_dtype.itemsize == 2)
+    ):
         marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
             marlin_scales.size(0), -1
         )
@@ -86,7 +110,10 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         for i in range(num_experts):
             qweight = weight[i].view(torch.int32)
             expected_packed_k = size_k // (32 // 4)
-            if qweight.size(0) != expected_packed_k:
+            if (
+                not _SKIP_MXFP4_MARLIN_WEIGHT_REPACK_TRANSPOSE
+                or qweight.size(0) != expected_packed_k
+            ):
                 qweight = qweight.T
             qweight = qweight.contiguous()
             marlin_qweight = gptq_marlin_repack(
@@ -101,6 +128,8 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
         scales = _normalize_scale_tensor(scales, param_dtype)
+        if _INVERT_MXFP4_MARLIN_SCALES:
+            scales = torch.reciprocal(scales)
 
         if is_w13:
             size_n, size_k = intermediate_size * 2, hidden_size
@@ -109,18 +138,29 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
         tensor_list = []
         for i in range(num_experts):
-            scale = scales[i].T
-            scale = scale.contiguous()
-            marlin_scales = marlin_permute_scales(
-                s=scale,
-                size_k=size_k,
-                size_n=size_n,
-                group_size=group_size,
+            scale = scales[i]
+            skip_transpose = _SKIP_MXFP4_MARLIN_SCALE_TRANSPOSE or (
+                is_w13 and _SKIP_MXFP4_MARLIN_W13_SCALE_TRANSPOSE
             )
+            if not skip_transpose:
+                scale = scale.T
+            scale = scale.contiguous()
+            skip_permute = is_w13 and _SKIP_MXFP4_MARLIN_W13_SCALE_PERMUTE
+            if skip_permute:
+                marlin_scales = scale
+            else:
+                marlin_scales = marlin_permute_scales(
+                    s=scale,
+                    size_k=size_k,
+                    size_n=size_n,
+                    group_size=group_size,
+                )
+            apply_swizzle = not (is_w13 and _SKIP_MXFP4_MARLIN_W13_SCALE_SWIZZLE)
             tensor_list.append(
                 mxfp4_marlin_process_scales(
                     marlin_scales,
                     input_dtype=param_dtype,
+                    apply_swizzle=apply_swizzle,
                 )
             )
         return torch.stack(tensor_list)
