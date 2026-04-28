@@ -12,9 +12,7 @@ if _is_cuda:
     from sgl_kernel.scalar_type import scalar_types
 
 
-def get_scalar_type(
-    num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] = None
-):
+def get_scalar_type(num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] = None):
     if (
         not has_zp
         and num_bits == 4
@@ -179,6 +177,11 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
+    use_atomic_add = (
+        hidden_states.dtype == torch.half
+        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    ) and (not is_mxfp4_marlin)
+
     intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
         hidden_states,
         intermediate_cache1,
@@ -203,7 +206,7 @@ def fused_marlin_moe(
         size_n=2 * N,
         size_k=K,
         is_k_full=is_k_full,
-        use_atomic_add=False,
+        use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     )
@@ -244,7 +247,7 @@ def fused_marlin_moe(
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
-        use_atomic_add=False,
+        use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
