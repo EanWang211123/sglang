@@ -9,16 +9,19 @@ Workflow (Linux only):
 
     1. Read a JSON config (`--config config.json`).
     2. Launch the sglang server WITHOUT speculative decoding (= baseline).
-       For each (seqlen, batch_size), call `sglang.bench_serving` with the
-       `random` dataset, max-concurrency = batch_size, num-prompts =
-       batch_size * combo_per_batch_size, ignore_eos=True, stream=True.
-       Record `mean_itl_ms` -> itl_baseline.
+       For each (seqlen, batch_size), fire batch_size concurrent streaming
+       requests and measure the raw inter-chunk gap (= time between consecutive
+       SSE data events, NOT divided by accepted tokens). This is the baseline
+       decode-step time.  Record mean_itl_ms → itl_baseline_ms.
     3. For each spec_size in `test_spec_size_list`, restart the server with
-       the speculative args appended, repeat the sweep -> itl_spec.
-    4. Emit a JSON file with one row per (seqlen, batch_size, spec_size):
+       speculative args appended, repeat the sweep.  The inter-chunk gap now
+       measures one full draft+verify+draft-extend cycle → itl_spec_ms.
+    4. Emit a JSONL file with one row per (seqlen, batch_size, spec_size):
            {seqlen, batch_size, spec_size,
             itl_baseline_ms, itl_spec_ms, itl_cost}
-       where `itl_cost = itl_spec_ms / itl_baseline_ms`.
+       where itl_cost = itl_spec_ms / itl_baseline_ms.
+       itl_cost < 1.0 → spec overhead fits within one baseline step (beneficial).
+       itl_cost > 1.0 → spec step costs more than baseline (may hurt throughput).
 
 Usage:
 
@@ -32,8 +35,8 @@ Stability notes:
     * Server lifecycle uses sglang.utils.{launch_server_cmd, wait_for_server,
       terminate_process} which internally calls kill_process_tree -- safe for
       TP/EP multi-process setups.
-    * After each bench, /flush_cache is called so prefix-cache cannot bleed
-      results across (seqlen, bs) cells.
+    * Prefix-cache bleeding is minimised by always using random prompts;
+      the server is started with --disable-radix-cache when possible.
     * Partial results are appended to `<output>.partial.jsonl` after every
       cell, so a crash mid-sweep does not lose data.
     * SIGINT / SIGTERM / atexit all teardown the running server.
@@ -42,21 +45,24 @@ Stability notes:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import json
+import math
 import os
+import random
 import re
 import shlex
 import signal
-import subprocess
 import sys
-import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import aiohttp
+import numpy as np
 import requests
 
 # ---------------------------------------------------------------------------
@@ -131,10 +137,26 @@ class Config:
 
     min_batch_size: int = 1
     max_batch_size: int = 32
-    batch_size_step: int = 1
+    batch_size_step: int = 4
+    # If non-empty, use exactly this list (sorted, deduped) and ignore the
+    # auto-generated sequence entirely.
+    batch_size_capture_list: List[int] = field(default_factory=list)
 
     test_spec_size_list: List[int] = field(default_factory=lambda: [1, 3, 5, 7, 9])
+    # SGLang speculative algorithm name (case-insensitive, matches
+    # sglang.srt.speculative.spec_info.SpeculativeAlgorithm):
+    #   "EAGLE"      – MTP self-speculation (SGLANG_ENABLE_SPEC_V2=1, no draft
+    #                  model path) or classic EAGLE1 (with draft model path)
+    #   "EAGLE3"     – EAGLE3 variant (requires draft model path)
+    #   "DFLASH"     – DFlash (requires draft model path)
+    #   "STANDALONE" – Standalone speculative worker (requires draft model path)
+    #   "NGRAM"      – N-gram lookahead (no draft model path needed)
+    speculative_algorithm: str = "EAGLE"
     speculative_eagle_topk: int = 1
+    # Path to the draft model checkpoint.  Leave empty ("") when using MTP /
+    # SGLANG_ENABLE_SPEC_V2=1 (main model reused internally).  Required for
+    # EAGLE3, DFLASH, STANDALONE, and EAGLE1 with a separate draft checkpoint.
+    speculative_draft_model_path: str = ""
     combo_per_batch_size: int = 3
 
     host: str = "127.0.0.1"
@@ -166,10 +188,16 @@ class Config:
             raise ValueError("seqlen_min and seqlen_step must be > 0")
         if self.seqlen_max < self.seqlen_min:
             raise ValueError("seqlen_max must be >= seqlen_min")
-        if self.min_batch_size < 1 or self.max_batch_size < self.min_batch_size:
-            raise ValueError("invalid batch-size range")
-        if self.batch_size_step <= 0:
-            raise ValueError("batch_size_step must be > 0")
+        if self.min_batch_size < 1:
+            raise ValueError("min_batch_size must be >= 1")
+        if self.max_batch_size < self.min_batch_size:
+            raise ValueError("max_batch_size must be >= min_batch_size")
+        if self.batch_size_step < 1:
+            raise ValueError("batch_size_step must be >= 1")
+        if self.batch_size_capture_list and any(
+            bs < 1 for bs in self.batch_size_capture_list
+        ):
+            raise ValueError("batch_size_capture_list values must be >= 1")
         if self.combo_per_batch_size < 1:
             raise ValueError("combo_per_batch_size must be >= 1")
         if any(s < 1 for s in self.test_spec_size_list):
@@ -181,9 +209,18 @@ class Config:
         return list(range(self.seqlen_min, self.seqlen_max + 1, self.seqlen_step))
 
     def batch_size_list(self) -> List[int]:
-        return list(
-            range(self.min_batch_size, self.max_batch_size + 1, self.batch_size_step)
-        )
+        if self.batch_size_capture_list:
+            return sorted(set(self.batch_size_capture_list))
+        # Auto: min_batch_size as the first anchor, then step-aligned values up
+        # to max_batch_size (always included).
+        # The step sequence starts at ceil(min/step)*step so that:
+        #   min=1,  step=4, max=32 → [1, 4, 8, 12, 16, 20, 24, 28, 32]
+        #   min=12, step=4, max=24 → [12, 16, 20, 24]
+        #   min=2,  step=4, max=32 → [2, 4, 8, 12, 16, 20, 24, 28, 32]
+        first_step = math.ceil(self.min_batch_size / self.batch_size_step) * self.batch_size_step
+        multiples = list(range(first_step, self.max_batch_size + 1, self.batch_size_step))
+        bslist = sorted(set([self.min_batch_size] + multiples + [self.max_batch_size]))
+        return bslist
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +229,11 @@ class Config:
 class ServerHandle:
     """Tiny wrapper around the subprocess returned by launch_server_cmd."""
 
-    def __init__(self, process, port: int, host: str):
+    def __init__(self, process, port: int, host: str, model_name: str = ""):
         self.process = process
         self.port = port
         self.host = host
+        self.model_name = model_name
 
     @property
     def base_url(self) -> str:
@@ -236,30 +274,30 @@ def build_server_command(
     """Append speculative args (or nothing) to base_command.
 
     base_command has already been cleaned by normalize_command (no spec flags,
-    no --port). --port is further injected by launch_server_cmd.
+    no --port).  --port is further injected by launch_server_cmd.
+
+    For speculative mode we only inject the three core flags:
+      --speculative-algorithm EAGLE
+      --speculative-num-steps  <spec_size>
+      --speculative-eagle-topk <topk>
+
+    Draft model path injection:
+      - speculative_draft_model_path == "" (default, MTP mode):
+          --speculative-draft-model-path is NOT added.  SGLang reuses the
+          main model internally when SGLANG_ENABLE_SPEC_V2=1.
+      - speculative_draft_model_path != "" (EAGLE1 / EAGLE3 / DFlash / …):
+          --speculative-draft-model-path <path> is appended.
     """
     cmd = cfg.base_command.strip()
     if spec_size is not None:
-        spec_args = (
-            " --speculative-algorithm EAGLE"
-            f" --speculative-num-steps {spec_size}"
-            f" --speculative-eagle-topk {cfg.speculative_eagle_topk}"
-            f" --speculative-num-draft-tokens {spec_size + 1}"
+        cmd = (
+            cmd
+            + f" --speculative-algorithm {cfg.speculative_algorithm}"
+            + f" --speculative-num-steps {spec_size}"
+            + f" --speculative-eagle-topk {cfg.speculative_eagle_topk}"
         )
-        # Best-effort: if user did not put --speculative-draft-model-path in
-        # the base, derive it from --model-path. EAGLE almost always reuses
-        # the same model path (matches the user's example).
-        if "--speculative-draft-model-path" not in cmd:
-            try:
-                tokens = shlex.split(cmd)
-                model_path = tokens[tokens.index("--model-path") + 1]
-                spec_args += f" --speculative-draft-model-path {model_path}"
-            except (ValueError, IndexError):
-                raise RuntimeError(
-                    "Could not infer --speculative-draft-model-path: please "
-                    "ensure --model-path is in `base_command`."
-                )
-        cmd = cmd + spec_args
+        if cfg.speculative_draft_model_path:
+            cmd += f" --speculative-draft-model-path {cfg.speculative_draft_model_path}"
     return cmd
 
 
@@ -286,7 +324,14 @@ def start_server(cfg: Config, spec_size: Optional[int]) -> ServerHandle:
         if handle in _active_handles:
             _active_handles.remove(handle)
         raise
-    print(f"[server] ready at {handle.base_url} ({label})")
+    # Fetch model name once so we can pass it to /v1/completions later.
+    try:
+        resp = requests.get(f"{handle.base_url}/v1/models", timeout=10)
+        handle.model_name = resp.json()["data"][0]["id"]
+    except Exception as exc:
+        print(f"[warn] could not fetch model name: {exc}", file=sys.stderr)
+        handle.model_name = ""
+    print(f"[server] ready at {handle.base_url} ({label})  model={handle.model_name!r}")
     return handle
 
 
@@ -298,19 +343,157 @@ def stop_server(handle: ServerHandle) -> None:
     time.sleep(5)
 
 
-def flush_cache(base_url: str) -> None:
+
+# ---------------------------------------------------------------------------
+# Bench: direct async SSE streaming client.
+#
+# Why not bench_serving?
+#   bench_serving computes ITL as `chunk_gap / num_new_tokens` (time spread
+#   evenly across every accepted token in a chunk). For speculative decoding
+#   the number of tokens per chunk varies (1..num_steps+1), so the normalized
+#   ITL is high-variance and conflates acceptance rate with step latency.
+#
+# What we actually want:
+#   ITL = time between consecutive streaming chunks (raw chunk_gap).
+#   - Baseline:  chunk_gap ≈ one decode-forward-pass time (1 token/step)
+#   - Spec:      chunk_gap ≈ one draft+verify+draft-extend cycle time
+#                           (independent of how many tokens were accepted)
+#   This makes itl_cost = itl_spec / itl_baseline a pure measure of overhead.
+# ---------------------------------------------------------------------------
+
+_SSE_PREFIX = b"data: "
+_SSE_DONE = b"data: [DONE]"
+
+
+async def _stream_one(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: dict,
+) -> List[float]:
+    """Stream a single /v1/chat/completions request and return decode-phase ITL
+    gaps (sec), matching the methodology of inference_benchmark.py exactly.
+
+    ITL definition (same as inference_benchmark.py::async_request_openai):
+      - First SSE event with delta.content → TTFT anchor (most_recent_timestamp).
+        NO gap appended.
+      - Every subsequent SSE event with delta.content → gap = timestamp - most_recent_timestamp.
+        most_recent_timestamp updated to this timestamp.
+      - Non-content events (e.g. usage) are parsed but do NOT contribute a gap.
+
+    For baseline (no spec): each SSE event carries 1 token → gap = one decode step.
+    For spec decoding: each SSE event carries all tokens accepted in one spec cycle
+    → gap = one full draft+verify+extend cycle (independent of acceptance length).
+
+    Implementation note: we use readline() instead of `async for chunk in resp.content`
+    to guarantee one SSE event per iteration regardless of TCP segment boundaries.
+    """
+    most_recent_timestamp: float = 0.0
+    gaps: List[float] = []
     try:
-        requests.post(f"{base_url}/flush_cache", timeout=30)
-    except Exception as exc:
-        print(f"[warn] /flush_cache failed: {exc}", file=sys.stderr)
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                return []
+            while True:
+                raw = await resp.content.readline()
+                if not raw:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                if line == _SSE_DONE:
+                    break
+                if not line.startswith(_SSE_PREFIX):
+                    continue
+                try:
+                    data = json.loads(line[len(_SSE_PREFIX):])
+                except json.JSONDecodeError:
+                    continue
+
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                if "content" not in delta:
+                    continue
+
+                timestamp = time.perf_counter()
+                if most_recent_timestamp == 0.0:
+                    # First content event = TTFT anchor; no gap recorded.
+                    most_recent_timestamp = timestamp
+                else:
+                    gaps.append(timestamp - most_recent_timestamp)
+                    most_recent_timestamp = timestamp
+    except Exception:
+        return []
+
+    return gaps
 
 
-# ---------------------------------------------------------------------------
-# Bench: subprocess-call into `sglang.bench_serving`. Subprocess isolation is
-# deliberate: bench_serving uses module-global `args`, so calling it twice in
-# the same process is fragile. A subprocess is ~free relative to the bench
-# duration and gives us total clean-state reproducibility.
-# ---------------------------------------------------------------------------
+def _make_payload(model: str, prompt_text: str, output_len: int) -> dict:
+    """Build a /v1/chat/completions streaming payload (mirrors inference_benchmark.py)."""
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "max_tokens": output_len,
+        "stream": True,
+        "ignore_eos": True,    # never cut short → full output_len always
+        "temperature": 0.0,
+        "best_of": 1,
+    }
+
+
+def _make_prompt_text(seqlen: int, rng: random.Random) -> str:
+    """Generate a text prompt of approximately `seqlen` tokens.
+
+    Uses space-separated two-digit random integers (0-99).  Each such number
+    tokenises to roughly 1 token for common BPE vocabularies, so seqlen numbers
+    ≈ seqlen tokens.  The exact count varies slightly by model/tokeniser but is
+    close enough for controlled ITL measurement.
+    """
+    return " ".join(str(rng.randint(0, 99)) for _ in range(seqlen))
+
+
+async def _async_bench(
+    host: str,
+    port: int,
+    model: str,
+    prompt_texts: List[str],
+    output_len: int,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Run `prompt_texts` in rounds of `batch_size` concurrent chat streams.
+
+    Returns dict with `mean_itl_ms` = mean raw chunk gap across all rounds.
+    """
+    url = f"http://{host}:{port}/v1/chat/completions"
+    all_gaps: List[float] = []
+
+    connector = aiohttp.TCPConnector(limit=0)
+    timeout = aiohttp.ClientTimeout(total=None, connect=30)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        for start in range(0, len(prompt_texts), batch_size):
+            batch = prompt_texts[start : start + batch_size]
+            payloads = [_make_payload(model, t, output_len) for t in batch]
+            results = await asyncio.gather(
+                *[_stream_one(session, url, pl) for pl in payloads],
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, list):
+                    all_gaps.extend(r)
+
+    if not all_gaps:
+        raise RuntimeError("No valid streaming chunks collected (server error?)")
+
+    arr = np.array(all_gaps) * 1000.0  # → ms
+    return {
+        "mean_itl_ms": float(np.mean(arr)),
+        "median_itl_ms": float(np.median(arr)),
+        "p95_itl_ms": float(np.percentile(arr, 95)),
+        "num_chunks": len(all_gaps),
+    }
+
+
 def run_one_bench(
     cfg: Config,
     handle: ServerHandle,
@@ -321,65 +504,28 @@ def run_one_bench(
     *,
     label: str,
 ) -> Dict[str, Any]:
-    """Run a single bench_serving call and return the parsed result dict.
-
-    stdout/stderr of the bench_serving subprocess are NOT captured so both
-    the server logs and the bench output appear live on the terminal.
-    The only structured output we need is the JSONL result file written by
-    bench_serving via --output-file.
+    """Generate `num_prompts` text prompts (~seqlen tokens each), stream them in
+    concurrent batches of `batch_size`, and return ITL statistics.
     """
-    with tempfile.NamedTemporaryFile(
-        mode="r",
-        suffix=".jsonl",
-        prefix="aicp_bench_",
-        delete=False,
-    ) as tmp:
-        out_file = tmp.name
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "sglang.bench_serving",
-        "--backend", "sglang",
-        "--host", handle.host,
-        "--port", str(handle.port),
-        "--dataset-name", "random",
-        "--random-input-len", str(seqlen),
-        "--random-output-len", str(output_len),
-        "--random-range-ratio", "1.0",
-        "--num-prompts", str(num_prompts),
-        "--max-concurrency", str(batch_size),
-        "--warmup-requests", "1",
-        "--seed", str(cfg.seed),
-        "--output-file", out_file,
-        "--disable-tqdm",
-    ]
-
-    # No capture: server logs + bench output both appear live in the terminal.
-    # No timeout: bench_serving exits naturally when requests finish or the
-    # server becomes unreachable (connection errors).
-    proc = subprocess.run(cmd, env=os.environ.copy())
-    if proc.returncode != 0:
-        try:
-            os.unlink(out_file)
-        except OSError:
-            pass
-        raise RuntimeError(
-            f"bench_serving exited with code {proc.returncode} "
-            f"for {label} seqlen={seqlen} bs={batch_size}"
+    rng = random.Random(cfg.seed)
+    prompt_texts = [_make_prompt_text(seqlen, rng) for _ in range(num_prompts)]
+    result = asyncio.run(
+        _async_bench(
+            host=handle.host,
+            port=handle.port,
+            model=handle.model_name,
+            prompt_texts=prompt_texts,
+            output_len=output_len,
+            batch_size=batch_size,
         )
-
-    try:
-        with open(out_file, "r", encoding="utf-8") as f:
-            lines = [ln for ln in f.read().splitlines() if ln.strip()]
-        if not lines:
-            raise RuntimeError(f"bench_serving produced no JSONL output for {label}")
-        result = json.loads(lines[-1])
-    finally:
-        try:
-            os.unlink(out_file)
-        except OSError:
-            pass
+    )
+    print(
+        f"  → mean_itl={result['mean_itl_ms']:.2f}ms  "
+        f"median={result['median_itl_ms']:.2f}ms  "
+        f"p95={result['p95_itl_ms']:.2f}ms  "
+        f"chunks={result['num_chunks']}",
+        flush=True,
+    )
     return result
 
 
@@ -434,7 +580,6 @@ def sweep_one_server(
             local_step += 1
             global_step[0] += 1
             num_prompts = bs * cfg.combo_per_batch_size
-            flush_cache(handle.base_url)
             print(
                 f"\n{'─' * 72}\n"
                 f"[progress] overall {global_step[0]}/{global_total}  "
@@ -471,6 +616,7 @@ def sweep_one_server(
                     "result": res,
                 },
             )
+
     return out
 
 
@@ -502,6 +648,10 @@ def aggregate(
     baseline: Dict[tuple, Dict[str, Any]],
     spec_results: Dict[int, Dict[tuple, Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
+    # `mean_itl_ms` here is the raw mean chunk gap (NOT divided by tokens/chunk).
+    # For baseline: chunk_gap ≈ one decode forward-pass → directly comparable.
+    # For spec:     chunk_gap ≈ one draft+verify+extend cycle.
+    # itl_cost = spec_step_time / baseline_step_time → < 1 means spec is faster.
     rows: List[Dict[str, Any]] = []
     for spec_size, spec_grid in spec_results.items():
         for (seqlen, bs), spec_res in spec_grid.items():
