@@ -119,7 +119,8 @@ class EAGLEWorker(TpModelWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
             )
 
         # Override the context length of the draft model to be the same as the target model.
@@ -236,7 +237,9 @@ class EAGLEWorker(TpModelWorker):
                         cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states()
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=self.server_args.cuda_graph_bs,
+                )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -344,14 +347,19 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
         ):
             # Reuse existing init methods for draft attention backend and cuda graphs
             self.init_attention_backend()
@@ -402,7 +410,10 @@ class EAGLEWorker(TpModelWorker):
 
     @contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -416,11 +427,17 @@ class EAGLEWorker(TpModelWorker):
             self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
+            sa.disable_cuda_graph,
         )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+            if not cuda_graph_bs:
+                sa.disable_cuda_graph = True
         try:
             yield
         finally:
@@ -434,6 +451,8 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
+                sa.disable_cuda_graph,
             ) = backup
 
     @property
@@ -476,6 +495,16 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            # Each BS range maintains its own optimal step count. The previous
+            # round may have served a different BS range, so we must switch to
+            # this batch's step before drafting. on_verify_complete (after verify)
+            # updates EMA and may change the step for the *current* BS range;
+            # this check handles cross-range switches between rounds.
+            if self.adaptive_controller is not None:
+                target_steps = self.adaptive_controller.get_steps_for_batch(batch.batch_size())
+                if target_steps != self.speculative_num_steps:
+                    self.adaptive_controller.activate(target_steps)
+
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
             with self.draft_tp_context(
@@ -526,7 +555,8 @@ class EAGLEWorker(TpModelWorker):
 
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
-                    verify_output.num_accepted_drafts_per_req_cpu
+                    verify_output.num_accepted_drafts_per_req_cpu,
+                    batch_size=batch.batch_size(),
                 )
 
             return GenerationBatchResult(
