@@ -181,8 +181,8 @@ class AdaptiveSpeculativeParams:
         # TODO: Wider range of candidate_steps (once lazy init is supported).
         self.candidate_steps = _resolve_candidate_steps(initial_steps, cfg)
         assert (
-            len(self.candidate_steps) >= 2
-        ), "candidate_steps must have at least 2 distinct values"
+            len(self.candidate_steps) >= 1
+        ), "candidate_steps must have at least 1 value"
 
         self.min_steps = self.candidate_steps[0]
         self.max_steps = self.candidate_steps[-1]
