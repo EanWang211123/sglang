@@ -11,14 +11,19 @@ aicp_random_tokens_benchmark.py
 
 用法示例：
 
-    python benchmark/speculative/aicp_random_tokens_benchmark.py \\
-        --base-url http://127.0.0.1:30000 \\
-        --tokenizer-path /path/to/model \\
-        --input-len 512 \\
-        --output-len 256 \\
-        --num-prompts 64 \\
-        --max-concurrency 8 \\
+    python benchmark/speculative/aicp_random_tokens_benchmark.py \
+        --base-url http://127.0.0.1:30000 \
+        --model YOUR_MODEL_NAME \
+        --tokenizer-path /path/to/model \
+        --input-len 512 \
+        --output-len 256 \
+        --num-prompts 64 \
+        --max-concurrency 8 \
         --api-key EMPTY
+
+``--model``：请求体里的服务模型名（与 ``--tokenizer-path`` 可为不同路径；后者仅用于
+``exact`` 模式下数输入 token 长度）。不写 ``--model`` 时会访问 ``GET /v1/models``，用返回的第一个
+``id``；若失败则必须显式传入 ``--model``。
 
 可选 ``--prompt-mode approx``：不加载 tokenizer，用空格分隔随机数字近似 ``input-len``
 个 token（与 ``aicp_speculative_size_itl_cost_warmup._make_prompt_text`` 思路一致）。
@@ -53,6 +58,10 @@ import aiohttp
 import numpy as np
 import pandas as pd
 import requests
+from openpyxl import Workbook
+from openpyxl.styles import Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
 from tqdm.asyncio import tqdm as async_tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -156,17 +165,100 @@ def safe_model_stem_for_filename(model_id: str) -> str:
     return name[:180]
 
 
-def write_summary_excel(path: Path, row: Dict[str, Any]) -> None:
-    """单行指标表写入 ``.xlsx``（需已安装 ``openpyxl``）。"""
-    try:
-        df = pd.DataFrame([row])
-        path = path.resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_excel(path, index=False, engine="openpyxl")
-    except ImportError as exc:
-        raise RuntimeError(
-            "写入 Excel 需要安装 openpyxl：pip install openpyxl"
-        ) from exc
+def _auto_col_width(ws) -> None:
+    for col_cells in ws.columns:
+        length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
+        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(length * 1.15, 60)
+
+
+# 与 test.py Q_STATIC 对齐的精简列集合（顺序与 test.py 一致）。
+# metadata 字段 (case_id/arch/gpu/gpu_num/replicas/backend/other_params) 通过 --metadata 写入，
+# 若未提供则该列值为空字符串。
+EXCEL_COLS: List[str] = [
+    "case_id", "arch", "gpu", "model", "gpu_num", "replicas",
+    "question_label", "batch", "num_prompts",
+    "mean_input_tokens", "mean_output_tokens",
+    "mean_TTFT", "mean_prefill_throughput", "mean_decode_throughput",
+    "mean_output_throughput", "output_throughput",
+    "mean_TPOT", "mean_ITL", "mean_E2EL",
+    "request_throughput", "goodput_percentage",
+    "other_params", "completed", "backend",
+]
+
+
+def write_summary_excel(
+    path: Path,
+    rows: List[Dict[str, Any]],
+    *,
+    color_col_values: Optional[tuple] = None,
+) -> None:
+    """带颜色的 Excel 输出，列集合与样式与 test.py ``export_to_color_excel`` 完全对齐。
+
+    - 只输出 EXCEL_COLS 中定义的列
+    - 表头：黄色填充 + 粗体 + 细边框
+    - 数据行：按 question_label 值着色（若值在 color_col_values 里则用对应色，
+      否则轮流分配），加细边框，且始终加粗（单次运行即为"SLO 内最大并发行"）
+    """
+    COLOR_FILLS = [
+        PatternFill(start_color="C5D9F1", end_color="C5D9F1", fill_type="solid"),
+        PatternFill(start_color="F2DCDB", end_color="F2DCDB", fill_type="solid"),
+        PatternFill(start_color="EBF1DE", end_color="EBF1DE", fill_type="solid"),
+        PatternFill(start_color="FDE9D9", end_color="FDE9D9", fill_type="solid"),
+    ]
+    HEADER_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    THIN_BORDER = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    BOLD_FONT = Font(bold=True)
+
+    # 构造精简行，只保留 EXCEL_COLS
+    curated: List[Dict[str, Any]] = [
+        {col: row.get(col, "") for col in EXCEL_COLS} for row in rows
+    ]
+    df = pd.DataFrame(curated, columns=EXCEL_COLS)
+
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws.append(r)
+
+    label_col_idx: Optional[int] = None
+    label_color_map: Dict[str, int] = {}
+    color_counter = 0
+
+    for row_idx, row in enumerate(ws.iter_rows(), start=1):
+        if row_idx == 1:
+            for cell in row:
+                cell.fill = HEADER_FILL
+                cell.border = THIN_BORDER
+                cell.font = BOLD_FONT
+                if cell.value == "question_label":
+                    label_col_idx = cell.column - 1
+        else:
+            label_val = row[label_col_idx].value if label_col_idx is not None else None
+            # 按 question_label 值分配颜色（与 test.py color_col_values 逻辑一致）
+            if color_col_values and label_val in color_col_values:
+                fill = COLOR_FILLS[color_col_values.index(label_val) % len(COLOR_FILLS)]
+            else:
+                if label_val not in label_color_map:
+                    label_color_map[label_val] = color_counter % len(COLOR_FILLS)
+                    color_counter += 1
+                fill = COLOR_FILLS[label_color_map[label_val]]
+            for cell in row:
+                cell.fill = fill
+                cell.border = THIN_BORDER
+                # 单次运行只有一条数据行，等价于 test.py 中标记为 temp_label_max_batch==1 的行
+                cell.font = BOLD_FONT
+
+    _auto_col_width(ws)
+    wb.save(path)
 
 
 def check_goodput_args(slo_args: Optional[List[str]]) -> Dict[str, float]:
@@ -300,7 +392,7 @@ def calculate_metrics(
         logging.warning(
             "All requests failed. Check server URL, model name, and GPU health."
         )
-        completed = int(float("-inf"))
+        completed = float("-inf")  # type: ignore[assignment]  # 与 test.py 保持一致，BenchmarkMetrics.completed 不强制类型
 
     metrics = BenchmarkMetrics(
         completed=completed,
@@ -364,6 +456,7 @@ def calculate_metrics(
 async def async_request_openai(
     request_func_input: RequestFuncInput,
     api_key: str,
+    enable_thinking: bool = False,
     pbar: Optional[async_tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
@@ -371,7 +464,7 @@ async def async_request_openai(
     async with aiohttp.ClientSession(
         timeout=AIOHTTP_TIMEOUT, connector=connector
     ) as session:
-        payload = {
+        payload: Dict[str, Any] = {
             "model": request_func_input.model,
             "temperature": request_func_input.temperature,
             "best_of": request_func_input.best_of,
@@ -379,12 +472,9 @@ async def async_request_openai(
             "stream": request_func_input.stream,
             "ignore_eos": request_func_input.ignore_eos,
             "stream_options": {"include_usage": True},
-            "messages": [
-                {
-                    "role": "user",
-                    "content": request_func_input.prompt,
-                }
-            ],
+            # Bug4 fix：对 Qwen3 等模型禁用 thinking 模式，否则 TTFT 会极大偏高
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            "messages": [{"role": "user", "content": request_func_input.prompt}],
         }
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -414,6 +504,9 @@ async def async_request_openai(
                         if chunk == "[DONE]":
                             output.latency = time.perf_counter() - st
                             output.success = True
+                            # Bug3 fix：若 usage chunk 未携带 completion_tokens，用 ITL 数量兜底
+                            if output.completion_len == 0 and output.itl:
+                                output.completion_len = len(output.itl) + 1
                         else:
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
@@ -429,14 +522,23 @@ async def async_request_openai(
                                 output.completion_len = data["usage"]["completion_tokens"]
                                 continue
 
+                            if not choices:
+                                continue
+
                             delta = choices[0].get("delta", {})
                             if "content" in delta:
+                                # Bug1 fix：SGLang 会发出 content="" 的空 delta，必须跳过；
+                                # 否则会错误触发 TTFT 或产生接近 0ms 的虚假 ITL 条目。
+                                if not delta.get("content"):
+                                    continue
                                 if output.ttft == 0.0:
                                     output.ttft = time.perf_counter() - st
                                 else:
                                     output.itl.append(timestamp - most_recent_timestamp)
-                                output.generated_text += delta["content"] or ""
-                            most_recent_timestamp = timestamp
+                                output.generated_text += delta["content"]
+                                # Bug2 fix：most_recent_timestamp 只在有效非空 content 时更新，
+                                # 与 test.py 行为一致；放在这里而非外层，避免 usage/空 chunk 干扰。
+                                most_recent_timestamp = timestamp
                 else:
                     error_message = "".join(
                         [chunk.decode("utf-8").strip() async for chunk in response.content]
@@ -457,12 +559,17 @@ async def limited_request_func(
     semaphore: Optional[asyncio.Semaphore],
     request_func_input: RequestFuncInput,
     api_key: str,
+    enable_thinking: bool,
     pbar: Optional[async_tqdm],
 ) -> RequestFuncOutput:
     if semaphore is None:
-        return await async_request_openai(request_func_input, api_key=api_key, pbar=pbar)
+        return await async_request_openai(
+            request_func_input, api_key=api_key, enable_thinking=enable_thinking, pbar=pbar
+        )
     async with semaphore:
-        return await async_request_openai(request_func_input, api_key=api_key, pbar=pbar)
+        return await async_request_openai(
+            request_func_input, api_key=api_key, enable_thinking=enable_thinking, pbar=pbar
+        )
 
 
 async def get_request(
@@ -570,6 +677,7 @@ async def warmup_one(
     prompt_mode: str,
     tokenizer: Optional[PreTrainedTokenizerBase],
     seed: int,
+    enable_thinking: bool = False,
 ) -> None:
     rng = random.Random(seed ^ 0x9E3779B9)
     if prompt_mode == "exact":
@@ -589,7 +697,7 @@ async def warmup_one(
         output_len=max(8, min(64, output_len)),
         ignore_eos=True,
     )
-    res = await async_request_openai(inp, api_key=api_key, pbar=None)
+    res = await async_request_openai(inp, api_key=api_key, enable_thinking=enable_thinking, pbar=None)
     if not res.success:
         raise RuntimeError(f"Warmup failed: {res.error}")
 
@@ -707,6 +815,8 @@ async def run_benchmark_async(args: argparse.Namespace) -> Dict[str, Any]:
     goodput_config_dict = check_goodput_args(args.goodput)
     selected_percentiles = [float(p) for p in args.metric_percentiles.split(",")]
 
+    enable_thinking: bool = getattr(args, "enable_thinking", False)
+
     if not args.disable_warmup:
         logging.info("Warming up (1 request)...")
         await warmup_one(
@@ -719,6 +829,7 @@ async def run_benchmark_async(args: argparse.Namespace) -> Dict[str, Any]:
             prompt_mode=args.prompt_mode,
             tokenizer=tokenizer,
             seed=args.seed,
+            enable_thinking=enable_thinking,
         )
 
     semaphore = (
@@ -746,6 +857,7 @@ async def run_benchmark_async(args: argparse.Namespace) -> Dict[str, Any]:
                     semaphore=semaphore,
                     request_func_input=inp,
                     api_key=api_key,
+                    enable_thinking=enable_thinking,
                     pbar=pbar,
                 )
             )
@@ -820,7 +932,12 @@ def main() -> None:
         default="/v1/chat/completions",
         help="聊天补全 endpoint，默认 /v1/chat/completions",
     )
-    parser.add_argument("--model", type=str, default=None, help="请求体 model；可省略以自动探测")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="请求 JSON 里的 model 字段（服务端登记的模型 id）。不写则 GET /v1/models 取第一个 id",
+    )
     parser.add_argument(
         "--api-key",
         type=str,
@@ -865,6 +982,13 @@ def main() -> None:
     parser.add_argument("--disable-warmup", action="store_true")
     parser.add_argument("--disable-pbar", action="store_true")
     parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help="在请求里传 chat_template_kwargs enable_thinking=True。"
+             "默认 False（对 Qwen3 等模型必须关闭，否则 thinking token 会导致 TTFT 极大偏高）",
+    )
+    parser.add_argument(
         "--metric-percentiles",
         type=str,
         default="90,95,99",
@@ -872,9 +996,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--goodput",
-        nargs="*",
-        default=[],
-        help='可选，格式 "ttft:5000" "throughput:100"（数值含义与 inference_benchmark 相同）',
+        nargs="+",
+        default=["ttft:5000", "throughput:10"],
+        help='Goodput SLO，格式 "KEY:VALUE"，支持 ttft/tpot/e2el/throughput。'
+             '默认与 test.py 一致：ttft:5000 throughput:10',
     )
     parser.add_argument(
         "--output-json",
@@ -894,6 +1019,14 @@ def main() -> None:
         help="指定 Excel 路径；默认使用当前工作目录下 模型名_时间戳.xlsx",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument(
+        "--metadata",
+        nargs="*",
+        default=[],
+        metavar="KEY=VALUE",
+        help="附加元数据字段，格式 KEY=VALUE，对应 test.py 的 case_id/arch/gpu/gpu_num/"
+             "replicas/backend/other_params，例如 --metadata arch=A100 gpu=H100 gpu_num=8",
+    )
 
     args = parser.parse_args()
 
@@ -914,7 +1047,18 @@ def main() -> None:
     out = asyncio.run(run_benchmark_async(args))
     run_id = str(uuid.uuid4())
 
+    # 解析 --metadata KEY=VALUE 列表
+    metadata: Dict[str, Any] = {}
+    for item in (args.metadata or []):
+        if "=" in item:
+            k, _, v = item.partition("=")
+            metadata[k.strip()] = v.strip()
+        else:
+            logging.warning("--metadata 条目格式不正确（应为 KEY=VALUE）：%s", item)
+
     excel_row: Dict[str, Any] = dict(out["result"])
+    # 注入 metadata（会填充 case_id/arch/gpu/gpu_num/replicas/backend/other_params 等字段）
+    excel_row.update(metadata)
     excel_row.update(
         {
             "duration_s": out["duration_s"],
@@ -932,7 +1076,7 @@ def main() -> None:
         else:
             stem = safe_model_stem_for_filename(out["model"])
             xlsx_path = Path.cwd() / f"{stem}_{ts}.xlsx"
-        write_summary_excel(xlsx_path, excel_row)
+        write_summary_excel(xlsx_path, [excel_row])
         logging.info("已写入 Excel %s", xlsx_path.resolve())
 
     if args.output_json:
