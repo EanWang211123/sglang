@@ -63,10 +63,12 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         if forward_mode.is_target_verify():
             seq_len = spec_info.draft_token_num
             self.actual_seq_lengths = self.actual_seq_lengths * seq_len
-            # indices
-            self.ssm_state_indices = torch.arange(
-                cache_indices.shape[0] * seq_len,
-                dtype=torch.int32,
+            # indices: stride must follow the physical intermediate_ssm
+            # buffer dim, not runtime seq_len, to stay in sync with
+            # move_intermediate_cache under --speculative-adaptive.
+            self.ssm_state_indices = self._build_verify_ssm_state_indices(
+                num_reqs=cache_indices.shape[0],
+                draft_token_num=seq_len,
                 device=cache_indices.device,
             )
         else:

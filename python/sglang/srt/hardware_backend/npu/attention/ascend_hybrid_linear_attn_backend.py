@@ -27,6 +27,43 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.state_indices_list_gdn = []
+        # Cache the physical per-request stride of `intermediate_ssm`. Under
+        # --speculative-adaptive the runtime `draft_token_num` can be smaller
+        # than the buffer's physical draft-token dim (which is allocated to
+        # effective_max_speculative_num_draft_tokens()). `move_intermediate_cache`
+        # always reads with the physical stride, so the NPU GDN kernel must
+        # also write with the physical stride; otherwise adjacent requests
+        # alias each other's intermediate-state slots.
+        mamba_cache = getattr(
+            getattr(self.req_to_token_pool, "mamba_pool", None), "mamba_cache", None
+        )
+        self.intermediate_state_draft_stride: Optional[int] = (
+            int(mamba_cache.intermediate_ssm.shape[2])
+            if mamba_cache is not None and hasattr(mamba_cache, "intermediate_ssm")
+            else None
+        )
+
+    def _build_verify_ssm_state_indices(
+        self,
+        num_reqs: int,
+        draft_token_num: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.int32,
+    ) -> torch.Tensor:
+        """Build ssm_state_indices that index into the *physical* intermediate
+        state buffer.
+
+        Result is a 1-D tensor of length ``num_reqs * draft_token_num`` where
+        request ``i`` token ``j`` maps to slot ``i * stride + j``. ``stride`` is
+        the physical draft-token dim of ``intermediate_ssm`` when available
+        (matches ``move_intermediate_cache``); otherwise falls back to the
+        runtime ``draft_token_num`` (legacy behavior, only correct when runtime
+        equals the physical dim, e.g. non-adaptive mode).
+        """
+        stride = self.intermediate_state_draft_stride or draft_token_num
+        row = torch.arange(num_reqs, dtype=dtype, device=device).unsqueeze(1) * stride
+        col = torch.arange(draft_token_num, dtype=dtype, device=device).unsqueeze(0)
+        return (row + col).flatten().contiguous()
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
@@ -93,9 +130,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
-            ssm_state_indices = torch.arange(
-                mamba_indices.shape[0] * spec_info.draft_token_num,
-                dtype=torch.int32,
+            ssm_state_indices = self._build_verify_ssm_state_indices(
+                num_reqs=mamba_indices.shape[0],
+                draft_token_num=spec_info.draft_token_num,
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1][
@@ -152,16 +189,18 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ssm_state_indices = torch.arange(
-                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num,
-                dtype=torch.int32,
+            real_mamba_indices = mamba_indices[: bs - num_padding]
+            real_num_reqs = real_mamba_indices.shape[0]
+            ssm_state_indices = self._build_verify_ssm_state_indices(
+                num_reqs=real_num_reqs,
+                draft_token_num=spec_info.draft_token_num,
                 device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1][
-                : len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num
+                : real_num_reqs * spec_info.draft_token_num
             ].copy_(ssm_state_indices)
             self.state_indices_list_gdn[bs - 1][
-                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num :
+                real_num_reqs * spec_info.draft_token_num :
             ] = 0
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
