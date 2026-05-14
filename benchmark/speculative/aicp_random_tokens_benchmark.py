@@ -214,11 +214,26 @@ def write_summary_excel(
     )
     BOLD_FONT = Font(bold=True)
 
-    # 构造精简行，只保留 EXCEL_COLS
-    curated: List[Dict[str, Any]] = [
-        {col: row.get(col, "") for col in EXCEL_COLS} for row in rows
+    # 动态收集 per-key 列（形如 ttft_goodput_pct），插在 goodput_percentage 后面
+    per_key_cols = [
+        col for col in (rows[0] if rows else {})
+        if col.endswith("_goodput_pct") and col not in EXCEL_COLS
     ]
-    df = pd.DataFrame(curated, columns=EXCEL_COLS)
+    # 按照 SLO 常用顺序排列
+    _key_order = ["ttft", "tpot", "e2el", "throughput"]
+    per_key_cols.sort(key=lambda c: next(
+        (i for i, k in enumerate(_key_order) if c.startswith(k)), len(_key_order)
+    ))
+
+    # 在 goodput_percentage 后面插入 per-key 列
+    insert_idx = EXCEL_COLS.index("goodput_percentage") + 1
+    effective_cols = EXCEL_COLS[:insert_idx] + per_key_cols + EXCEL_COLS[insert_idx:]
+
+    # 构造精简行，只保留有效列
+    curated: List[Dict[str, Any]] = [
+        {col: row.get(col, "") for col in effective_cols} for row in rows
+    ]
+    df = pd.DataFrame(curated, columns=effective_cols)
 
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -358,6 +373,9 @@ def calculate_metrics(
         good_tpots = np.array([])
         good_e2els = np.array([])
         good_throughputs = np.array([])
+        # Per-key 单独计数（只要该 key 对应的单个条件满足即算）
+        per_key_counts: Dict[str, int] = {k: 0 for k in goodput_config_dict}
+        n_zip = 0
         # 注意：原版 inference_benchmark 此处 zip 的第三列误写为 tpot；此处改为 e2el
         for _ttft, _tpot, _e2el, _throughput in zip(
             valid_metrics["ttft"],
@@ -365,6 +383,8 @@ def calculate_metrics(
             valid_metrics["e2el"],
             valid_metrics["throughput"],
         ):
+            n_zip += 1
+            # 组合 goodput：所有配置的 key 同时满足
             if (
                 _ttft <= slo_values["ttft"]
                 and _tpot <= slo_values["tpot"]
@@ -375,6 +395,15 @@ def calculate_metrics(
                 good_tpots = np.append(good_tpots, _tpot)
                 good_e2els = np.append(good_e2els, _e2el)
                 good_throughputs = np.append(good_throughputs, _throughput)
+            # Per-key 单独判断
+            if "ttft" in goodput_config_dict and _ttft <= slo_values["ttft"]:
+                per_key_counts["ttft"] += 1
+            if "tpot" in goodput_config_dict and _tpot <= slo_values["tpot"]:
+                per_key_counts["tpot"] += 1
+            if "e2el" in goodput_config_dict and _e2el <= slo_values["e2el"]:
+                per_key_counts["e2el"] += 1
+            if "throughput" in goodput_config_dict and _throughput >= slo_values["throughput"]:
+                per_key_counts["throughput"] += 1
 
         good_completed = len(good_ttfts)
         if good_completed > 0:
@@ -450,7 +479,16 @@ def calculate_metrics(
         ],
     )
 
-    return metrics, actual_output_lens
+    # Per-key goodput 百分比：每个 key 单独满足条件的请求占比（分母为 n_zip）
+    per_key_goodput_pct: Dict[str, float] = {}
+    if goodput_config_dict and n_zip > 0:
+        per_key_goodput_pct = {
+            key: cnt / n_zip * 100 for key, cnt in per_key_counts.items()
+        }
+    elif goodput_config_dict:
+        per_key_goodput_pct = {key: 0.0 for key in goodput_config_dict}
+
+    return metrics, actual_output_lens, per_key_goodput_pct
 
 
 async def async_request_openai(
@@ -711,6 +749,7 @@ def metrics_to_result_dict(
     num_prompts: int,
     max_concurrency: int,
     goodput_config_dict: Dict[str, float],
+    per_key_goodput_pct: Optional[Dict[str, float]] = None,
 ) -> "OrderedDict[str, Any]":
     pct_ttft = metrics.percentiles_ttft_ms
     pct_tpot = metrics.percentiles_tpot_ms
@@ -745,6 +784,11 @@ def metrics_to_result_dict(
             "goodput_percentage": metrics.goodput_percentage
             if goodput_config_dict
             else -1.0,
+            # Per-key goodput（每个 SLO key 单独满足的请求占比，列名形如 ttft_goodput_pct）
+            **{
+                f"{key}_goodput_pct": pct
+                for key, pct in (per_key_goodput_pct or {}).items()
+            },
             "mean_goodput_ttft": metrics.mean_goodput_ttft,
             "mean_goodput_tpot": metrics.mean_goodput_tpot,
             "mean_goodput_e2el": metrics.mean_goodput_e2el,
@@ -867,7 +911,7 @@ async def run_benchmark_async(args: argparse.Namespace) -> Dict[str, Any]:
         pbar.close()
 
     dur_s = time.perf_counter() - t0
-    metrics, _ = calculate_metrics(
+    metrics, _, per_key_pct = calculate_metrics(
         outputs=tuple(outputs),
         dur_s=dur_s,
         selected_percentiles=selected_percentiles,
@@ -882,6 +926,7 @@ async def run_benchmark_async(args: argparse.Namespace) -> Dict[str, Any]:
         num_prompts=args.num_prompts,
         max_concurrency=args.max_concurrency,
         goodput_config_dict=goodput_config_dict,
+        per_key_goodput_pct=per_key_pct,
     )
 
     # 日志摘要（风格贴近 inference_benchmark.benchmark）
@@ -905,6 +950,24 @@ async def run_benchmark_async(args: argparse.Namespace) -> Dict[str, Any]:
     logging.info("%-40s %.2f", "Mean TPOT (ms):", metrics.mean_tpot_ms)
     logging.info("%-40s %.2f", "Mean ITL (ms):", metrics.mean_itl_ms)
     logging.info("%-40s %.2f", "Mean E2EL (ms):", metrics.mean_e2el_ms)
+    if goodput_config_dict:
+        logging.info(
+            "%-40s %.2f%%",
+            "Goodput (combined SLO) %:",
+            metrics.goodput_percentage,
+        )
+        for key, pct in per_key_pct.items():
+            slo_val = goodput_config_dict[key]
+            unit = "ms" if key in ("ttft", "tpot", "e2el") else "tok/s"
+            direction = "<" if key in ("ttft", "tpot", "e2el") else ">"
+            logging.info(
+                "%-40s %.2f%%  (SLO: %s %.4g %s)",
+                f"  {key}_goodput_pct:",
+                pct,
+                direction,
+                slo_val,
+                unit,
+            )
     logging.info("%s", "=" * 72)
 
     return {
