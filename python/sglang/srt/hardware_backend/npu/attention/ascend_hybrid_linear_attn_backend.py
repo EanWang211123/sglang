@@ -15,12 +15,31 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+
+def _runtime_draft_token_num(
+    forward_mode: ForwardMode,
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, SpecInput]],
+) -> int:
+    """Return the runtime number of draft tokens for the current batch.
+
+    Under ``--speculative-adaptive`` this can be smaller than the physical
+    per-request stride of ``intermediate_ssm`` /
+    ``intermediate_conv_window`` (which is sized to
+    ``effective_max_speculative_num_draft_tokens()``). Callers that need
+    the *physical* stride should read it from the buffer shape directly;
+    callers that need the runtime value (e.g. ``conv_state_rollback``)
+    should use this helper.
+    """
+    if forward_mode.is_target_verify() and spec_info is not None:
+        return int(getattr(spec_info, "draft_token_num", 1))
+    return 1
 
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):
@@ -141,6 +160,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        runtime_draft_token_num = _runtime_draft_token_num(forward_mode, spec_info)
+
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
@@ -152,12 +173,16 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=runtime_draft_token_num,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=runtime_draft_token_num,
             )
 
     def _replay_metadata(
@@ -216,6 +241,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        runtime_draft_token_num = _runtime_draft_token_num(forward_mode, spec_info)
+
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
@@ -231,13 +258,32 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=runtime_draft_token_num,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=runtime_draft_token_num,
             )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        # Persist runtime draft_token_num so the post-verify hook
+        # (`update_mamba_state_after_mtp_verify`) can roll back conv states
+        # with the *runtime* stride rather than the physical buffer dim.
+        # Under --speculative-adaptive the two can differ (e.g. runtime 4 vs
+        # physical 8 when the candidate switches), which previously caused
+        # an over-shift in `conv_state_rollback` and polluted the conv state.
+        self.forward_metadata.draft_token_num = _runtime_draft_token_num(
+            forward_batch.forward_mode, forward_batch.spec_info
+        )
+        self.forward_metadata.is_target_verify = (
+            forward_batch.forward_mode.is_target_verify()
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0  # Mamba attn does not use seq lens to index kv cache
@@ -303,13 +349,32 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             last_steps,
         )
 
-        draft_token_num = intermediate_state_cache.shape[2]
+        # `conv_state_rollback` must use the *runtime* draft_token_num that
+        # was actually forwarded through conv1d during verify, not the
+        # physical per-request dim of `intermediate_state_cache` (which is
+        # allocated to `effective_max_speculative_num_draft_tokens()` and
+        # is larger than the runtime value when --speculative-adaptive
+        # selects a smaller candidate). Using the physical dim caused
+        # shift = (physical - 1) - step_idx, over-shifting by
+        # (physical - runtime) every verify and corrupting conv state ->
+        # observable as repeated-fragment output in long generations.
+        runtime_draft_token_num = getattr(
+            self.linear_attn_backend.forward_metadata,
+            "draft_token_num",
+            None,
+        )
+        if not runtime_draft_token_num or runtime_draft_token_num <= 1:
+            # Fallback: legacy physical-dim behavior. Only reached when the
+            # metadata wasn't populated (e.g. older code path); keeps the
+            # pre-fix behavior so this change is strictly additive.
+            runtime_draft_token_num = intermediate_state_cache.shape[2]
+
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(
                 conv_states,
                 dst_indices_tensor,
                 last_steps,
-                draft_token_num,
+                runtime_draft_token_num,
             )
         return
 
