@@ -901,6 +901,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             f"{state.speculative_num_draft_tokens}",
         )
 
+        # Drain in-flight async kernels before swapping shared backend references.
+        # In overlap-schedule mode `on_verify_complete_cpu` fires while the just-launched
+        # batch's kernels (mamba state update, KV writes) are still queued. Without this
+        # sync, the next batch is prepared with the new alloc_len_per_decode / num_steps
+        # and can race with those kernels on shared NPU memory (req_to_token,
+        # intermediate_ssm_state_cache), producing MTE out-of-range faults under high
+        # concurrency.
+        torch.get_device_module(self.device).synchronize()
+
         # Top-level
         self.speculative_num_steps = state.speculative_num_steps
         self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
