@@ -1,0 +1,44 @@
+{
+    "_comment": "示例配置 for aicp_goodput_max_concurrency_sweep.py",
+    "_usage": "python benchmark/speculative_aicp/aicp_goodput_max_concurrency_sweep.py --config benchmark/speculative_aicp/goodput_sweep_config.example.json",
+
+    "base_url": "http://127.0.0.1:30000",
+
+    "_section_seqlen": "--- 输入长度扫描范围 ---",
+    "min_input_len": 500,
+    "max_input_len": 5000,
+    "seqlen_step": 500,
+    "output_len": 256,
+
+    "_section_search": "--- 并发搜索参数 ---",
+    "_note_search": "步进序列：min_batch_size → 倍增至 8 → 每次 +linear_step",
+    "_example_sequence": "min=1, linear_step=4, max=64 → 1,2,4,8,12,16,20,...,64",
+    "min_batch_size": 1,
+    "max_batch_size": 64,
+    "linear_step": 4,
+
+    "_section_bench": "--- 基准测试参数 ---",
+    "combo_per_batch_size": 3,
+    "_note_goodput": "支持 key: ttft(ms) / tpot(ms) / e2el(ms) / throughput(tok/s)",
+    "goodput": ["ttft:5000", "throughput:10"],
+
+    "_section_model": "--- 服务端 / 模型配置 ---",
+    "model": null,
+    "api_key": "EMPTY",
+    "prompt_mode": "approx",
+    "tokenizer_path": null,
+    "seed": 1,
+
+    "_section_warmup": "--- 预热 ---",
+    "warmup_input_len": 32,
+    "warmup_output_len": 32,
+    "disable_warmup": false,
+
+    "_section_output": "--- 输出 ---",
+    "_note_detail_excel": "每个 seqlen 保存一张详情表格（行=测试过的每个并发值）",
+    "_note_summary_excel": "最终汇总表格（行=seqlen，列=各key最大并发）",
+    "output_path": "goodput_max_concurrency_results.jsonl",
+    "detail_excel_dir": null,
+    "disable_excel": false,
+    "excel_path": null
+}
