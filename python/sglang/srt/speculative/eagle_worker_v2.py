@@ -281,6 +281,7 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
+        init_max_bs = getattr(self, "_adaptive_init_max_bs", None)
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -291,7 +292,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
-            ](self)
+            ](self, init_max_bs=init_max_bs)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -334,7 +335,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                 self.target_worker.device
-            ](self)
+            ](self, init_max_bs=init_max_bs)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,
@@ -740,7 +741,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states()
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=self.server_args.cuda_graph_bs,
+                )
+                max_steps = max(self.adaptive_controller.candidate_steps)
+                topk = self.server_args.speculative_eagle_topk or 1
+                self.server_args._adaptive_max_alloc_len_per_decode = max(
+                    max_steps * topk, max_steps + 1
+                )
 
     @property
     def target_worker(self):
@@ -783,6 +791,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+<<<<<<< HEAD
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -790,6 +799,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     else CaptureHiddenMode.LAST
                 )
                 batch.spec_info = EagleDraftInput.create_idle_input(
+=======
+            if self.adaptive_controller is not None:
+                target_steps = self.adaptive_controller.get_steps_for_batch(
+                    model_worker_batch.seq_lens.shape[0]
+                )
+                if target_steps != self.speculative_num_steps:
+                    self.adaptive_controller.activate(target_steps)
+
+            if model_worker_batch.spec_info is None:
+                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+>>>>>>> pr-24055-bsaware-adasd
                     device=self.device,
                     hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
@@ -825,21 +845,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req, batch_size=batch_size
+            )
 
     # -- Adaptive speculative decoding protocol --
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
+        init_max_bs=None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
+            init_max_bs=init_max_bs,
         ):
             self._draft_worker.init_attention_backend()
             self._draft_worker.init_cuda_graphs()
@@ -933,7 +964,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     @contextlib.contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
+        init_max_bs: int | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -950,6 +985,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
+            sa.disable_cuda_graph,
         )
 
         self.speculative_num_steps = speculative_num_steps
@@ -958,6 +995,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
+            # for steps that no BS range uses (e.g. step=1). Disable graph
+            # capture for those steps; restore in finally so subsequent steps
+            # are not affected.
+            if not cuda_graph_bs:
+                sa.disable_cuda_graph = True
+        dw._adaptive_init_max_bs = init_max_bs
 
         try:
             yield
@@ -974,7 +1020,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
+                sa.disable_cuda_graph,
             ) = backup
+            dw._adaptive_init_max_bs = None
 
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
