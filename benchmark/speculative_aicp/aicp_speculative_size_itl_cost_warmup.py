@@ -48,6 +48,7 @@ import argparse
 import asyncio
 import atexit
 import json
+import logging
 import math
 import os
 import random
@@ -361,86 +362,149 @@ def stop_server(handle: ServerHandle) -> None:
 #   This makes itl_cost = itl_spec / itl_baseline a pure measure of overhead.
 # ---------------------------------------------------------------------------
 
-_SSE_PREFIX = b"data: "
-_SSE_DONE = b"data: [DONE]"
+# ---------------------------------------------------------------------------
+# SSE streaming client – copied verbatim from aicp_random_tokens_benchmark.py
+# (RequestFuncInput / RequestFuncOutput / remove_prefix / async_request_openai)
+# ---------------------------------------------------------------------------
+
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
-async def _stream_one(
-    session: aiohttp.ClientSession,
-    url: str,
-    payload: dict,
-) -> List[float]:
-    """Stream a single /v1/chat/completions request and return decode-phase ITL
-    gaps (sec), matching the methodology of inference_benchmark.py exactly.
+@dataclass
+class RequestFuncInput:
+    prompt: str
+    api_url: str
+    prompt_len: int
+    output_len: int
+    model: str
+    best_of: int = 1
+    ignore_eos: bool = False
+    temperature: float = 0.0
+    stream: bool = True
 
-    ITL definition (same as inference_benchmark.py::async_request_openai):
-      - First SSE event with delta.content → TTFT anchor (most_recent_timestamp).
-        NO gap appended.
-      - Every subsequent SSE event with delta.content → gap = timestamp - most_recent_timestamp.
-        most_recent_timestamp updated to this timestamp.
-      - Non-content events (e.g. usage) are parsed but do NOT contribute a gap.
 
-    For baseline (no spec): each SSE event carries 1 token → gap = one decode step.
-    For spec decoding: each SSE event carries all tokens accepted in one spec cycle
-    → gap = one full draft+verify+extend cycle (independent of acceptance length).
+@dataclass
+class RequestFuncOutput:
+    generated_text: str = ""
+    success: bool = False
+    latency: float = 0.0
+    ttft: float = 0.0
+    itl: List[float] = field(default_factory=list)
+    prompt_len: int = 0
+    completion_len: int = 0
+    error: str = ""
 
-    Implementation note: we use readline() instead of `async for chunk in resp.content`
-    to guarantee one SSE event per iteration regardless of TCP segment boundaries.
-    """
-    most_recent_timestamp: float = 0.0
-    gaps: List[float] = []
-    try:
-        async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                return []
-            while True:
-                raw = await resp.content.readline()
-                if not raw:
-                    break
-                line = raw.strip()
-                if not line:
-                    continue
-                if line == _SSE_DONE:
-                    break
-                if not line.startswith(_SSE_PREFIX):
-                    continue
-                try:
-                    data = json.loads(line[len(_SSE_PREFIX):])
-                except json.JSONDecodeError:
-                    continue
 
-                choices = data.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-                if "content" not in delta:
-                    continue
+def remove_prefix(s: str, prefix: str) -> str:
+    if s.startswith(prefix):
+        return s[len(prefix):]
+    return s
 
-                timestamp = time.perf_counter()
-                if most_recent_timestamp == 0.0:
-                    # First content event = TTFT anchor; no gap recorded.
-                    most_recent_timestamp = timestamp
+
+async def async_request_openai(
+    request_func_input: RequestFuncInput,
+    api_key: str = "EMPTY",
+    enable_thinking: bool = False,
+    pbar: Optional[Any] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    connector = aiohttp.TCPConnector(ssl=False) if "https" in api_url else None
+    async with aiohttp.ClientSession(
+        timeout=AIOHTTP_TIMEOUT, connector=connector
+    ) as session:
+        payload: Dict[str, Any] = {
+            "model": request_func_input.model,
+            "temperature": request_func_input.temperature,
+            "best_of": request_func_input.best_of,
+            "max_tokens": request_func_input.output_len,
+            "stream": request_func_input.stream,
+            "ignore_eos": request_func_input.ignore_eos,
+            "stream_options": {"include_usage": True},
+            # Bug4 fix：对 Qwen3 等模型禁用 thinking 模式，否则 TTFT 会极大偏高
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            "messages": [{"role": "user", "content": request_func_input.prompt}],
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(url=api_url, json=payload, headers=headers) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        if (
+                            not chunk_bytes
+                            or chunk_bytes in {b"\r", b"\n"}
+                            or b": ping - " in chunk_bytes
+                        ):
+                            continue
+                        if b"local_rate_limited" in chunk_bytes:
+                            break
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:").strip()
+                        if chunk == "[DONE]":
+                            output.latency = time.perf_counter() - st
+                            output.success = True
+                            # Bug3 fix：若 usage chunk 未携带 completion_tokens，用 ITL 数量兜底
+                            if output.completion_len == 0 and output.itl:
+                                output.completion_len = len(output.itl) + 1
+                        else:
+                            timestamp = time.perf_counter()
+                            data = json.loads(chunk)
+
+                            if data.get("status", {}).get("code") == 500:
+                                output.error = f"{response.reason} {chunk}".strip()
+                                output.success = False
+                                break
+
+                            choices = data.get("choices", [])
+                            if not choices and data.get("usage"):
+                                output.prompt_len = data["usage"]["prompt_tokens"]
+                                output.completion_len = data["usage"]["completion_tokens"]
+                                continue
+
+                            if not choices:
+                                continue
+
+                            delta = choices[0].get("delta", {})
+                            if "content" in delta:
+                                # Bug1 fix：SGLang 会发出 content="" 的空 delta，必须跳过；
+                                # 否则会错误触发 TTFT 或产生接近 0ms 的虚假 ITL 条目。
+                                if not delta.get("content"):
+                                    continue
+                                if output.ttft == 0.0:
+                                    output.ttft = time.perf_counter() - st
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
+                                output.generated_text += delta["content"]
+                                # Bug2 fix：most_recent_timestamp 只在有效非空 content 时更新，
+                                # 与 test.py 行为一致；放在这里而非外层，避免 usage/空 chunk 干扰。
+                                most_recent_timestamp = timestamp
                 else:
-                    gaps.append(timestamp - most_recent_timestamp)
-                    most_recent_timestamp = timestamp
-    except Exception:
-        return []
+                    error_message = "".join(
+                        [c.decode("utf-8").strip() async for c in response.content]
+                    )
+                    output.error = f"{response.reason} {error_message}".strip()
+                    output.success = False
+        except Exception:
+            output.success = False
+            output.error = "".join(traceback.format_exception(*sys.exc_info()))
+            logging.error("Request failed: %s", output.error)
 
-    return gaps
+    if pbar is not None:
+        pbar.update(1)
+    return output
 
 
-def _make_payload(model: str, prompt_text: str, output_len: int) -> dict:
-    """Build a /v1/chat/completions streaming payload (mirrors inference_benchmark.py)."""
-    return {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt_text}],
-        "max_tokens": output_len,
-        "stream": True,
-        "ignore_eos": True,    # never cut short → full output_len always
-        "temperature": 0.0,
-        "best_of": 1,
-    }
-
+# ---------------------------------------------------------------------------
+# Prompt generator
+# ---------------------------------------------------------------------------
 
 def _make_prompt_text(seqlen: int, rng: random.Random) -> str:
     """Generate a text prompt of approximately `seqlen` tokens.
@@ -453,6 +517,10 @@ def _make_prompt_text(seqlen: int, rng: random.Random) -> str:
     return " ".join(str(rng.randint(0, 99)) for _ in range(seqlen))
 
 
+# ---------------------------------------------------------------------------
+# Async benchmark runner (uses async_request_openai, same as random_tokens_benchmark)
+# ---------------------------------------------------------------------------
+
 async def _async_bench(
     host: str,
     port: int,
@@ -460,37 +528,44 @@ async def _async_bench(
     prompt_texts: List[str],
     output_len: int,
     batch_size: int,
+    api_key: str = "EMPTY",
 ) -> Dict[str, Any]:
-    """Run `prompt_texts` in rounds of `batch_size` concurrent chat streams.
+    """Run all prompts concurrently (up to `batch_size` at a time) using
+    async_request_openai, then aggregate ITL from successful requests.
 
-    Returns dict with `mean_itl_ms` = mean raw chunk gap across all rounds.
+    Returns dict with `mean_itl_ms`, `median_itl_ms`, `p95_itl_ms`, `num_chunks`.
     """
     url = f"http://{host}:{port}/v1/chat/completions"
-    all_gaps: List[float] = []
+    semaphore = asyncio.Semaphore(batch_size)
+    all_itls: List[float] = []
 
-    connector = aiohttp.TCPConnector(limit=0)
-    timeout = aiohttp.ClientTimeout(total=None, connect=30)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        for start in range(0, len(prompt_texts), batch_size):
-            batch = prompt_texts[start : start + batch_size]
-            payloads = [_make_payload(model, t, output_len) for t in batch]
-            results = await asyncio.gather(
-                *[_stream_one(session, url, pl) for pl in payloads],
-                return_exceptions=True,
-            )
-            for r in results:
-                if isinstance(r, list):
-                    all_gaps.extend(r)
+    async def _one(prompt_text: str) -> RequestFuncOutput:
+        inp = RequestFuncInput(
+            prompt=prompt_text,
+            api_url=url,
+            prompt_len=len(prompt_text.split()),
+            output_len=output_len,
+            model=model,
+            ignore_eos=True,
+            temperature=0.0,
+        )
+        async with semaphore:
+            return await async_request_openai(inp, api_key=api_key)
 
-    if not all_gaps:
-        raise RuntimeError("No valid streaming chunks collected (server error?)")
+    outputs = await asyncio.gather(*[_one(t) for t in prompt_texts])
+    for out in outputs:
+        if out.success:
+            all_itls.extend(out.itl)
 
-    arr = np.array(all_gaps) * 1000.0  # → ms
+    if not all_itls:
+        raise RuntimeError("No valid ITL samples collected (all requests failed?)")
+
+    arr = np.array(all_itls) * 1000.0  # → ms
     return {
         "mean_itl_ms": float(np.mean(arr)),
         "median_itl_ms": float(np.median(arr)),
         "p95_itl_ms": float(np.percentile(arr, 95)),
-        "num_chunks": len(all_gaps),
+        "num_chunks": len(all_itls),
     }
 
 
