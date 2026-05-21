@@ -188,6 +188,10 @@ def build_per_bs_params(
 
     Returns ``(bs_list, bs_params)`` where *bs_list* is the sorted list of
     BS lower-bound keys and *bs_params* maps each key to its params instance.
+
+    Non-integer keys in the config (e.g. ``ema_alpha``, ``itl_cost_path``) are
+    treated as global overrides or ignored, so the same function works for both
+    the standard adaptive config and the throughput-aware config formats.
     """
     cfg, bs_config = _load_validated_config(cfg_path)
 

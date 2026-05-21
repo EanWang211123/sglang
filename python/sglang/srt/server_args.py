@@ -564,6 +564,7 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    speculative_adaptive_throughput_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
@@ -5594,6 +5595,17 @@ class ServerArgs:
             default=ServerArgs.speculative_adaptive_config,
         )
         parser.add_argument(
+            "--speculative-adaptive-throughput-config",
+            type=str,
+            help="Path to a JSON config file for throughput-aware adaptive speculative decoding. "
+            "Enables a separate strategy that scores each step by "
+            "E[accepted_tokens] / itl_cost using offline profiling data. "
+            "Mutually exclusive with --speculative-adaptive; takes priority when both are set. "
+            "Required keys: 'itl_cost_path'; optional: 'warmup_per_pos', 'ema_alpha', "
+            "'update_interval', plus integer-string BS-lower-bound keys for per-BS step lists.",
+            default=ServerArgs.speculative_adaptive_throughput_config,
+        )
+        parser.add_argument(
             "--speculative-skip-dp-mlp-sync",
             action="store_true",
             default=ServerArgs.speculative_skip_dp_mlp_sync,
@@ -6850,16 +6862,25 @@ class ServerArgs:
         """Return the maximum draft-token count runtime speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
-        if not self.speculative_adaptive:
+
+        is_adaptive = self.speculative_adaptive or (
+            self.speculative_adaptive_throughput_config is not None
+        )
+        if not is_adaptive:
             return self.speculative_num_draft_tokens
 
         from sglang.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,
         )
 
+        # For throughput-aware config the integer-keyed BS entries use the same
+        # format as the standard adaptive config, so the same resolver works.
+        cfg_path = self.speculative_adaptive_config or (
+            self.speculative_adaptive_throughput_config
+        )
         candidate_steps = resolve_candidate_steps_from_config(
             initial_steps=self.speculative_num_steps,
-            cfg_path=self.speculative_adaptive_config,
+            cfg_path=cfg_path,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
         # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.

@@ -38,6 +38,9 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative.throughput_aware_controller import (
+    ThroughputAwareAdaptiveController,
+)
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -705,7 +708,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
-        if server_args.speculative_adaptive:
+        if server_args.speculative_adaptive_throughput_config is not None:
+            self.adaptive_controller = ThroughputAwareAdaptiveController(
+                self,
+                throughput_config_path=server_args.speculative_adaptive_throughput_config,
+            )
+        elif server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
@@ -791,9 +799,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # changed the optimal step for the current batch size, so we query
             # and activate here before entering the draft→verify→extend loop.
             if self.adaptive_controller is not None:
-                target_steps = self.adaptive_controller.get_steps_for_batch(
-                    batch.seq_lens.shape[0]
-                )
+                _batch_size = batch.seq_lens.shape[0]
+                if isinstance(
+                    self.adaptive_controller, ThroughputAwareAdaptiveController
+                ):
+                    _avg_sl = float(batch.seq_lens.float().mean().item())
+                    _max_sl = float(batch.seq_lens.max().item())
+                    target_steps = self.adaptive_controller.get_steps_for_batch(
+                        _batch_size, avg_seqlen=(_avg_sl + _max_sl) / 2.0
+                    )
+                else:
+                    target_steps = self.adaptive_controller.get_steps_for_batch(
+                        _batch_size
+                    )
                 if target_steps != self.speculative_num_steps:
                     self.adaptive_controller.activate(target_steps)
 

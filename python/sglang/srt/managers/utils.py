@@ -231,7 +231,10 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     # active.  This prevents KV pool accounting drift when the overlap
     # scheduler switches steps between decode rounds.
     adaptive_max = server_args.effective_max_speculative_num_draft_tokens()
-    if adaptive_max is not None and server_args.speculative_adaptive:
+    if adaptive_max is not None and (
+        server_args.speculative_adaptive
+        or server_args.speculative_adaptive_throughput_config is not None
+    ):
         return adaptive_max
 
     # Spec v1:
