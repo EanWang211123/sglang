@@ -32,6 +32,34 @@ from sglang.srt.utils import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 
+def _format_position_rates(rates: list[Optional[float]]) -> str:
+    parts = []
+    for k, rate in enumerate(rates):
+        if rate is None:
+            parts.append(f"p{k}=?")
+        else:
+            parts.append(f"p{k}={rate:.3f}")
+    return "[" + ", ".join(parts) + "]"
+
+
+def _format_score_breakdown(rows: list[dict]) -> str:
+    parts = []
+    for row in rows:
+        steps = int(row["steps"])
+        expected = row["expected"]
+        itl_cost = row["itl_cost"]
+        score = row["score"]
+        if score is not None and expected is not None and itl_cost is not None:
+            parts.append(
+                f"S={steps}:E={expected:.2f}/itl={itl_cost:.2f}→{score:.4f}"
+            )
+        elif expected is not None:
+            parts.append(f"S={steps}:E={expected:.2f}/itl=?")
+        else:
+            parts.append(f"S={steps}:?")
+    return "[" + ", ".join(parts) + "]"
+
+
 def load_throughput_config(path: Optional[str]) -> dict:
     """Load the throughput-aware config JSON.
 
@@ -171,7 +199,12 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         bs_key = self._find_closest_bs(padded_bs)
         candidate_steps = self._bs_params[bs_key].candidate_steps
 
-        new_steps = self._scorer.best_step(candidate_steps, batch_size, avg_seqlen)
+        max_pos = max(candidate_steps) if candidate_steps else 0
+        pos_rates = self._tracker.snapshot_position_rates(max_pos)
+        score_rows = self._scorer.score_breakdown(
+            candidate_steps, batch_size, avg_seqlen
+        )
+        new_steps = self._scorer.pick_best_from_breakdown(candidate_steps, score_rows)
 
         # Reset cooldown regardless of whether the step changed.
         self._batches_since_change = 0
@@ -188,7 +221,9 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
             logger.info(
                 f"ThroughputAwareAdaptiveController: BS slot {bs_key} "
                 f"(actual bs={batch_size}, seqlen={avg_seqlen:.0f}) "
-                f"steps {old_steps} -> {new_steps}"
+                f"steps {old_steps} -> {new_steps}; "
+                f"pos_rates={_format_position_rates(pos_rates)}; "
+                f"scores={_format_score_breakdown(score_rows)}"
             )
 
         return self._current_steps

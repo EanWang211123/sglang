@@ -111,6 +111,19 @@ class PositionAcceptanceTracker:
 
         return 1.0 + sum(rates)
 
+    def snapshot_position_rates(self, num_positions: int) -> list[Optional[float]]:
+        """Return per-position rates used for scoring (EMA, warmup mean, or extrapolated)."""
+        if num_positions <= 0:
+            return []
+        known: list[float] = []
+        out: list[Optional[float]] = []
+        for k in range(num_positions):
+            rate = self._get_rate_or_extrapolate(k, known)
+            out.append(rate)
+            if rate is not None:
+                known.append(rate)
+        return out
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -241,6 +254,49 @@ class ThroughputScorer:
         self.tracker = tracker
         self.itl_table = itl_table
 
+    def score_breakdown(
+        self,
+        candidate_steps: list[int],
+        batch_size: int,
+        index_seqlen: float,
+    ) -> list[dict[str, Optional[float]]]:
+        """Per-candidate expected tokens, ITL cost, and throughput score."""
+        rows: list[dict[str, Optional[float]]] = []
+        for steps in candidate_steps:
+            expected = self.tracker.get_expected_tokens(steps)
+            itl_cost = self.itl_table.lookup(index_seqlen, batch_size, steps)
+            score: Optional[float] = None
+            if (
+                expected is not None
+                and itl_cost is not None
+                and itl_cost > 0
+            ):
+                score = expected / itl_cost
+            rows.append(
+                {
+                    "steps": float(steps),
+                    "expected": expected,
+                    "itl_cost": itl_cost,
+                    "score": score,
+                }
+            )
+        return rows
+
+    def pick_best_from_breakdown(
+        self,
+        candidate_steps: list[int],
+        rows: list[dict[str, Optional[float]]],
+    ) -> int:
+        """Return the highest-scoring step from :meth:`score_breakdown` output."""
+        best_step = candidate_steps[0]
+        best_score = -math.inf
+        for row in rows:
+            score = row["score"]
+            if score is not None and score > best_score:
+                best_score = score
+                best_step = int(row["steps"])
+        return best_step
+
     def best_step(
         self,
         candidate_steps: list[int],
@@ -252,19 +308,7 @@ class ThroughputScorer:
         Falls back to the first candidate if no score can be computed
         (e.g. cold start or missing ITL data for all candidates).
         """
-        best_step = candidate_steps[0]
-        best_score = -math.inf
-
-        for steps in candidate_steps:
-            expected = self.tracker.get_expected_tokens(steps)
-            if expected is None:
-                continue
-            itl_cost = self.itl_table.lookup(index_seqlen, batch_size, steps)
-            if itl_cost is None or itl_cost <= 0:
-                continue
-            score = expected / itl_cost
-            if score > best_score:
-                best_score = score
-                best_step = steps
-
-        return best_step
+        return self.pick_best_from_breakdown(
+            candidate_steps,
+            self.score_breakdown(candidate_steps, batch_size, index_seqlen),
+        )
