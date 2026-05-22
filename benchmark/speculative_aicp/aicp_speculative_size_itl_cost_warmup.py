@@ -16,9 +16,12 @@ Workflow (Linux only):
     3. For each spec_size in `test_spec_size_list`, restart the server with
        speculative args appended, repeat the sweep.  The inter-chunk gap now
        measures one full draft+verify+draft-extend cycle → itl_spec_ms.
-    4. Emit a JSONL file with one row per (seqlen, batch_size, spec_size):
-           {seqlen, batch_size, spec_size,
+    4. Emit a JSONL file with one row per (input_tokens, batch_size, spec_size):
+           {target_seqlen, input_tokens, seqlen, batch_size, spec_size,
             itl_baseline_ms, itl_spec_ms, itl_cost}
+       ``input_tokens`` / ``seqlen`` are measured via the local tokenizer
+       (chat template included, matching /v1/chat/completions).
+       ``target_seqlen`` is the sweep-grid target from config.
        where itl_cost = itl_spec_ms / itl_baseline_ms.
        itl_cost < 1.0 → spec overhead fits within one baseline step (beneficial).
        itl_cost > 1.0 → spec step costs more than baseline (may hurt throughput).
@@ -60,11 +63,18 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
 import requests
+
+try:
+    from transformers import AutoTokenizer
+    _TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    _TRANSFORMERS_AVAILABLE = False
+    AutoTokenizer = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # sglang helpers (Linux-only assumed; these modules import fine without GPU).
@@ -124,6 +134,18 @@ def normalize_command(cmd: str) -> str:
     return " ".join(clean)
 
 
+def extract_model_path_from_command(cmd: str) -> Optional[str]:
+    """Read ``--model-path`` / ``--model`` from a launch command string."""
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None
+    for i, tok in enumerate(tokens):
+        if tok in ("--model-path", "--model") and i + 1 < len(tokens):
+            return tokens[i + 1]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -161,6 +183,10 @@ class Config:
     combo_per_batch_size: int = 3
 
     host: str = "127.0.0.1"
+    # HuggingFace tokenizer directory.  If empty, inferred from --model-path in
+    # base_command.  Used to build exact-length prompts and to measure the
+    # actual input token count written to JSONL (chat template included).
+    tokenizer_path: str = ""
     warmup_seqlen: int = 512
     warmup_output_len: int = 32
     seed: int = 1
@@ -205,6 +231,15 @@ class Config:
             raise ValueError("test_spec_size_list values must be >= 1")
         if self.output_len <= 1:
             raise ValueError("output_len must be > 1 to measure ITL")
+        if not self.tokenizer_path:
+            inferred = extract_model_path_from_command(self.base_command)
+            if inferred:
+                self.tokenizer_path = inferred
+        if not self.tokenizer_path:
+            raise ValueError(
+                "tokenizer_path is required (set explicitly or include "
+                "--model-path in base_command)"
+            )
 
     def seqlen_list(self) -> List[int]:
         return list(range(self.seqlen_min, self.seqlen_max + 1, self.seqlen_step))
@@ -503,18 +538,95 @@ async def async_request_openai(
 
 
 # ---------------------------------------------------------------------------
-# Prompt generator
+# Prompt generator (tokenizer-backed)
 # ---------------------------------------------------------------------------
 
-def _make_prompt_text(seqlen: int, rng: random.Random) -> str:
-    """Generate a text prompt of approximately `seqlen` tokens.
+def build_exact_prompt_tokens(
+    tokenizer: Any,
+    num_tokens: int,
+    rng: random.Random,
+) -> Tuple[str, int]:
+    """Build user-message text with exactly ``num_tokens`` raw tokens."""
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be > 0")
+    ids: List[int] = []
+    special = set(getattr(tokenizer, "all_special_ids", []) or [])
+    for _ in range(10000):
+        while len(ids) < num_tokens:
+            tid = rng.randint(0, tokenizer.vocab_size - 1)
+            if tid in special:
+                continue
+            ids.append(tid)
+        ids = ids[:num_tokens]
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+        enc = tokenizer.encode(text, add_special_tokens=False)
+        if len(enc) == num_tokens:
+            return text, num_tokens
+        if len(enc) > num_tokens:
+            ids = enc[:num_tokens]
+        else:
+            ids = enc
+    raise RuntimeError(
+        f"无法构造恰好 {num_tokens} 个 token 的 prompt，请换 seed 或 tokenizer。"
+    )
 
-    Uses space-separated two-digit random integers (0-99).  Each such number
-    tokenises to roughly 1 token for common BPE vocabularies, so seqlen numbers
-    ≈ seqlen tokens.  The exact count varies slightly by model/tokeniser but is
-    close enough for controlled ITL measurement.
+
+def count_chat_prompt_tokens(tokenizer: Any, prompt_text: str) -> int:
+    """Token count for /v1/chat/completions (includes chat template overhead)."""
+    messages = [{"role": "user", "content": prompt_text}]
+    try:
+        ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+    except TypeError:
+        ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    # Some tokenizers return tensors / BatchEncoding instead of list[int].
+    if hasattr(ids, "input_ids"):
+        ids = ids["input_ids"]
+    elif hasattr(ids, "shape"):
+        ids = ids.flatten().tolist()
+    return len(ids)
+
+
+def resolve_measured_input_tokens(
+    *results: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Pick authoritative input length for JSONL (never the sweep-grid target).
+
+    Priority: server ``usage.prompt_tokens`` mean > bench ``input_tokens``.
     """
-    return " ".join(str(rng.randint(0, 99)) for _ in range(seqlen))
+    for res in results:
+        if not isinstance(res, dict):
+            continue
+        for key in ("mean_server_prompt_tokens", "input_tokens"):
+            val = res.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def make_prompt_batch(
+    tokenizer: Any,
+    target_seqlen: int,
+    num_prompts: int,
+    seed: int,
+) -> List[str]:
+    """Return exact-length user prompts for one benchmark cell."""
+    rng = random.Random(seed)
+    return [
+        build_exact_prompt_tokens(tokenizer, target_seqlen, rng)[0]
+        for _ in range(num_prompts)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +638,7 @@ async def _async_bench(
     port: int,
     model: str,
     prompt_texts: List[str],
+    prompt_lens: List[int],
     output_len: int,
     batch_size: int,
     api_key: str = "EMPTY",
@@ -533,17 +646,19 @@ async def _async_bench(
     """Run all prompts concurrently (up to `batch_size` at a time) using
     async_request_openai, then aggregate ITL from successful requests.
 
-    Returns dict with `mean_itl_ms`, `median_itl_ms`, `p95_itl_ms`, `num_chunks`.
+    Returns dict with `mean_itl_ms`, `median_itl_ms`, `p95_itl_ms`, `num_chunks`,
+    and optional `mean_server_prompt_tokens` from usage chunks.
     """
     url = f"http://{host}:{port}/v1/chat/completions"
     semaphore = asyncio.Semaphore(batch_size)
     all_itls: List[float] = []
+    server_prompt_tokens: List[int] = []
 
-    async def _one(prompt_text: str) -> RequestFuncOutput:
+    async def _one(prompt_text: str, prompt_len: int) -> RequestFuncOutput:
         inp = RequestFuncInput(
             prompt=prompt_text,
             api_url=url,
-            prompt_len=len(prompt_text.split()),
+            prompt_len=prompt_len,
             output_len=output_len,
             model=model,
             ignore_eos=True,
@@ -552,50 +667,75 @@ async def _async_bench(
         async with semaphore:
             return await async_request_openai(inp, api_key=api_key)
 
-    outputs = await asyncio.gather(*[_one(t) for t in prompt_texts])
+    outputs = await asyncio.gather(
+        *[_one(t, pl) for t, pl in zip(prompt_texts, prompt_lens)]
+    )
     for out in outputs:
         if out.success:
             all_itls.extend(out.itl)
+            if out.prompt_len > 0:
+                server_prompt_tokens.append(out.prompt_len)
 
     if not all_itls:
         raise RuntimeError("No valid ITL samples collected (all requests failed?)")
 
     arr = np.array(all_itls) * 1000.0  # → ms
-    return {
+    result: Dict[str, Any] = {
         "mean_itl_ms": float(np.mean(arr)),
         "median_itl_ms": float(np.median(arr)),
         "p95_itl_ms": float(np.percentile(arr, 95)),
         "num_chunks": len(all_itls),
     }
+    if server_prompt_tokens:
+        result["mean_server_prompt_tokens"] = int(round(np.mean(server_prompt_tokens)))
+    return result
 
 
 def run_one_bench(
     cfg: Config,
     handle: ServerHandle,
-    seqlen: int,
+    tokenizer: Any,
+    target_seqlen: int,
     batch_size: int,
     output_len: int,
     num_prompts: int,
     *,
     label: str,
 ) -> Dict[str, Any]:
-    """Generate `num_prompts` text prompts (~seqlen tokens each), stream them in
-    concurrent batches of `batch_size`, and return ITL statistics.
+    """Generate `num_prompts` exact-length prompts, stream them in concurrent
+    batches of `batch_size`, and return ITL statistics plus ``input_tokens``.
     """
-    rng = random.Random(cfg.seed)
-    prompt_texts = [_make_prompt_text(seqlen, rng) for _ in range(num_prompts)]
+    prompt_texts = make_prompt_batch(
+        tokenizer,
+        target_seqlen=target_seqlen,
+        num_prompts=num_prompts,
+        seed=cfg.seed,
+    )
+    prompt_lens = [count_chat_prompt_tokens(tokenizer, t) for t in prompt_texts]
+    tokenizer_local_tokens = int(round(float(np.mean(prompt_lens))))
     result = asyncio.run(
         _async_bench(
             host=handle.host,
             port=handle.port,
             model=handle.model_name,
             prompt_texts=prompt_texts,
+            prompt_lens=prompt_lens,
             output_len=output_len,
             batch_size=batch_size,
         )
     )
+    result["tokenizer_local_tokens"] = tokenizer_local_tokens
+    result["target_seqlen"] = target_seqlen
+    # Prefer server-side prompt_tokens (same counter SGLang uses at runtime).
+    server_tokens = result.get("mean_server_prompt_tokens")
+    result["input_tokens"] = (
+        int(server_tokens) if server_tokens is not None else tokenizer_local_tokens
+    )
     print(
-        f"  → mean_itl={result['mean_itl_ms']:.2f}ms  "
+        f"  → input_tokens={result['input_tokens']} "
+        f"(server={server_tokens}, local={tokenizer_local_tokens}, "
+        f"target={target_seqlen})  "
+        f"mean_itl={result['mean_itl_ms']:.2f}ms  "
         f"median={result['median_itl_ms']:.2f}ms  "
         f"p95={result['p95_itl_ms']:.2f}ms  "
         f"chunks={result['num_chunks']}",
@@ -610,6 +750,7 @@ def run_one_bench(
 def sweep_one_server(
     cfg: Config,
     handle: ServerHandle,
+    tokenizer: Any,
     spec_size: Optional[int],
     partial_path: Path,
     global_step: List[int],
@@ -635,7 +776,8 @@ def sweep_one_server(
         run_one_bench(
             cfg=cfg,
             handle=handle,
-            seqlen=cfg.warmup_seqlen,
+            tokenizer=tokenizer,
+            target_seqlen=cfg.warmup_seqlen,
             batch_size=1,
             output_len=cfg.warmup_output_len,
             num_prompts=1,
@@ -667,7 +809,8 @@ def sweep_one_server(
                 res = run_one_bench(
                     cfg=cfg,
                     handle=handle,
-                    seqlen=seqlen,
+                    tokenizer=tokenizer,
+                    target_seqlen=seqlen,
                     batch_size=bs,
                     output_len=cfg.output_len,
                     num_prompts=num_prompts,
@@ -681,12 +824,17 @@ def sweep_one_server(
                 traceback.print_exc()
                 res = {"error": str(exc)}
 
+            measured = (
+                resolve_measured_input_tokens(res) if isinstance(res, dict) else None
+            )
             out[(seqlen, bs)] = res
             _append_partial(
                 partial_path,
                 {
                     "spec_size": spec_size,
-                    "seqlen": seqlen,
+                    "target_seqlen": seqlen,
+                    "seqlen": measured,
+                    "input_tokens": measured,
                     "batch_size": bs,
                     "result": res,
                 },
@@ -738,9 +886,31 @@ def aggregate(
                 if (base_itl is not None and spec_itl is not None and base_itl > 0)
                 else None
             )
+            measured = resolve_measured_input_tokens(base_res, spec_res)
+            if measured is None:
+                print(
+                    f"[warn] skip row: no measured input_tokens for "
+                    f"target_seqlen={seqlen} bs={bs} spec_size={spec_size}",
+                    file=sys.stderr,
+                )
+                continue
+            server_pt = None
+            local_pt = None
+            for res in (base_res, spec_res):
+                if not isinstance(res, dict):
+                    continue
+                if server_pt is None and res.get("mean_server_prompt_tokens") is not None:
+                    server_pt = int(res["mean_server_prompt_tokens"])
+                if local_pt is None and res.get("tokenizer_local_tokens") is not None:
+                    local_pt = int(res["tokenizer_local_tokens"])
             rows.append(
                 {
-                    "seqlen": seqlen,
+                    # ``seqlen`` = runtime prefill prompt_tokens (server usage preferred).
+                    "seqlen": measured,
+                    "input_tokens": measured,
+                    "target_seqlen": seqlen,
+                    "server_prompt_tokens": server_pt,
+                    "tokenizer_local_tokens": local_pt,
                     "batch_size": bs,
                     "spec_size": spec_size,
                     "itl_baseline_ms": base_itl,
@@ -748,7 +918,13 @@ def aggregate(
                     "itl_cost": cost,
                 }
             )
-    rows.sort(key=lambda r: (r["spec_size"], r["seqlen"], r["batch_size"]))
+    rows.sort(
+        key=lambda r: (
+            r["spec_size"],
+            r.get("input_tokens") or r.get("target_seqlen") or 0,
+            r["batch_size"],
+        )
+    )
     return rows
 
 
@@ -770,6 +946,19 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = Config.from_file(args.config)
+
+    if not _TRANSFORMERS_AVAILABLE:
+        print(
+            "[error] transformers is required for tokenizer-backed prompt lengths. "
+            "Install with: pip install transformers",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"[plan] tokenizer_path   = {cfg.tokenizer_path}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.tokenizer_path, trust_remote_code=True
+    )
+
     output_path = Path(cfg.output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     partial_path = output_path.with_suffix(output_path.suffix + ".partial.jsonl")
@@ -796,7 +985,7 @@ def main() -> int:
     try:
         handle = start_server(cfg, spec_size=None)
         baseline = sweep_one_server(
-            cfg, handle, spec_size=None,
+            cfg, handle, tokenizer, spec_size=None,
             partial_path=partial_path,
             global_step=global_step, global_total=global_total,
         )
@@ -811,7 +1000,7 @@ def main() -> int:
         try:
             handle = start_server(cfg, spec_size=spec_size)
             spec_results[spec_size] = sweep_one_server(
-                cfg, handle, spec_size=spec_size,
+                cfg, handle, tokenizer, spec_size=spec_size,
                 partial_path=partial_path,
                 global_step=global_step, global_total=global_total,
             )
@@ -834,6 +1023,16 @@ def main() -> int:
 
     print(f"\n[done] wrote {len(rows)} rows -> {output_path}")
     print(f"[done] partial log    -> {partial_path}")
+    if rows:
+        sample = rows[0]
+        print(
+            "[done] sample row keys:",
+            sorted(sample.keys()),
+            "| seqlen=",
+            sample.get("seqlen"),
+            "target_seqlen=",
+            sample.get("target_seqlen"),
+        )
     return 0
 
 
