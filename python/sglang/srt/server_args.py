@@ -5601,8 +5601,9 @@ class ServerArgs:
             "Enables a separate strategy that scores each step by "
             "E[accepted_tokens] / itl_cost using offline profiling data. "
             "Mutually exclusive with --speculative-adaptive; takes priority when both are set. "
-            "Required keys: 'itl_cost_path'; optional: 'warmup_per_pos', 'ema_alpha', "
-            "'update_interval', plus integer-string BS-lower-bound keys for per-BS step lists.",
+            "Required keys: 'itl_cost_path'; optional: 'window_size' (default 20), "
+            "'update_interval' (default 10), plus integer-string BS-lower-bound keys for "
+            "per-BS step lists.",
             default=ServerArgs.speculative_adaptive_throughput_config,
         )
         parser.add_argument(

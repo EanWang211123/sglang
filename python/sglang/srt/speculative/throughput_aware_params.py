@@ -1,7 +1,7 @@
 """Throughput-aware speculative decoding: acceptance tracking and cost lookup.
 
 Three components:
-  - PositionAcceptanceTracker  -- per-position EMA/warmup accept-rate tracker
+  - PositionAcceptanceTracker  -- per-position sliding-window accept-rate tracker
                                    shared across all batch sizes.
   - ITLCostTable               -- offline profiling data (seqlen, bs, spec_size)
                                    → itl_cost multiplier.
@@ -14,54 +14,63 @@ import bisect
 import json
 import logging
 import math
+from collections import deque
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 class PositionAcceptanceTracker:
-    """Per-position acceptance-rate tracker, shared across all batch sizes.
+    """Per-position acceptance-rate tracker using a fixed-size sliding window.
 
     Position k (0-indexed) is accepted when ``num_correct_drafts > k``.
 
-    Two-phase update per position:
-      1. **Warmup** (first ``warmup_per_pos`` observations): accumulate a
-         running mean.  No EMA is started until the warmup completes; this
-         avoids the cold-start bias ``0 + alpha * p`` that EMA would produce.
-      2. **EMA** (after warmup): standard exponential moving average.
+    Each position maintains a circular buffer of the ``window_size`` most
+    recent batch-level acceptance rates.  The estimated rate for position k
+    is the arithmetic mean of its buffer.
+
+    Lifecycle of a position's buffer:
+      - **Filling** (buffer length < ``window_size``): the partial-window mean
+        is used as the best available estimate.  The controller's warmup gate
+        (``all_positions_warmed``) blocks step changes until every active
+        position has a full window, preventing premature decisions on noisy
+        early data.
+      - **Steady state** (buffer full): the oldest entry is evicted on each
+        new observation, giving a true ``window_size``-batch sliding average.
 
     When the active step count decreases, positions above the new step are
-    cleared so they don't pollute the tracker the next time those positions
-    are explored.
+    cleared (buffer fully emptied) so they start fresh if the step is later
+    raised again.
 
-    For positions that have no data yet (e.g. when increasing steps), the
-    tracker extrapolates using the geometric mean of the per-step transition
-    probabilities computed from the existing positions.
+    For positions with no data at all (empty buffer after a clear, or a
+    candidate step larger than the current), the tracker extrapolates from
+    the geometric mean of the per-step transition probabilities computed
+    from the positions that do have data.
     """
 
     def __init__(
         self,
         max_steps: int,
-        ema_alpha: float = 0.2,
-        warmup_per_pos: int = 5,
+        window_size: int = 20,
     ):
         self.max_steps = max_steps
-        self.ema_alpha = ema_alpha
-        self.warmup_per_pos = warmup_per_pos
+        self.window_size = window_size
 
-        # Per-position state: None means no data at all.
-        self._ema_rate: list[Optional[float]] = [None] * max_steps
-        self._warmup_count: list[int] = [0] * max_steps
-        self._warmup_sum: list[float] = [0.0] * max_steps
+        # Per-position circular buffers. ``deque(maxlen=N)`` automatically
+        # evicts the oldest entry when a new value is appended beyond capacity.
+        self._windows: list[deque] = [
+            deque(maxlen=window_size) for _ in range(max_steps)
+        ]
 
     def update(self, accept_lengths: list[int], current_steps: int) -> None:
         """Update per-position rates from one verify batch.
 
         Args:
-            accept_lengths: ``num_correct_drafts_per_req`` (excludes extend
-                token; value k means the first k draft positions were accepted).
-            current_steps: number of draft steps that were actually run this
-                batch.  Only positions 0..current_steps-1 are updated.
+            accept_lengths: ``num_correct_drafts_per_req`` (excludes the
+                always-accepted extend token; value k means the first k draft
+                positions were accepted).
+            current_steps: number of draft steps actually run this batch.
+                Only positions 0..current_steps-1 are updated.
         """
         n = len(accept_lengths)
         if n == 0:
@@ -71,32 +80,31 @@ class PositionAcceptanceTracker:
             # p[k] = fraction of requests that accepted position k
             # (i.e. had at least k+1 correct drafts)
             pos_rate = sum(1 for a in accept_lengths if a > k) / n
-
-            if self._warmup_count[k] < self.warmup_per_pos:
-                self._warmup_count[k] += 1
-                self._warmup_sum[k] += pos_rate
-                if self._warmup_count[k] >= self.warmup_per_pos:
-                    # Graduate: set EMA to the warmup mean.
-                    self._ema_rate[k] = self._warmup_sum[k] / self._warmup_count[k]
-            else:
-                assert self._ema_rate[k] is not None
-                self._ema_rate[k] = (
-                    (1.0 - self.ema_alpha) * self._ema_rate[k]
-                    + self.ema_alpha * pos_rate
-                )
+            self._windows[k].append(pos_rate)
 
     def clear_positions_above(self, steps: int) -> None:
-        """Clear data for positions >= *steps* (called on step-count decrease)."""
+        """Clear buffers for positions >= *steps* (called on step-count decrease)."""
         for k in range(steps, self.max_steps):
-            self._ema_rate[k] = None
-            self._warmup_count[k] = 0
-            self._warmup_sum[k] = 0.0
+            self._windows[k].clear()
+
+    def all_positions_warmed(self, target_steps: int) -> bool:
+        """Return True if every position in ``[0, target_steps)`` has a full window.
+
+        Used by the controller as a gate: step changes are blocked until all
+        active positions have accumulated ``window_size`` observations.  This
+        prevents premature decisions based on small samples, both at cold-start
+        and after a step-up introduces new positions.
+        """
+        for k in range(min(target_steps, self.max_steps)):
+            if len(self._windows[k]) < self.window_size:
+                return False
+        return True
 
     def get_expected_tokens(self, target_steps: int) -> Optional[float]:
         """Return ``E[accepted tokens | target_steps drafted]``, including the
         always-present extend token (+1).
 
-        Uses extrapolation for positions that have not yet been warmed up.
+        Uses extrapolation for positions whose buffer is empty.
         Returns ``None`` if there is no data to extrapolate from (cold start).
         """
         if target_steps <= 0:
@@ -112,7 +120,7 @@ class PositionAcceptanceTracker:
         return 1.0 + sum(rates)
 
     def snapshot_position_rates(self, num_positions: int) -> list[Optional[float]]:
-        """Return per-position rates used for scoring (EMA, warmup mean, or extrapolated)."""
+        """Return per-position rates used for scoring (window mean or extrapolated)."""
         if num_positions <= 0:
             return []
         known: list[float] = []
@@ -129,13 +137,11 @@ class PositionAcceptanceTracker:
     # ------------------------------------------------------------------
 
     def _best_rate(self, k: int) -> Optional[float]:
-        """Return the best available rate for position k (graduated EMA first,
-        then warmup mean if warmup has at least one sample)."""
-        if self._ema_rate[k] is not None:
-            return self._ema_rate[k]
-        if self._warmup_count[k] > 0:
-            return self._warmup_sum[k] / self._warmup_count[k]
-        return None
+        """Return the sliding-window mean for position k, or ``None`` if empty."""
+        w = self._windows[k]
+        if not w:
+            return None
+        return sum(w) / len(w)
 
     def _get_rate_or_extrapolate(
         self, k: int, known_rates: list[float]
@@ -143,7 +149,7 @@ class PositionAcceptanceTracker:
         """Return acceptance rate for position k.
 
         Priority:
-          1. Real data (EMA or warmup mean).
+          1. Window mean (partial or full).
           2. Geometric extrapolation from ``known_rates``.
           3. ``None`` if there is nothing to extrapolate from.
         """
@@ -151,11 +157,11 @@ class PositionAcceptanceTracker:
         if real is not None:
             return real
 
-        # Extrapolate
+        # Extrapolate from the positions that do have data.
         if len(known_rates) == 0:
             return None
         if len(known_rates) == 1:
-            # Only one data point; use it as-is (p[k] ≈ p[0]).
+            # Only one data point; carry it forward (p[k] ≈ p[0]).
             return known_rates[0]
 
         # Geometric mean of per-step transition probabilities:
