@@ -528,15 +528,15 @@ class EAGLEWorker(TpModelWorker):
                     _seq_lens = [req.seqlen for req in batch.reqs]
                     _avg_sl = sum(_seq_lens) / len(_seq_lens)
                     _max_sl = max(_seq_lens)
-                    target_steps = self.adaptive_controller.get_steps_for_batch(
-                        _batch_size, avg_seqlen=(_avg_sl + _max_sl) / 2.0
+                    self.adaptive_controller.activate_step_by_batch(
+                        _batch_size,
+                        self.speculative_num_steps,
+                        avg_seqlen=(_avg_sl + _max_sl) / 2.0,
                     )
                 else:
-                    target_steps = self.adaptive_controller.get_steps_for_batch(
-                        _batch_size
+                    self.adaptive_controller.activate_step_by_batch(
+                        _batch_size, self.speculative_num_steps
                     )
-                if target_steps != self.speculative_num_steps:
-                    self.adaptive_controller.activate(target_steps)
 
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 

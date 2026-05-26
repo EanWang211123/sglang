@@ -185,6 +185,19 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
     # Overridden decision interface
     # ------------------------------------------------------------------
 
+    def activate_step_by_batch(
+        self, batch_size: int, current_steps: int, avg_seqlen: float = 0.0
+    ) -> None:
+        """Activate the optimal throughput-aware step if it differs from *current_steps*.
+
+        Overrides the base class to pass *avg_seqlen* ``(avg + max) / 2`` to
+        :meth:`get_steps_for_batch` so that the ITL cost table is looked up
+        with a representative sequence length rather than the default 0.
+        """
+        target = self.get_steps_for_batch(batch_size, avg_seqlen=avg_seqlen)
+        if target != current_steps:
+            self._activate(target)
+
     def get_steps_for_batch(self, batch_size: int, avg_seqlen: float = 0.0) -> int:
         """Score candidate steps and return the optimal one.
 

@@ -824,15 +824,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     _avg_sl = float(batch.seq_lens.float().mean().item())
                     _max_sl = float(batch.seq_lens.max().item())
-                    target_steps = self.adaptive_controller.get_steps_for_batch(
-                        _batch_size, avg_seqlen=(_avg_sl + _max_sl) / 2.0
+                    self.adaptive_controller.activate_step_by_batch(
+                        _batch_size,
+                        self.speculative_num_steps,
+                        avg_seqlen=(_avg_sl + _max_sl) / 2.0,
                     )
                 else:
-                    target_steps = self.adaptive_controller.get_steps_for_batch(
-                        _batch_size
+                    self.adaptive_controller.activate_step_by_batch(
+                        _batch_size, self.speculative_num_steps
                     )
-                if target_steps != self.speculative_num_steps:
-                    self.adaptive_controller.activate(target_steps)
 
             if batch.spec_info is None:
                 capture_mode = (
