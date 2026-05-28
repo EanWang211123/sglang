@@ -15,25 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-_NO_PREAMBLE = (
+HIGH_PROMPT = (
     "Do not explain. Do not think. Do not add a title or preamble. "
-    "Start output immediately on the first line."
+    "Start output immediately. Output only the digit 1 repeated exactly 256 times "
+    "in one continuous stream. Do not use spaces, newlines, or any other character."
 )
 
-HIGH_PROMPTS = [
-    (
-        f"{_NO_PREAMBLE}\n"
-        "Print exactly 256 lines. Every line must contain only the single character: a"
-    ),
-    (
-        f"{_NO_PREAMBLE}\n"
-        "Print exactly 256 lines. Every line must contain only the single digit: 1"
-    ),
-    (
-        f"{_NO_PREAMBLE}\n"
-        "Print exactly 256 lines. Every line must be exactly the two letters: OK"
-    ),
-]
+HIGH_PROMPTS = [HIGH_PROMPT]
 
 LOW_PROMPTS = [
     (
@@ -71,7 +59,6 @@ WORKLOADS = {
         ("high_2", HIGH_PROMPTS),
     ],
 }
-
 
 def build_phase_plan(workload: str, num_requests: int):
     return [
