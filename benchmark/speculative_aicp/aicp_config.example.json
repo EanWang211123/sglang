@@ -31,6 +31,7 @@
   "speculative_draft_model_path": "",
 
   "combo_per_batch_size": 5,
+  "wait_all_prefill_before_itl": true,
 
   "host": "127.0.0.1",
   "_tokenizer_note": "Leave empty to auto-use --model-path from base_command. JSONL writes input_tokens from this tokenizer (chat template included).",

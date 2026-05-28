@@ -43,6 +43,10 @@ Stability notes:
     * Partial results are appended to `<output>.partial.jsonl` after every
       cell, so a crash mid-sweep does not lose data.
     * SIGINT / SIGTERM / atexit all teardown the running server.
+    * With ``wait_all_prefill_before_itl`` (default true), ITL is recorded
+      only while every in-flight stream has received its first token, so a
+      long prefill batch for one request does not inflate another request's
+      inter-chunk gaps.
 """
 
 from __future__ import annotations
@@ -181,6 +185,11 @@ class Config:
     # EAGLE3, DFLASH, STANDALONE, and EAGLE1 with a separate draft checkpoint.
     speculative_draft_model_path: str = ""
     combo_per_batch_size: int = 3
+    # When true, no stream records ITL until every in-flight stream has
+    # received its first non-empty content chunk (prefill done).  New streams
+    # pause ITL for all until they also finish prefill (avoids prefill-batch
+    # stalls polluting decode ITL under concurrent load).
+    wait_all_prefill_before_itl: bool = True
 
     host: str = "127.0.0.1"
     # HuggingFace tokenizer directory.  If empty, inferred from --model-path in
@@ -395,6 +404,12 @@ def stop_server(handle: ServerHandle) -> None:
 #   - Spec:      chunk_gap ≈ one draft+verify+draft-extend cycle time
 #                           (independent of how many tokens were accepted)
 #   This makes itl_cost = itl_spec / itl_baseline a pure measure of overhead.
+#
+# Prefill / decode isolation (``wait_all_prefill_before_itl``):
+#   Under concurrency, SGLang may run a prefill batch for request B while
+#   request A is already decoding; A's inter-chunk gap would then include B's
+#   prefill time.  ``PrefillBarrier`` suppresses ITL until every in-flight
+#   stream has TTFT, and pauses again when a new stream joins the pool.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -403,6 +418,39 @@ def stop_server(handle: ServerHandle) -> None:
 # ---------------------------------------------------------------------------
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+
+
+class PrefillBarrier:
+    """Coordinate ITL recording across concurrent streams.
+
+    While any registered stream has not yet received its first token, no
+    stream may append ITL samples.  When a new stream registers, recording
+    pauses again until it also completes prefill.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._waiting_prefill: set[int] = set()
+        self._next_id = 0
+
+    async def register(self) -> int:
+        async with self._lock:
+            sid = self._next_id
+            self._next_id += 1
+            self._waiting_prefill.add(sid)
+            return sid
+
+    async def mark_prefill_done(self, sid: int) -> None:
+        async with self._lock:
+            self._waiting_prefill.discard(sid)
+
+    async def unregister(self, sid: int) -> None:
+        async with self._lock:
+            self._waiting_prefill.discard(sid)
+
+    async def all_prefill_done(self) -> bool:
+        async with self._lock:
+            return len(self._waiting_prefill) == 0
 
 
 @dataclass
@@ -441,6 +489,7 @@ async def async_request_openai(
     api_key: str = "EMPTY",
     enable_thinking: bool = False,
     pbar: Optional[Any] = None,
+    prefill_barrier: Optional[PrefillBarrier] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     connector = aiohttp.TCPConnector(ssl=False) if "https" in api_url else None
@@ -466,6 +515,10 @@ async def async_request_openai(
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+
+        stream_id: Optional[int] = None
+        if prefill_barrier is not None:
+            stream_id = await prefill_barrier.register()
 
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -515,7 +568,12 @@ async def async_request_openai(
                                     continue
                                 if output.ttft == 0.0:
                                     output.ttft = time.perf_counter() - st
-                                else:
+                                    if prefill_barrier is not None and stream_id is not None:
+                                        await prefill_barrier.mark_prefill_done(stream_id)
+                                elif prefill_barrier is None or (
+                                    stream_id is not None
+                                    and await prefill_barrier.all_prefill_done()
+                                ):
                                     output.itl.append(timestamp - most_recent_timestamp)
                                 output.generated_text += delta["content"]
                                 # Bug2 fix：most_recent_timestamp 只在有效非空 content 时更新，
@@ -531,6 +589,9 @@ async def async_request_openai(
             output.success = False
             output.error = "".join(traceback.format_exception(*sys.exc_info()))
             logging.error("Request failed: %s", output.error)
+        finally:
+            if prefill_barrier is not None and stream_id is not None:
+                await prefill_barrier.unregister(stream_id)
 
     if pbar is not None:
         pbar.update(1)
@@ -642,6 +703,7 @@ async def _async_bench(
     output_len: int,
     batch_size: int,
     api_key: str = "EMPTY",
+    wait_all_prefill_before_itl: bool = True,
 ) -> Dict[str, Any]:
     """Run all prompts concurrently (up to `batch_size` at a time) using
     async_request_openai, then aggregate ITL from successful requests.
@@ -651,6 +713,7 @@ async def _async_bench(
     """
     url = f"http://{host}:{port}/v1/chat/completions"
     semaphore = asyncio.Semaphore(batch_size)
+    prefill_barrier = PrefillBarrier() if wait_all_prefill_before_itl else None
     all_itls: List[float] = []
     server_prompt_tokens: List[int] = []
 
@@ -665,7 +728,11 @@ async def _async_bench(
             temperature=0.0,
         )
         async with semaphore:
-            return await async_request_openai(inp, api_key=api_key)
+            return await async_request_openai(
+                inp,
+                api_key=api_key,
+                prefill_barrier=prefill_barrier,
+            )
 
     outputs = await asyncio.gather(
         *[_one(t, pl) for t, pl in zip(prompt_texts, prompt_lens)]
@@ -722,6 +789,7 @@ def run_one_bench(
             prompt_lens=prompt_lens,
             output_len=output_len,
             batch_size=batch_size,
+            wait_all_prefill_before_itl=cfg.wait_all_prefill_before_itl,
         )
     )
     result["tokenizer_local_tokens"] = tokenizer_local_tokens
