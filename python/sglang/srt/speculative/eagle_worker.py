@@ -885,20 +885,35 @@ class EAGLEWorker(TpModelWorker):
             _sl = batch.seq_lens.float()
             _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
             optimal_k = self.adaptive_controller.get_optimal_verify_steps(
-                _bs, _avg_seqlen
+                _bs, _avg_seqlen, current_steps=self.speculative_num_steps
             )
             if optimal_k != self.speculative_num_steps:
                 verify_steps = optimal_k
                 verify_draft_token_num = optimal_k + 1
-                # Truncate outputs for a topk=1 linear chain.
-                # top_scores_index: [bs, fixed_draft_steps] → [bs, k]
-                # draft_tokens:     [bs, fixed_draft_steps] → [bs, k]
-                # parent_list:      [bs, fixed_draft_steps-1] → [bs, k-1]
-                top_scores_index = top_scores_index[:, :optimal_k]
-                draft_tokens = draft_tokens[:, :optimal_k]
-                parent_k_cols = max(0, optimal_k - 1)
+                # Truncate the draft outputs so that build_tree_kernel_efficient
+                # receives the same tensor shapes it would see from a native k-step
+                # draft.  For a topk=T linear/tree draft, organize_draft_results
+                # produces:
+                #   top_scores_index: [bs, speculative_num_steps]
+                #   draft_tokens:     [bs, speculative_num_steps]
+                #   parent_list:      [bs, T*(speculative_num_steps-1) + 1]
+                #                      because parents_list[0] has T+1 cols and
+                #                      parents_list[i≥1] each have T cols.
+                # A native k-step draft would give the *first* k columns of
+                # top_scores_index / draft_tokens and the first T*(k-1)+1 columns
+                # of parent_list (0 columns when k=1).
+                # NOTE: slicing produces a non-contiguous view; the
+                # sgl_build_tree_kernel_efficient CUDA kernel reads these tensors
+                # assuming contiguous row-major layout, so we MUST call
+                # .contiguous() to avoid out-of-bounds reads (which manifest as
+                # "invalid eagle tree" warnings and CUDA illegal memory access).
+                top_scores_index = top_scores_index[:, :optimal_k].contiguous()
+                draft_tokens = draft_tokens[:, :optimal_k].contiguous()
+                parent_k_cols = (
+                    self.topk * (optimal_k - 1) + 1 if optimal_k >= 2 else 0
+                )
                 if parent_list.shape[1] > parent_k_cols:
-                    parent_list = parent_list[:, :parent_k_cols]
+                    parent_list = parent_list[:, :parent_k_cols].contiguous()
                 # Switch target graph runner and draft-extend runner to k-step state.
                 self.adaptive_controller._activate(optimal_k)
         # --------------------------------------------------------------

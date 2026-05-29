@@ -67,6 +67,40 @@ def _format_score_breakdown(rows: list[dict]) -> str:
     return "[" + ", ".join(parts) + "]"
 
 
+def _format_draft_probs(probs: torch.Tensor, max_seqs: int = 16) -> str:
+    """Format [bs, steps] greedy draft prob matrix for logging."""
+    bs = probs.shape[0]
+    n = min(bs, max_seqs)
+    parts = []
+    for s in range(n):
+        pos_parts = [
+            f"p{k}={probs[s, k].item():.4f}" for k in range(probs.shape[1])
+        ]
+        parts.append(f"seq{s}=[{', '.join(pos_parts)}]")
+    if bs > n:
+        parts.append(f"...+{bs - n}seq")
+    return "; ".join(parts)
+
+
+def _format_draft_prob_scores(rows: list[dict], best_k: int) -> str:
+    parts = []
+    for row in rows:
+        steps = int(row["steps"])
+        expected = row["expected"]
+        itl_cost = row["itl_cost"]
+        score = row["score"]
+        marker = "*" if steps == best_k else ""
+        if score is not None and expected is not None and itl_cost is not None:
+            parts.append(
+                f"S={steps}:E={expected:.2f}/itl={itl_cost:.2f}→{score:.4f}{marker}"
+            )
+        elif expected is not None:
+            parts.append(f"S={steps}:E={expected:.2f}/itl=?{marker}")
+        else:
+            parts.append(f"S={steps}:?{marker}")
+    return "[" + ", ".join(parts) + "]"
+
+
 def load_throughput_config(path: Optional[str]) -> dict:
     """Load the throughput-aware config JSON.
 
@@ -323,6 +357,8 @@ class DraftProbAdaptiveController(AdaptiveController):
       - ``"enable_draft_prob_adaptive": true``   — activates this controller.
       - ``"fixed_draft_steps": 5``               — always draft this many steps.
       - ``"itl_cost_path": "..."``               — offline profiling JSONL.
+      - ``"log_draft_prob_decision": true``      — log per-position draft probs
+        and per-candidate throughput scores after each draft (default true).
       - ``"1": {"steps": [1,2,3,4,5]}, ...``    — candidate verify steps per BS.
 
     Constraints:
@@ -365,13 +401,17 @@ class DraftProbAdaptiveController(AdaptiveController):
         # (so max_bs is known).  draft_forward() writes to this buffer in-place;
         # the CUDA graph captures those writes and replays them on every forward pass.
         self._per_step_draft_probs: Optional[torch.Tensor] = None
+        self._log_draft_prob_decision: bool = bool(
+            cfg.get("log_draft_prob_decision", True)
+        )
 
         log_info_on_rank0(
             logger,
             f"DraftProbAdaptiveController initialized: "
             f"fixed_draft_steps={self._fixed_draft_steps}, "
             f"candidate_steps={self.candidate_steps}, "
-            f"itl_cost_path={itl_cost_path!r}",
+            f"itl_cost_path={itl_cost_path!r}, "
+            f"log_draft_prob_decision={self._log_draft_prob_decision}",
         )
 
     # ------------------------------------------------------------------
@@ -416,7 +456,66 @@ class DraftProbAdaptiveController(AdaptiveController):
     # Post-draft interface (compute optimal verify steps from probs)
     # ------------------------------------------------------------------
 
-    def get_optimal_verify_steps(self, batch_size: int, avg_seqlen: float) -> int:
+    def draft_prob_score_breakdown(
+        self,
+        batch_size: int,
+        avg_seqlen: float,
+    ) -> tuple[list[dict], Optional[torch.Tensor], int]:
+        """Score every candidate verify step from the current draft prob buffer.
+
+        Returns ``(score_rows, probs[:batch_size], best_k)``.  Each row has
+        keys ``steps``, ``expected``, ``itl_cost``, ``score``, and per-seq
+        ``seq_expected`` (1 + sum of cumprods for that candidate k).
+        """
+        if self._per_step_draft_probs is None or self._itl_table is None:
+            return [], None, self._fixed_draft_steps
+
+        probs = self._per_step_draft_probs[:batch_size]  # [bs, fixed_draft_steps]
+
+        candidates = [
+            k for k in self.candidate_steps if 1 <= k <= self._fixed_draft_steps
+        ]
+        if not candidates:
+            return [], probs, self._fixed_draft_steps
+
+        rows: list[dict] = []
+        best_k = candidates[0]
+        best_score = -float("inf")
+
+        for k in candidates:
+            k_probs = probs[:, :k]
+            cum_prods = torch.cumprod(k_probs, dim=1)
+            # Per-seq: 1 (bonus) + sum_j prod(p[0:j+1])
+            seq_expected = 1.0 + cum_prods.sum(dim=1)
+            total_expected = float(seq_expected.sum().item())
+
+            itl_cost = self._itl_table.lookup(avg_seqlen, batch_size, k)
+            score: Optional[float] = None
+            if itl_cost is not None and itl_cost > 0:
+                score = total_expected / itl_cost
+
+            rows.append(
+                {
+                    "steps": float(k),
+                    "expected": total_expected,
+                    "itl_cost": itl_cost,
+                    "score": score,
+                    "seq_expected": seq_expected.detach().cpu().tolist(),
+                }
+            )
+
+            if score is not None and score > best_score:
+                best_score = score
+                best_k = k
+
+        return rows, probs, best_k
+
+    def get_optimal_verify_steps(
+        self,
+        batch_size: int,
+        avg_seqlen: float,
+        current_steps: Optional[int] = None,
+    ) -> int:
         """After draft: read per-step probs and return the optimal verify step count.
 
         For each candidate k, computes::
@@ -431,45 +530,40 @@ class DraftProbAdaptiveController(AdaptiveController):
             batch_size: Actual (unpadded) number of requests in the batch.
             avg_seqlen: (avg + max) / 2 of current sequence lengths, used to
                 look up ITL cost.
+            current_steps: Active STS before the verify switch (for logging only).
         """
-        if self._per_step_draft_probs is None or self._itl_table is None:
+        rows, probs, best_k = self.draft_prob_score_breakdown(batch_size, avg_seqlen)
+        if probs is None:
             return self._fixed_draft_steps
 
-        probs = self._per_step_draft_probs[:batch_size]  # [bs, fixed_draft_steps]
+        if self._log_draft_prob_decision:
+            prev = (
+                current_steps
+                if current_steps is not None
+                else self._fixed_draft_steps
+            )
+            switch_note = (
+                f"verify {prev}->{best_k}"
+                if best_k != prev
+                else f"verify {best_k} (no switch)"
+            )
+            seq_expected_lines = []
+            for row in rows:
+                k = int(row["steps"])
+                seq_parts = [
+                    f"seq{s}={exp:.3f}"
+                    for s, exp in enumerate(row["seq_expected"])
+                ]
+                seq_expected_lines.append(f"k={k}:[{', '.join(seq_parts)}]")
+            log_info_on_rank0(
+                logger,
+                f"DraftProbAdaptiveController: bs={batch_size} seqlen={avg_seqlen:.0f} "
+                f"{switch_note}; "
+                f"draft_probs={_format_draft_probs(probs)}; "
+                f"seq_expected={{{'; '.join(seq_expected_lines)}}}; "
+                f"scores={_format_draft_prob_scores(rows, best_k)}",
+            )
 
-        candidates = [
-            k for k in self.candidate_steps if 1 <= k <= self._fixed_draft_steps
-        ]
-        if not candidates:
-            return self._fixed_draft_steps
-
-        best_k = candidates[0]
-        best_score = -float("inf")
-
-        for k in candidates:
-            # Cumulative products along draft steps: [bs, k]
-            # cum_prods[s, j] = prod(probs[s, 0:j+1])
-            k_probs = probs[:, :k]
-            cum_prods = torch.cumprod(k_probs, dim=1)
-            # total_expected = sum_seq(1) + sum_seq_j(cum_prods[s, j])
-            total_expected = float(batch_size) + float(cum_prods.sum().item())
-
-            itl_cost = self._itl_table.lookup(avg_seqlen, batch_size, k)
-            if itl_cost is None or itl_cost <= 0:
-                continue
-
-            score = total_expected / itl_cost
-            if score > best_score:
-                best_score = score
-                best_k = k
-
-        logger.debug(
-            "DraftProbAdaptiveController: bs=%d seqlen=%.0f optimal_k=%d score=%.4f",
-            batch_size,
-            avg_seqlen,
-            best_k,
-            best_score,
-        )
         return best_k
 
     # ------------------------------------------------------------------
