@@ -12,6 +12,11 @@ Key differences from the EMA-based parent:
     since the last change), not a global periodic counter.
   - A single ``_current_steps`` value is maintained rather than one
     ``current_steps`` per BS slot.
+
+Also contains :class:`DraftProbAdaptiveController`, which uses the draft
+model's per-step greedy softmax probabilities (captured via a GPU side-buffer
+during the draft CUDA graph) instead of a sliding-window acceptance tracker.
+The verify step count is chosen *per batch* to maximise batch-level throughput.
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ from __future__ import annotations
 import json
 import logging
 from typing import Optional
+
+import torch
 
 from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController
 from sglang.srt.speculative.adaptive_spec_params import build_per_bs_params
@@ -288,3 +295,191 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
 
         self._tracker.update(accept_lengths, self._current_steps)
         self._batch_count += 1
+
+
+class DraftProbAdaptiveController(AdaptiveController):
+    """Adaptive verify-step controller driven by per-step draft softmax probs.
+
+    Unlike :class:`ThroughputAwareAdaptiveController` (which maintains a
+    sliding-window acceptance tracker fed from historical verify results),
+    this controller reads the draft model's **greedy softmax probability at
+    each draft position** captured during the current batch's draft forward
+    pass, and uses those probabilities to estimate the expected acceptance
+    length for every candidate verify step count *k*.
+
+    Algorithm (per batch):
+      1. Always draft ``fixed_draft_steps`` tokens.
+      2. During the draft CUDA graph, per-step greedy probs are written
+         in-place to ``_per_step_draft_probs`` [bs, fixed_draft_steps].
+      3. After draft, for each candidate k compute::
+
+             total_expected(k) = sum_seq(1 + p[0] + p[0]*p[1] + ... + prod(p[:k]))
+             score(k) = total_expected(k) / itl_cost(seqlen, bs, k)
+
+      4. Pick k* = argmax score(k) and switch the verify CUDA graph to k*.
+      5. After verify + draft-extend, restore STS to ``fixed_draft_steps``.
+
+    Config JSON keys (same file as throughput-aware config):
+      - ``"enable_draft_prob_adaptive": true``   — activates this controller.
+      - ``"fixed_draft_steps": 5``               — always draft this many steps.
+      - ``"itl_cost_path": "..."``               — offline profiling JSONL.
+      - ``"1": {"steps": [1,2,3,4,5]}, ...``    — candidate verify steps per BS.
+
+    Constraints:
+      - Requires ``speculative_eagle_topk = 1`` (greedy / linear chain).
+      - Requires spec-v1 (non-overlap) scheduler so that the verify graph can
+        be changed after the draft and before the verify call.
+    """
+
+    def __init__(
+        self,
+        worker,
+        throughput_config_path: Optional[str] = None,
+    ):
+        cfg = load_throughput_config(throughput_config_path)
+
+        # Inherit candidate_steps, _states, _cuda_graph_bs machinery from parent.
+        self.worker = worker
+        self._bs_list, self._bs_params = build_per_bs_params(throughput_config_path)
+        self._states: dict = {}
+        self._cuda_graph_bs = None
+
+        # Fixed number of draft steps (draft CUDA graph is always for this many steps).
+        self._fixed_draft_steps: int = int(
+            cfg.get("fixed_draft_steps", max(self.candidate_steps))
+        )
+
+        # ITL cost table for throughput scoring.
+        itl_cost_path: Optional[str] = cfg.get("itl_cost_path")
+        if itl_cost_path:
+            self._itl_table: Optional[ITLCostTable] = ITLCostTable(itl_cost_path)
+        else:
+            self._itl_table = None
+            logger.warning(
+                "DraftProbAdaptiveController: no 'itl_cost_path' in config; "
+                "verify steps will always equal fixed_draft_steps."
+            )
+
+        # GPU side-buffer for per-step greedy probs; shape [max_bs, fixed_draft_steps].
+        # Allocated lazily in init_side_buffer() after the draft CUDA graph is captured
+        # (so max_bs is known).  draft_forward() writes to this buffer in-place;
+        # the CUDA graph captures those writes and replays them on every forward pass.
+        self._per_step_draft_probs: Optional[torch.Tensor] = None
+
+        log_info_on_rank0(
+            logger,
+            f"DraftProbAdaptiveController initialized: "
+            f"fixed_draft_steps={self._fixed_draft_steps}, "
+            f"candidate_steps={self.candidate_steps}, "
+            f"itl_cost_path={itl_cost_path!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Side-buffer lifecycle
+    # ------------------------------------------------------------------
+
+    def init_side_buffer(self, max_bs: int, device: str) -> None:
+        """Allocate the GPU tensor that draft_forward() writes per-step probs to.
+
+        Must be called **after** the draft CUDA graph is captured (so max_bs
+        is known) and **before** any replay.  The CUDA graph records the
+        in-place copy operations into this buffer; reading it after replay
+        gives the correct per-step greedy probabilities for the current batch.
+        """
+        self._per_step_draft_probs = torch.zeros(
+            (max_bs, self._fixed_draft_steps),
+            dtype=torch.float32,
+            device=device,
+        )
+        log_info_on_rank0(
+            logger,
+            f"DraftProbAdaptiveController: side buffer allocated "
+            f"[{max_bs}, {self._fixed_draft_steps}] on {device}",
+        )
+
+    # ------------------------------------------------------------------
+    # Pre-draft interface (always return fixed_draft_steps)
+    # ------------------------------------------------------------------
+
+    def get_steps_for_batch(self, batch_size: int, avg_seqlen: float = 0.0) -> int:
+        """Pre-draft: always return fixed_draft_steps so the draft always runs fully."""
+        return self._fixed_draft_steps
+
+    def activate_step_by_batch(
+        self, batch_size: int, current_steps: int, avg_seqlen: float = 0.0
+    ) -> None:
+        """Ensure STS = fixed_draft_steps before each draft round."""
+        if current_steps != self._fixed_draft_steps:
+            self._activate(self._fixed_draft_steps)
+
+    # ------------------------------------------------------------------
+    # Post-draft interface (compute optimal verify steps from probs)
+    # ------------------------------------------------------------------
+
+    def get_optimal_verify_steps(self, batch_size: int, avg_seqlen: float) -> int:
+        """After draft: read per-step probs and return the optimal verify step count.
+
+        For each candidate k, computes::
+
+            total_expected(k) = sum_{seq} (1 + p[0] + p[0]*p[1] + ... + prod(p[:k]))
+            score(k)          = total_expected(k) / itl_cost(seqlen, bs, k)
+
+        Returns the k with the highest score.  Falls back to ``fixed_draft_steps``
+        if the side buffer is not yet ready or the ITL table is missing.
+
+        Args:
+            batch_size: Actual (unpadded) number of requests in the batch.
+            avg_seqlen: (avg + max) / 2 of current sequence lengths, used to
+                look up ITL cost.
+        """
+        if self._per_step_draft_probs is None or self._itl_table is None:
+            return self._fixed_draft_steps
+
+        probs = self._per_step_draft_probs[:batch_size]  # [bs, fixed_draft_steps]
+
+        candidates = [
+            k for k in self.candidate_steps if 1 <= k <= self._fixed_draft_steps
+        ]
+        if not candidates:
+            return self._fixed_draft_steps
+
+        best_k = candidates[0]
+        best_score = -float("inf")
+
+        for k in candidates:
+            # Cumulative products along draft steps: [bs, k]
+            # cum_prods[s, j] = prod(probs[s, 0:j+1])
+            k_probs = probs[:, :k]
+            cum_prods = torch.cumprod(k_probs, dim=1)
+            # total_expected = sum_seq(1) + sum_seq_j(cum_prods[s, j])
+            total_expected = float(batch_size) + float(cum_prods.sum().item())
+
+            itl_cost = self._itl_table.lookup(avg_seqlen, batch_size, k)
+            if itl_cost is None or itl_cost <= 0:
+                continue
+
+            score = total_expected / itl_cost
+            if score > best_score:
+                best_score = score
+                best_k = k
+
+        logger.debug(
+            "DraftProbAdaptiveController: bs=%d seqlen=%.0f optimal_k=%d score=%.4f",
+            batch_size,
+            avg_seqlen,
+            best_k,
+            best_score,
+        )
+        return best_k
+
+    # ------------------------------------------------------------------
+    # No-op: we don't maintain a sliding-window tracker
+    # ------------------------------------------------------------------
+
+    def on_verify_complete(
+        self,
+        accept_lengths: list[int],
+        batch_size: int = 0,
+    ) -> None:
+        """No-op: this controller uses draft probs, not historical accept rates."""
+        pass

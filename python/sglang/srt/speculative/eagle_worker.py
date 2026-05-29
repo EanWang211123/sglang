@@ -40,7 +40,9 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.throughput_aware_controller import (
+    DraftProbAdaptiveController,
     ThroughputAwareAdaptiveController,
+    load_throughput_config,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -123,10 +125,19 @@ class EAGLEWorker(TpModelWorker):
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive_throughput_config is not None:
-            self.adaptive_controller = ThroughputAwareAdaptiveController(
-                self,
-                throughput_config_path=server_args.speculative_adaptive_throughput_config,
+            _tp_cfg = load_throughput_config(
+                server_args.speculative_adaptive_throughput_config
             )
+            if _tp_cfg.get("enable_draft_prob_adaptive", False):
+                self.adaptive_controller = DraftProbAdaptiveController(
+                    self,
+                    throughput_config_path=server_args.speculative_adaptive_throughput_config,
+                )
+            else:
+                self.adaptive_controller = ThroughputAwareAdaptiveController(
+                    self,
+                    throughput_config_path=server_args.speculative_adaptive_throughput_config,
+                )
         elif server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
                 self,
@@ -596,6 +607,14 @@ class EAGLEWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
             )
 
+            # DraftProbAdaptiveController: restore STS to fixed_draft_steps after
+            # draft-extend so the next iteration starts with the correct draft graph.
+            # (The STS was switched to optimal_k inside draft() for verify + extend.)
+            if isinstance(self.adaptive_controller, DraftProbAdaptiveController):
+                _fixed = self.adaptive_controller._fixed_draft_steps
+                if self.speculative_num_steps != _fixed:
+                    self.adaptive_controller._activate(_fixed)
+
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
                     verify_output.num_correct_drafts_per_req_cpu,
@@ -847,6 +866,43 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_draft_tokens,
             )
 
+        # --- DraftProbAdaptiveController: pick optimal verify steps ---
+        # After running the full draft (always fixed_draft_steps), read the
+        # per-step greedy probabilities from the side buffer, compute the
+        # throughput-optimal verify step count k, then:
+        #   1. Truncate the draft outputs to k steps (topk=1 linear chain).
+        #   2. Switch the target CUDA graph runner to the k-step state so
+        #      verify() uses the correct graph.
+        # The STS (self.speculative_num_steps) is switched here for both the
+        # verify and the subsequent draft-extend (k+1 tokens → correct shape).
+        # forward_batch_generation() restores STS to fixed_draft_steps after
+        # draft-extend completes.
+        verify_steps = self.speculative_num_steps
+        verify_draft_token_num = self.speculative_num_draft_tokens
+
+        if isinstance(self.adaptive_controller, DraftProbAdaptiveController):
+            _bs = batch.batch_size()
+            _sl = batch.seq_lens.float()
+            _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
+            optimal_k = self.adaptive_controller.get_optimal_verify_steps(
+                _bs, _avg_seqlen
+            )
+            if optimal_k != self.speculative_num_steps:
+                verify_steps = optimal_k
+                verify_draft_token_num = optimal_k + 1
+                # Truncate outputs for a topk=1 linear chain.
+                # top_scores_index: [bs, fixed_draft_steps] → [bs, k]
+                # draft_tokens:     [bs, fixed_draft_steps] → [bs, k]
+                # parent_list:      [bs, fixed_draft_steps-1] → [bs, k-1]
+                top_scores_index = top_scores_index[:, :optimal_k]
+                draft_tokens = draft_tokens[:, :optimal_k]
+                parent_k_cols = max(0, optimal_k - 1)
+                if parent_list.shape[1] > parent_k_cols:
+                    parent_list = parent_list[:, :parent_k_cols]
+                # Switch target graph runner and draft-extend runner to k-step state.
+                self.adaptive_controller._activate(optimal_k)
+        # --------------------------------------------------------------
+
         (
             tree_mask,
             position,
@@ -862,8 +918,8 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
+            verify_steps,
+            verify_draft_token_num,
         )
 
         target_capture_mode = (
@@ -879,9 +935,9 @@ class EAGLEWorker(TpModelWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_cum_len=None,
-            spec_steps=self.speculative_num_steps,
+            spec_steps=verify_steps,
             topk=self.topk,
-            draft_token_num=self.speculative_num_draft_tokens,
+            draft_token_num=verify_draft_token_num,
             capture_hidden_mode=target_capture_mode,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
@@ -914,6 +970,28 @@ class EAGLEWorker(TpModelWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+
+        # Check if we need to capture per-step greedy probs into the side buffer.
+        # Conditions:
+        #   1. DraftProbAdaptiveController is active and the buffer is allocated.
+        #   2. This is the fixed-draft-steps graph (not a k-step verify-only graph).
+        #      The guard on speculative_num_steps prevents k-step draft graphs (built
+        #      by build_adaptive_runtime_state) from recording spurious writes into
+        #      the shared buffer during their own CUDA graph capture.
+        # The writes below are in-place on a pre-allocated GPU tensor, so they are
+        # captured by the fixed-draft-steps CUDA graph and replayed on every forward.
+        _prob_buf: Optional[torch.Tensor] = None
+        _ctrl = getattr(self, "adaptive_controller", None)
+        if (
+            isinstance(_ctrl, DraftProbAdaptiveController)
+            and _ctrl._per_step_draft_probs is not None
+            and self.speculative_num_steps == _ctrl._fixed_draft_steps
+        ):
+            _prob_buf = _ctrl._per_step_draft_probs
+            # Position 0: probability of the first draft token (from the previous
+            # verify/extend's softmax output stored in spec_info.topk_p).
+            bs = forward_batch.batch_size
+            _prob_buf[:bs, 0].copy_(topk_p[:, 0])
 
         # Forward multiple steps
         scores = None
@@ -965,6 +1043,11 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
+
+            # Capture greedy prob at draft position i+1.
+            # topk_p[:, 0] is the highest-probability (greedy) token's softmax prob.
+            if _prob_buf is not None:
+                _prob_buf[:bs, i + 1].copy_(topk_p[:, 0])
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens

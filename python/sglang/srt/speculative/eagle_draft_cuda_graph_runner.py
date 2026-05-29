@@ -31,6 +31,13 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+
+# Lazy import to avoid circular dependency: only resolved at runtime when needed.
+def _get_draft_prob_controller_cls():
+    from sglang.srt.speculative.throughput_aware_controller import (
+        DraftProbAdaptiveController,
+    )
+    return DraftProbAdaptiveController
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -183,6 +190,19 @@ class EAGLEDraftCudaGraphRunner:
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
         self.buffers.share_buffers()
+
+        # For DraftProbAdaptiveController: allocate the per-step prob side buffer
+        # BEFORE capturing the graph so that the in-place copy ops inside
+        # draft_forward() are recorded in the captured graph and replayed correctly.
+        # Only allocate for the fixed-draft-steps graph (skip for k-step verify graphs).
+        _DraftProbCtrl = _get_draft_prob_controller_cls()
+        _ctrl = getattr(eagle_worker, "adaptive_controller", None)
+        if (
+            isinstance(_ctrl, _DraftProbCtrl)
+            and self.speculative_num_steps == _ctrl._fixed_draft_steps
+            and _ctrl._per_step_draft_probs is None
+        ):
+            _ctrl.init_side_buffer(self.max_bs, model_runner.device)
 
         # Capture
         try:
