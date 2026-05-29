@@ -248,6 +248,12 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
+        # Per-step timing accumulators (seconds); updated every decode iteration
+        self._last_draft_time = 0.0
+        self._last_verify_time = 0.0
+        self._last_draft_extend_time = 0.0
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(
@@ -484,6 +490,10 @@ class EAGLEWorker(TpModelWorker):
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
+            if self._enable_timing_logging:
+                torch.cuda.synchronize()
+                _step_t0 = time.perf_counter()
+
             with (
                 self.draft_tp_context(self.draft_model_runner.tp_group),
                 speculative_moe_backend_context(),
@@ -543,6 +553,23 @@ class EAGLEWorker(TpModelWorker):
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
                     verify_output.num_correct_drafts_per_req_cpu
+                )
+
+            if self.tp_rank == 0 and self._enable_timing_logging:
+                torch.cuda.synchronize()
+                step_wall_time = time.perf_counter() - _step_t0
+                kernel_total = (
+                    self._last_draft_time
+                    + self._last_verify_time
+                    + self._last_draft_extend_time
+                )
+                logger.info(
+                    "[EAGLE Step Timing] "
+                    f"draft={self._last_draft_time * 1000:.2f}ms, "
+                    f"verify={self._last_verify_time * 1000:.2f}ms, "
+                    f"draft_extend={self._last_draft_extend_time * 1000:.2f}ms, "
+                    f"kernel_total={kernel_total * 1000:.2f}ms, "
+                    f"step_wall={step_wall_time * 1000:.2f}ms"
                 )
 
             return GenerationBatchResult(
@@ -741,6 +768,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def draft(self, batch: ScheduleBatch):
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _draft_t0 = time.perf_counter()
+
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -766,6 +797,7 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -784,6 +816,9 @@ class EAGLEWorker(TpModelWorker):
             )
 
         if batch.forward_mode.is_idle():
+            if self._enable_timing_logging:
+                torch.cuda.synchronize()
+                self._last_draft_time = time.perf_counter() - _draft_t0
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
@@ -808,6 +843,10 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
         )
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            self._last_draft_time = time.perf_counter() - _draft_t0
 
         target_capture_mode = (
             CaptureHiddenMode.NULL
@@ -922,6 +961,11 @@ class EAGLEWorker(TpModelWorker):
     def verify(self, batch: ScheduleBatch):
         spec_info: EagleVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _verify_t0 = time.perf_counter()
+
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -978,6 +1022,10 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            self._last_verify_time = time.perf_counter() - _verify_t0
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
@@ -1164,6 +1212,10 @@ class EAGLEWorker(TpModelWorker):
             )
             batch.spec_info = draft_extend_input
 
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _draft_extend_t0 = time.perf_counter()
+
         # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
         draft_extend_input.num_tokens_for_logprob_per_req = 1
@@ -1194,6 +1246,7 @@ class EAGLEWorker(TpModelWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+
         if can_cuda_graph:
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
@@ -1244,6 +1297,10 @@ class EAGLEWorker(TpModelWorker):
             topk_index=topk_index,
             capture_hidden_mode=next_decode_capture_mode,
         )
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            self._last_draft_extend_time = time.perf_counter() - _draft_extend_t0
 
         # Restore batch fields. `seq_lens` etc. were modified by
         # `prepare_extend_after_decode`. Caller installs `next_draft_input` as
