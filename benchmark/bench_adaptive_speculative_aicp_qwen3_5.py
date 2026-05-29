@@ -15,11 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-HIGH_PROMPT = (
-    "Do not explain. Do not think. Do not add a title or preamble. "
-    "Start output immediately. Output only the digit 1 repeated exactly 256 times "
-    "in one continuous stream. Do not use spaces, newlines, or any other character."
-)
+# Prefix continuation: decode starts inside a run of identical tokens so MTP draft
+# aligns from the first verify round (no instruction-following preamble).
+_HIGH_PREFIX_LEN = 64
+HIGH_PROMPT = "1" * _HIGH_PREFIX_LEN
 
 HIGH_PROMPTS = [HIGH_PROMPT]
 
