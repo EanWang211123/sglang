@@ -5,7 +5,7 @@ import math
 import os
 import time
 from contextlib import contextmanager
-from typing import IO, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -251,19 +251,24 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        # Accept-length statistics writer (enabled when EAGLE_ACCEPT_STATS_JSONL is set)
-        self._accept_stats_file: Optional[IO] = None
-        _stats_path = os.environ.get("EAGLE_ACCEPT_STATS_JSONL", "")
-        if _stats_path:
-            try:
-                self._accept_stats_file = open(_stats_path, "a", buffering=1)
-                logger.info(
-                    "EAGLE accept-length stats will be appended to %s", _stats_path
-                )
-            except OSError as e:
-                logger.warning(
-                    "Failed to open EAGLE_ACCEPT_STATS_JSONL=%s: %s", _stats_path, e
-                )
+        # Accept-length statistics (enabled when EAGLE_ACCEPT_STATS_JSONL is set).
+        # Data is aggregated per concurrency level; the file is rewritten every
+        # EAGLE_ACCEPT_STATS_FLUSH_INTERVAL batches (default 50) so the on-disk
+        # snapshot stays reasonably fresh without hammering the filesystem.
+        self._accept_stats_path: str = os.environ.get("EAGLE_ACCEPT_STATS_JSONL", "")
+        # {concurrency: {"total_accept_len": float, "count": int, "buckets": {label: int}}}
+        self._accept_stats_agg: dict = {}
+        self._accept_stats_dirty: int = 0
+        self._accept_stats_flush_interval: int = int(
+            os.environ.get("EAGLE_ACCEPT_STATS_FLUSH_INTERVAL", "50")
+        )
+        if self._accept_stats_path:
+            logger.info(
+                "EAGLE accept-length stats (aggregated by concurrency) → %s "
+                "(flush every %d batches)",
+                self._accept_stats_path,
+                self._accept_stats_flush_interval,
+            )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -946,53 +951,86 @@ class EAGLEWorker(TpModelWorker):
         num_correct_drafts_per_req_cpu: List[int],
         concurrency: int,
     ) -> None:
-        """Write one JSONL record for this decode batch.
+        """Accumulate per-batch statistics grouped by concurrency and periodically flush.
 
-        Each record has the shape::
+        For each batch we compute one number:
+            batch_avg = mean(num_correct_drafts + 1)   # average accepted tokens in this batch
+
+        That number is then bucketed into a 0.5-width bin and accumulated under the
+        key ``concurrency`` in ``_accept_stats_agg``.
+
+        The on-disk JSONL has **one line per unique concurrency value**.  Each line
+        shows the distribution of per-batch averages observed at that concurrency::
 
             {
-              "concurrency": <int>,          # number of requests in the batch
-              "avg_accept_len": <float>,     # mean accepted tokens per request (= num_correct_drafts + 1)
-              "distribution": {              # fraction of requests whose accepted-token count
-                "1.0-1.5": 0.25,            # falls in each half-open [lo, lo+0.5) bucket
-                "2.0-2.5": 0.50,
-                ...
+              "concurrency": 12,
+              "batch_count": 480,           # how many batches at this concurrency
+              "avg_of_batch_avgs": 4.83,    # mean of all per-batch averages
+              "distribution": {             # fraction of batches whose per-batch avg
+                "4.0-4.5": 0.12,           # fell in each 0.5-wide bucket
+                "4.5-5.0": 0.35,
+                "5.0-5.5": 0.53
               }
             }
 
-        "Accepted tokens" for a request = num_correct_drafts + 1 (the forced bonus token is
-        always included).  Because the values are non-negative integers, every integer ``n``
-        lands in the bucket ``[n, n+0.5)`` whose label is ``"<n>.0-<n+0.5>"``.
+        The file is rewritten atomically every ``_accept_stats_flush_interval`` batches.
         """
-        if self._accept_stats_file is None:
+        if not self._accept_stats_path:
             return
 
         n = len(num_correct_drafts_per_req_cpu)
         if n == 0:
             return
 
-        # accept_len = num_correct_drafts + 1  (always >= 1)
-        accept_lens = [v + 1 for v in num_correct_drafts_per_req_cpu]
-        avg = sum(accept_lens) / n
+        # One number per batch: average accepted tokens across all requests
+        batch_avg = sum(v + 1 for v in num_correct_drafts_per_req_cpu) / n
 
-        # Build 0.5-width histogram
-        bucket_counts: dict = {}
-        for val in accept_lens:
-            lo = float(math.floor(val / 0.5) * 0.5)
-            label = f"{lo:.1f}-{lo + 0.5:.1f}"
-            bucket_counts[label] = bucket_counts.get(label, 0) + 1
+        # Bucket the batch average into a 0.5-wide bin
+        lo = float(math.floor(batch_avg / 0.5) * 0.5)
+        label = f"{lo:.1f}-{lo + 0.5:.1f}"
 
-        distribution = {k: round(v / n, 6) for k, v in sorted(bucket_counts.items())}
+        if concurrency not in self._accept_stats_agg:
+            self._accept_stats_agg[concurrency] = {
+                "total_batch_avg": 0.0,
+                "batch_count": 0,
+                "buckets": {},
+            }
+        agg = self._accept_stats_agg[concurrency]
+        agg["total_batch_avg"] += batch_avg
+        agg["batch_count"] += 1
+        agg["buckets"][label] = agg["buckets"].get(label, 0) + 1
 
-        record = {
-            "concurrency": concurrency,
-            "avg_accept_len": round(avg, 6),
-            "distribution": distribution,
-        }
+        self._accept_stats_dirty += 1
+        if self._accept_stats_dirty >= self._accept_stats_flush_interval:
+            self._flush_accept_stats()
+            self._accept_stats_dirty = 0
+
+    def _flush_accept_stats(self) -> None:
+        """Rewrite the stats JSONL with one aggregated line per concurrency."""
+        if not self._accept_stats_path or not self._accept_stats_agg:
+            return
+
+        tmp_path = self._accept_stats_path + ".tmp"
         try:
-            self._accept_stats_file.write(json.dumps(record) + "\n")
+            with open(tmp_path, "w") as f:
+                for concurrency in sorted(self._accept_stats_agg):
+                    agg = self._accept_stats_agg[concurrency]
+                    n_batches = agg["batch_count"]
+                    avg_of_avgs = agg["total_batch_avg"] / n_batches
+                    distribution = {
+                        k: round(v / n_batches, 6)
+                        for k, v in sorted(agg["buckets"].items())
+                    }
+                    record = {
+                        "concurrency": concurrency,
+                        "batch_count": n_batches,
+                        "avg_of_batch_avgs": round(avg_of_avgs, 6),
+                        "distribution": distribution,
+                    }
+                    f.write(json.dumps(record) + "\n")
+            os.replace(tmp_path, self._accept_stats_path)
         except OSError as e:
-            logger.warning("Failed to write accept stats: %s", e)
+            logger.warning("Failed to flush accept stats to %s: %s", self._accept_stats_path, e)
 
     def verify(self, batch: ScheduleBatch):
         spec_info: EagleVerifyInput = batch.spec_info
