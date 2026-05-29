@@ -15,7 +15,6 @@
 #include <sgl_kernel/distributed/common.cuh>
 #include <sgl_kernel/distributed/custom_all_reduce.cuh>
 
-#include <bit>
 #include <cstdint>
 #include <cstring>
 
@@ -161,7 +160,7 @@ struct CustomAllReducePull : public CustomAllReduceBase {
     RuntimeCheck(shot == 1 || shot == 2, "Invalid shot count: ", shot);
     RuntimeCheck(device.device_type == kDLCUDA, "Only CUDA device is supported");
     RuntimeCheck(is_type<DType>(input.dtype()), "Input dtype mismatch");
-    RuntimeCheck(std::bit_cast<intptr_t>(input_ptr) % 16 == 0, "Input pointer is not properly aligned");
+    RuntimeCheck(reinterpret_cast<intptr_t>(input_ptr) % 16 == 0, "Input pointer is not properly aligned");
     RuntimeCheck(m_pull_ctrl.has_value(), "Controller is not initialized");
     RuntimeCheck(static_cast<int64_t>(num_items) == num_items_int64, "Number of items exceeds 4G limit");
 
