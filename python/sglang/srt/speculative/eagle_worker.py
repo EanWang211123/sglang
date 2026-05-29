@@ -1,8 +1,11 @@
 import contextlib
+import json
 import logging
+import math
+import os
 import time
 from contextlib import contextmanager
-from typing import List, Optional, Tuple
+from typing import IO, List, Optional, Tuple
 
 import torch
 
@@ -247,6 +250,20 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        # Accept-length statistics writer (enabled when EAGLE_ACCEPT_STATS_JSONL is set)
+        self._accept_stats_file: Optional[IO] = None
+        _stats_path = os.environ.get("EAGLE_ACCEPT_STATS_JSONL", "")
+        if _stats_path:
+            try:
+                self._accept_stats_file = open(_stats_path, "a", buffering=1)
+                logger.info(
+                    "EAGLE accept-length stats will be appended to %s", _stats_path
+                )
+            except OSError as e:
+                logger.warning(
+                    "Failed to open EAGLE_ACCEPT_STATS_JSONL=%s: %s", _stats_path, e
+                )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -544,6 +561,11 @@ class EAGLEWorker(TpModelWorker):
                 self.adaptive_controller.on_verify_complete(
                     verify_output.num_correct_drafts_per_req_cpu
                 )
+
+            self._record_accept_stats(
+                verify_output.num_correct_drafts_per_req_cpu,
+                concurrency=len(batch.reqs),
+            )
 
             return GenerationBatchResult(
                 logits_output=verify_output.logits_output,
@@ -918,6 +940,59 @@ class EAGLEWorker(TpModelWorker):
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
         pass
+
+    def _record_accept_stats(
+        self,
+        num_correct_drafts_per_req_cpu: List[int],
+        concurrency: int,
+    ) -> None:
+        """Write one JSONL record for this decode batch.
+
+        Each record has the shape::
+
+            {
+              "concurrency": <int>,          # number of requests in the batch
+              "avg_accept_len": <float>,     # mean accepted tokens per request (= num_correct_drafts + 1)
+              "distribution": {              # fraction of requests whose accepted-token count
+                "1.0-1.5": 0.25,            # falls in each half-open [lo, lo+0.5) bucket
+                "2.0-2.5": 0.50,
+                ...
+              }
+            }
+
+        "Accepted tokens" for a request = num_correct_drafts + 1 (the forced bonus token is
+        always included).  Because the values are non-negative integers, every integer ``n``
+        lands in the bucket ``[n, n+0.5)`` whose label is ``"<n>.0-<n+0.5>"``.
+        """
+        if self._accept_stats_file is None:
+            return
+
+        n = len(num_correct_drafts_per_req_cpu)
+        if n == 0:
+            return
+
+        # accept_len = num_correct_drafts + 1  (always >= 1)
+        accept_lens = [v + 1 for v in num_correct_drafts_per_req_cpu]
+        avg = sum(accept_lens) / n
+
+        # Build 0.5-width histogram
+        bucket_counts: dict = {}
+        for val in accept_lens:
+            lo = float(math.floor(val / 0.5) * 0.5)
+            label = f"{lo:.1f}-{lo + 0.5:.1f}"
+            bucket_counts[label] = bucket_counts.get(label, 0) + 1
+
+        distribution = {k: round(v / n, 6) for k, v in sorted(bucket_counts.items())}
+
+        record = {
+            "concurrency": concurrency,
+            "avg_accept_len": round(avg, 6),
+            "distribution": distribution,
+        }
+        try:
+            self._accept_stats_file.write(json.dumps(record) + "\n")
+        except OSError as e:
+            logger.warning("Failed to write accept stats: %s", e)
 
     def verify(self, batch: ScheduleBatch):
         spec_info: EagleVerifyInput = batch.spec_info
