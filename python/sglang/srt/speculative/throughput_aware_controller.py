@@ -21,6 +21,7 @@ The verify step count is chosen *per batch* to maximise batch-level throughput.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 from typing import Optional
@@ -223,6 +224,54 @@ class ThroughputAwareAdaptiveController(AdaptiveController):
         )
 
     # ------------------------------------------------------------------
+    # BS-routing helpers (mirror AdaptiveSpeculativeParams methods since
+    # this class bypasses the parent's self.params)
+    # ------------------------------------------------------------------
+
+    @property
+    def candidate_steps(self) -> list[int]:
+        return sorted({s for slot in self._bs_params.values() for s in slot.candidate_steps})
+
+    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
+        if self._cuda_graph_bs is None:
+            return batch_size
+        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
+        return (
+            self._cuda_graph_bs[idx] if idx < len(self._cuda_graph_bs) else batch_size
+        )
+
+    def _find_closest_bs(self, target: int) -> int:
+        idx = bisect.bisect_right(self._bs_list, target) - 1
+        return self._bs_list[max(0, idx)]
+
+    def _cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
+        if self._cuda_graph_bs is None:
+            return None
+        return [
+            v for v in self._cuda_graph_bs
+            if step in self._bs_params[self._find_closest_bs(self._pad_to_cuda_graph_bs(v))].candidate_steps
+        ]
+
+    def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
+        """Build and register runtime states for all candidate steps."""
+        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+        init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
+
+        for steps in self.candidate_steps:
+            if steps in self._states:
+                continue
+            pruned_bs = self._cuda_graph_bs_for_step(steps)
+            state = self.worker.build_adaptive_runtime_state(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                cuda_graph_bs=pruned_bs,
+                init_max_bs=init_max_bs,
+            )
+            self._states[steps] = state
+
+        self._activate(self._current_steps)
+
+    # ------------------------------------------------------------------
     # Overridden decision interface
     # ------------------------------------------------------------------
 
@@ -413,6 +462,54 @@ class DraftProbAdaptiveController(AdaptiveController):
             f"itl_cost_path={itl_cost_path!r}, "
             f"log_draft_prob_decision={self._log_draft_prob_decision}",
         )
+
+    # ------------------------------------------------------------------
+    # BS-routing helpers (mirror AdaptiveSpeculativeParams methods since
+    # this class bypasses the parent's self.params)
+    # ------------------------------------------------------------------
+
+    @property
+    def candidate_steps(self) -> list[int]:
+        return sorted({s for slot in self._bs_params.values() for s in slot.candidate_steps})
+
+    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
+        if self._cuda_graph_bs is None:
+            return batch_size
+        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
+        return (
+            self._cuda_graph_bs[idx] if idx < len(self._cuda_graph_bs) else batch_size
+        )
+
+    def _find_closest_bs(self, target: int) -> int:
+        idx = bisect.bisect_right(self._bs_list, target) - 1
+        return self._bs_list[max(0, idx)]
+
+    def _cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
+        if self._cuda_graph_bs is None:
+            return None
+        return [
+            v for v in self._cuda_graph_bs
+            if step in self._bs_params[self._find_closest_bs(self._pad_to_cuda_graph_bs(v))].candidate_steps
+        ]
+
+    def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
+        """Build and register runtime states for all candidate steps."""
+        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+        init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
+
+        for steps in self.candidate_steps:
+            if steps in self._states:
+                continue
+            pruned_bs = self._cuda_graph_bs_for_step(steps)
+            state = self.worker.build_adaptive_runtime_state(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                cuda_graph_bs=pruned_bs,
+                init_max_bs=init_max_bs,
+            )
+            self._states[steps] = state
+
+        self._activate(self._fixed_draft_steps)
 
     # ------------------------------------------------------------------
     # Side-buffer lifecycle
