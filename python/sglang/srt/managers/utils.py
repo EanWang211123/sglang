@@ -32,6 +32,11 @@ class GenerationBatchResult:
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
+    # PP skip output comm: True when output send/recv was skipped and
+    # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
+    # to validate that skipped output is never consumed.
+    skipped_output_comm: bool = False
+
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
@@ -228,17 +233,6 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args.speculative_algorithm is None:
         return 1
 
-    # When adaptive spec is enabled, use the max across all candidate steps
-    # so the allocation stays constant regardless of which step is currently
-    # active.  This prevents KV pool accounting drift when the overlap
-    # scheduler switches steps between decode rounds.
-    adaptive_max = server_args.effective_max_speculative_num_draft_tokens()
-    if adaptive_max is not None and (
-        server_args.speculative_adaptive
-        or server_args.speculative_adaptive_throughput_config is not None
-    ):
-        return adaptive_max
-
     # Spec v1:
     # 1) alloc topk * num_steps when draft decoding and then restore the allocation
     # 2) alloc num_draft_tokens when verifying the drafts
@@ -246,7 +240,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
 
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens
+    spec_tokens = server_args.max_speculative_num_draft_tokens
     page_size = server_args.page_size
 
     if page_size == 1 or spec_topk == 1:
