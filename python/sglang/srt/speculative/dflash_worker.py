@@ -212,6 +212,9 @@ class DFlashWorker:
         self._draft_block_tokens_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_block_probs_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size - 1], greedy softmax prob per draft slot
+        )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
@@ -228,6 +231,8 @@ class DFlashWorker:
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
+        self._draft_greedy_local_sum_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_local_sum_cap: int = 0
 
         self._use_fused_kv_materialize = is_cuda()
         self._fused_kv_helper: Optional[object] = None
@@ -333,6 +338,10 @@ class DFlashWorker:
         )
         self._draft_block_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
+        )
+        draft_prob_cols = max(block_size - 1, 0)
+        self._draft_block_probs_buf = torch.empty(
+            (new_cap, draft_prob_cols), dtype=torch.float32, device=device
         )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
@@ -667,13 +676,17 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
+        draft_next, draft_next_probs = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+        )
+        draft_next = draft_next.view(bs, self.block_size - 1)
+        draft_next_probs = draft_next_probs.view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        assert self._draft_block_probs_buf is not None
+        self._draft_block_probs_buf[:bs].copy_(draft_next_probs)
         positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
@@ -698,22 +711,98 @@ class DFlashWorker:
         batch.spec_info = verify_input
         batch.return_hidden_states = False
 
+    def _ensure_draft_greedy_local_sum_buf(
+        self, chunk_len: int, *, device: torch.device, chunk_cap: int
+    ) -> torch.Tensor:
+        if (
+            self._draft_greedy_local_sum_cap < chunk_len
+            or self._draft_greedy_local_sum_buf is None
+            or self._draft_greedy_local_sum_buf.device != device
+        ):
+            self._draft_greedy_local_sum_buf = torch.empty(
+                (chunk_cap,), dtype=torch.float32, device=device
+            )
+            self._draft_greedy_local_sum_cap = chunk_cap
+        return self._draft_greedy_local_sum_buf[:chunk_len]
+
+    @staticmethod
+    def _local_logsumexp_from_shards(
+        *,
+        base_logits: Optional[torch.Tensor],
+        added_logits: Optional[torch.Tensor],
+        device: torch.device,
+        chunk_len: int,
+    ) -> torch.Tensor:
+        """Per-row logsumexp over valid logits on this TP shard."""
+        has_base = base_logits is not None and base_logits.numel() > 0
+        has_added = added_logits is not None and added_logits.numel() > 0
+        if has_base and has_added:
+            lse_base = torch.logsumexp(base_logits.to(torch.float32), dim=-1)
+            lse_added = torch.logsumexp(added_logits.to(torch.float32), dim=-1)
+            return torch.logsumexp(torch.stack((lse_base, lse_added), dim=-1), dim=-1)
+        if has_base:
+            return torch.logsumexp(base_logits.to(torch.float32), dim=-1)
+        if has_added:
+            return torch.logsumexp(added_logits.to(torch.float32), dim=-1)
+        # Empty local shard: contributes zero mass to the global partition function.
+        return torch.full(
+            (chunk_len,), float("-inf"), dtype=torch.float32, device=device
+        )
+
+    def _greedy_selected_probs_from_shards(
+        self,
+        global_max: torch.Tensor,
+        *,
+        base_logits: Optional[torch.Tensor],
+        added_logits: Optional[torch.Tensor],
+        chunk_cap: int,
+        tp_group,
+        tp_size: int,
+    ) -> torch.Tensor:
+        """Return softmax prob of the greedy token (= global_max) per row."""
+        chunk_len = int(global_max.shape[0])
+        local_lse = self._local_logsumexp_from_shards(
+            base_logits=base_logits,
+            added_logits=added_logits,
+            device=global_max.device,
+            chunk_len=chunk_len,
+        )
+
+        local_sum = self._ensure_draft_greedy_local_sum_buf(
+            chunk_len, device=global_max.device, chunk_cap=chunk_cap
+        )
+        torch.exp(
+            local_lse - global_max.to(torch.float32),
+            out=local_sum,
+        )
+        if tp_size > 1:
+            tp_group.all_reduce(local_sum)
+        return local_sum.reciprocal()
+
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
         per-rank max, gathers candidates across TP ranks, and selects the global max.
+
+        Also returns the softmax probability of each selected token without building
+        full-vocab logits: per-rank logsumexp over local shards, exp(lse - global_max),
+        then one TP all-reduce(SUM) to form the global partition function.
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            device = hidden_states.device
+            return (
+                torch.empty((0,), dtype=torch.long, device=device),
+                torch.empty((0,), dtype=torch.float32, device=device),
+            )
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
@@ -737,33 +826,45 @@ class DFlashWorker:
         added_vocab_start = int(shard.added_vocab_start_index)
 
         num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
+        device = hidden_states.device
+        out_tokens = torch.empty((num_tokens,), dtype=torch.long, device=device)
+        out_probs = torch.empty((num_tokens,), dtype=torch.float32, device=device)
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
+        chunk_cap = int(chunk_size)
+
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
-            for start in range(0, num_tokens, int(chunk_size)):
-                end = min(num_tokens, start + int(chunk_size))
+            for start in range(0, num_tokens, chunk_cap):
+                end = min(num_tokens, start + chunk_cap)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_tokens[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
+                    global_max, local_arg = torch.max(base_logits, dim=-1)
+                    out_tokens[start:end] = local_arg.to(torch.long) + org_vocab_start
+                    out_probs[start:end] = self._greedy_selected_probs_from_shards(
+                        global_max,
+                        base_logits=base_logits,
+                        added_logits=None,
+                        chunk_cap=chunk_cap,
+                        tp_group=tp_group,
+                        tp_size=tp_size,
                     )
                 else:
                     out_tokens[start:end] = 0
-            return out_tokens
+                    out_probs[start:end] = 1.0
+            return out_tokens, out_probs
 
-        for start in range(0, num_tokens, int(chunk_size)):
-            end = min(num_tokens, start + int(chunk_size))
+        for start in range(0, num_tokens, chunk_cap):
+            end = min(num_tokens, start + chunk_cap)
             hs = _cast_hs(hidden_states[start:end])
             chunk_len = int(hs.shape[0])
+
+            base_logits: Optional[torch.Tensor] = None
+            added_logits: Optional[torch.Tensor] = None
 
             # Base vocab logits.
             if num_org > 0:
@@ -812,11 +913,18 @@ class DFlashWorker:
 
             if tp_size == 1:
                 out_tokens[start:end] = global_ids.to(torch.long)
+                out_probs[start:end] = self._greedy_selected_probs_from_shards(
+                    local_max,
+                    base_logits=base_logits,
+                    added_logits=added_logits,
+                    chunk_cap=chunk_cap,
+                    tp_group=tp_group,
+                    tp_size=tp_size,
+                )
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
             needed = tp_size * chunk_len
-            chunk_cap = int(chunk_size)
             if (
                 self._draft_greedy_gather_cap < needed
                 or self._draft_greedy_gathered_max_buf is None
@@ -861,6 +969,16 @@ class DFlashWorker:
             gathered_max = gathered_max.view(tp_size, chunk_len)
             gathered_ids = gathered_ids.view(tp_size, chunk_len)
 
+            global_max = gathered_max.max(dim=0).values
+            out_probs[start:end] = self._greedy_selected_probs_from_shards(
+                global_max,
+                base_logits=base_logits,
+                added_logits=added_logits,
+                chunk_cap=chunk_cap,
+                tp_group=tp_group,
+                tp_size=tp_size,
+            )
+
             best_rank = self._draft_greedy_best_rank_buf[:chunk_len]
             torch.argmax(gathered_max, dim=0, out=best_rank)
 
@@ -870,7 +988,7 @@ class DFlashWorker:
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_tokens[start:end].copy_(selected_ids.view(-1))
 
-        return out_tokens
+        return out_tokens, out_probs
 
     def _append_target_hidden_to_draft_kv(
         self,
