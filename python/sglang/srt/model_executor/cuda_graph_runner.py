@@ -1421,10 +1421,13 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            # Draft worker always captures with full block_size; only the target
+            # worker should use the truncated verify length.
             dflash_verify_token_num = (
                 self.model_runner.server_args.dflash_target_verify_token_num
-                or self.speculative_num_draft_tokens
-            )
+                if not self.model_runner.is_draft_worker
+                else None
+            ) or self.speculative_num_draft_tokens
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
