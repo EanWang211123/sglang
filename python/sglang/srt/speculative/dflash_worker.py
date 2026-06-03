@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from copy import deepcopy
 from typing import Optional
 
@@ -230,6 +231,12 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        # Per-step timing accumulators (seconds); updated every decode iteration
+        self._last_draft_time = 0.0
+        self._last_verify_time = 0.0
+        self._last_draft_extend_time = 0.0
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -525,6 +532,10 @@ class DFlashWorker:
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _draft_t0 = time.perf_counter()
+
         if batch.has_grammar:
             raise RuntimeError(
                 "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
@@ -694,6 +705,10 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            self._last_draft_time = time.perf_counter() - _draft_t0
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1171,6 +1186,10 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _step_t0 = time.perf_counter()
+
         self._prepare_for_speculative_decoding(batch, draft_input)
 
         assert batch.forward_mode.is_target_verify()
@@ -1183,6 +1202,10 @@ class DFlashWorker:
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _verify_t0 = time.perf_counter()
 
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True, **kwargs
@@ -1210,14 +1233,45 @@ class DFlashWorker:
                 commit_lens=commit_lens,
             )
 
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            self._last_verify_time = time.perf_counter() - _verify_t0
+
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
         draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            _draft_extend_t0 = time.perf_counter()
+
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+
+        if self._enable_timing_logging:
+            torch.cuda.synchronize()
+            self._last_draft_extend_time = time.perf_counter() - _draft_extend_t0
+
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+
+        if self.tp_rank == 0 and self._enable_timing_logging:
+            torch.cuda.synchronize()
+            step_wall_time = time.perf_counter() - _step_t0
+            kernel_total = (
+                self._last_draft_time
+                + self._last_verify_time
+                + self._last_draft_extend_time
+            )
+            logger.info(
+                "[DFLASH Step Timing] "
+                f"draft={self._last_draft_time * 1000:.2f}ms, "
+                f"verify={self._last_verify_time * 1000:.2f}ms, "
+                f"draft_extend={self._last_draft_extend_time * 1000:.2f}ms, "
+                f"kernel_total={kernel_total * 1000:.2f}ms, "
+                f"step_wall={step_wall_time * 1000:.2f}ms"
+            )
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
