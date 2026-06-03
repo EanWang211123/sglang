@@ -590,6 +590,9 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    # DFLASH only: how many spec-generated draft tokens to verify (excluding the
+    # committed bonus token). Target verify length is verify_step + 1.
+    speculative_dflash_verify_step: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -5723,6 +5726,17 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
+            "--speculative-dflash-verify-step",
+            type=int,
+            help=(
+                "DFLASH only. Number of spec-generated draft tokens sent to the "
+                "target model for verification (the committed bonus token is always "
+                "included). Target verify length is verify_step + 1. Defaults to "
+                "--speculative-num-steps when set; otherwise block_size - 1 (full verify)."
+            ),
+            default=ServerArgs.speculative_dflash_verify_step,
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -7179,13 +7193,24 @@ class ServerArgs:
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
+    @property
+    def dflash_target_verify_token_num(self) -> Optional[int]:
+        """DFLASH target-verify query length (bonus token + spec drafts)."""
+        if self.speculative_dflash_verify_step is None:
+            return None
+        return int(self.speculative_dflash_verify_step) + 1
+
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
         """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
+            return (
+                self.dflash_target_verify_token_num
+                if self.speculative_algorithm == "DFLASH"
+                else None
+            ) or self.speculative_num_draft_tokens
 
         from sglang.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,

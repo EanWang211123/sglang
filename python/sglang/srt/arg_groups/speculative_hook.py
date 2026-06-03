@@ -135,19 +135,10 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
-    # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
-    # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-    # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
-    #
-    # For DFlash, the natural unit is `block_size` (verify window length).
-    if server_args.speculative_num_steps is None:
-        server_args.speculative_num_steps = 1
-    elif int(server_args.speculative_num_steps) != 1:
-        logger.warning(
-            "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            server_args.speculative_num_steps,
-        )
-        server_args.speculative_num_steps = 1
+    # DFLASH does not use EAGLE-style multi-step draft autoregression, but
+    # `--speculative-num-steps` is reused as the default verify_step before
+    # being forced to 1 for scheduler accounting.
+    user_verify_step = server_args.speculative_num_steps
 
     if server_args.speculative_eagle_topk is None:
         server_args.speculative_eagle_topk = 1
@@ -210,6 +201,35 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 inferred_block_size,
             )
         server_args.speculative_num_draft_tokens = inferred_block_size
+
+    block_size = int(server_args.speculative_num_draft_tokens)
+    if server_args.speculative_dflash_verify_step is None:
+        server_args.speculative_dflash_verify_step = (
+            int(user_verify_step) if user_verify_step is not None else block_size - 1
+        )
+    verify_step = int(server_args.speculative_dflash_verify_step)
+    if verify_step < 0 or verify_step >= block_size:
+        raise ValueError(
+            "DFLASH requires 0 <= --speculative-dflash-verify-step < block_size. "
+            f"verify_step={verify_step}, block_size={block_size}."
+        )
+    logger.info(
+        "DFLASH verify_step=%d (target verify len=%d, draft block_size=%d).",
+        verify_step,
+        verify_step + 1,
+        block_size,
+    )
+
+    # Scheduler/KV accounting still uses speculative_num_steps == 1 for DFLASH.
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "DFLASH only supports speculative_num_steps == 1 for scheduler accounting; "
+            "overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
 
     if server_args.speculative_draft_window_size is not None:
         draft_tokens = int(server_args.speculative_num_draft_tokens)

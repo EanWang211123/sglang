@@ -180,6 +180,17 @@ class DFlashWorker:
                     model_block_size,
                 )
 
+        verify_step = server_args.speculative_dflash_verify_step
+        if verify_step is None:
+            verify_step = self.block_size - 1
+        self.verify_step = int(verify_step)
+        if self.verify_step < 0 or self.verify_step >= self.block_size:
+            raise ValueError(
+                "DFLASH requires 0 <= speculative_dflash_verify_step < block_size. "
+                f"verify_step={self.verify_step}, block_size={self.block_size}."
+            )
+        self.effective_verify_len = self.verify_step + 1
+
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
         self._mask_token_id = self._resolve_mask_token_id(
@@ -188,10 +199,12 @@ class DFlashWorker:
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, verify_step=%s, effective_verify_len=%s, draft_window_size=%s, compact_cache=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
                 self.block_size,
+                self.verify_step,
+                self.effective_verify_len,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
@@ -667,19 +680,24 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        eff_len = self.effective_verify_len
+        num_spec_tokens = eff_len - 1
         draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            hidden_states=draft_hidden[:, 1:eff_len, :].reshape(
+                -1, draft_hidden.shape[-1]
+            ),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
+        ).view(bs, num_spec_tokens)
+        draft_tokens = self._draft_block_tokens_buf[:bs, :eff_len]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+        if num_spec_tokens > 0:
+            draft_tokens[:, 1:].copy_(draft_next)
+        positions = positions_2d[:bs, :eff_len].reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens.reshape(-1),
             positions=positions,
-            draft_token_num=self.block_size,
+            draft_token_num=eff_len,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend

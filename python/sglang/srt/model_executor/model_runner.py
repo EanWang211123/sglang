@@ -2486,9 +2486,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if not self.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
+            draft_tokens_for_capture = (
+                (
+                    self.server_args.dflash_target_verify_token_num
+                    if self.spec_algorithm.is_dflash() and not self.is_draft_worker
+                    else None
+                )
+                or self.server_args.speculative_num_draft_tokens
+            )
             num_tokens_per_bs = (
                 self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    self.server_args.speculative_num_draft_tokens, self.is_draft_worker
+                    draft_tokens_for_capture, self.is_draft_worker
                 )
             )
 
