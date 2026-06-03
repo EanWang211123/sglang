@@ -41,13 +41,36 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     },
 }
 
+# DFlash candidate_steps are verify_len - 1 (i.e. num drafted tokens).
+# E.g. block_size=16 → verify_lens [4,8,12,16] → steps [3,7,11,15].
+DEFAULT_DFLASH_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [3, 7, 11, 15],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+    "8": {
+        "candidate_steps": [3, 7, 11],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
+        "candidate_steps": [3, 7],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+}
+
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DFLASH are supported)"
         )
     if server_args.speculative_eagle_topk != 1:
         return (
@@ -79,16 +102,18 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
 def _load_adaptive_config(
     cfg_path: str | None,
+    is_dflash: bool = False,
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
+    Uses ``DEFAULT_DFLASH_ADAPTIVE_CONFIG`` when *cfg_path* is ``None`` and
+    *is_dflash* is ``True``, otherwise falls back to ``DEFAULT_ADAPTIVE_CONFIG``.
     """
     if cfg_path is not None:
         with open(cfg_path) as f:
             cfg = json.load(f)
     else:
-        cfg = DEFAULT_ADAPTIVE_CONFIG
+        cfg = DEFAULT_DFLASH_ADAPTIVE_CONFIG if is_dflash else DEFAULT_ADAPTIVE_CONFIG
 
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
@@ -113,6 +138,27 @@ def _load_adaptive_config(
             f"Got keys: {list(cfg.keys())}"
         )
     return cfg, bs_entries
+
+
+def _resolve_candidate_steps(
+    initial_steps: int,
+    candidate_steps: list[int],
+) -> list[int]:
+    """Return sorted candidate steps; inserts *initial_steps* when missing.
+
+    Ensures the worker's pre-built runtime state for *initial_steps* is always
+    reachable via ``AdaptiveController._activate``.
+    """
+    candidates: set[int] = set(candidate_steps)
+    if initial_steps not in candidates:
+        log_info_on_rank0(
+            logger,
+            f"Adding initial speculative_num_steps={initial_steps} to "
+            f"candidate_steps={sorted(candidates)} so the pre-built "
+            f"runtime state is reused.",
+        )
+        candidates.add(initial_steps)
+    return sorted(candidates)
 
 
 def resolve_candidate_steps_from_config(
@@ -177,9 +223,9 @@ class AdaptiveStepSlot:
     """
 
     def __init__(self, initial_steps: int, cfg: dict):
-        candidates = sorted(set(cfg["candidate_steps"]))
-        assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
-        self.candidate_steps = candidates
+        raw_candidates = sorted(set(cfg["candidate_steps"]))
+        assert len(raw_candidates) >= 1, "candidate_steps must have at least 1 value"
+        self.candidate_steps = _resolve_candidate_steps(initial_steps, raw_candidates)
 
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
@@ -273,8 +319,9 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        is_dflash: bool = False,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        cfg, bs_entries = _load_adaptive_config(cfg_path, is_dflash=is_dflash)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         for bs, entry in sorted(bs_entries.items()):
