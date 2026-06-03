@@ -1266,6 +1266,7 @@ class DFlashWorker:
             )
             logger.info(
                 "[DFLASH Step Timing] "
+                f"bs={batch.batch_size()}, "
                 f"draft={self._last_draft_time * 1000:.2f}ms, "
                 f"verify={self._last_verify_time * 1000:.2f}ms, "
                 f"draft_extend={self._last_draft_extend_time * 1000:.2f}ms, "

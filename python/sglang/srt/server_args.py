@@ -5749,8 +5749,9 @@ class ServerArgs:
             "--enable-speculative-timing-logging",
             action="store_true",
             default=ServerArgs.enable_speculative_timing_logging,
-            help="Enable per-step timing logging for speculative decoding (draft / verify / draft-extend). "
-            "Only rank-0 prints. Adds two torch.cuda.synchronize() calls per decode step.",
+            help="Enable per-step timing logging for decode. Speculative paths log "
+            "draft / verify / draft-extend; baseline (no spec) logs target forward only. "
+            "Only rank-0 prints. Adds torch.cuda.synchronize() calls per logged decode step.",
         )
 
         # Multi-layer Eagle speculative decoding
