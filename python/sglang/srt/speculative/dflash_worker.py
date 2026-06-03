@@ -850,51 +850,77 @@ class DFlashWorker:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
 
-        # Only sample effective_verify_len-1 candidates to avoid wasted LM head compute.
-        # When adaptive is disabled, effective_verify_len == block_size (no truncation).
+        # Determine how many LM-head samples to compute.
+        # - DraftProbAdaptiveController needs ALL block_size-1 probs to score every
+        #   candidate k; the actual verify_len is decided *after* scoring.
+        # - All other controllers use effective_verify_len (may be < block_size when
+        #   a smaller STS is already active), skipping positions that won't be verified.
         effective_verify_len = self._effective_verify_len
+        prob_sample_len = (
+            self.block_size
+            if isinstance(self.adaptive_controller, DraftProbAdaptiveController)
+            else effective_verify_len
+        )
         draft_next, draft_next_probs = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:effective_verify_len, :].reshape(
+            hidden_states=draft_hidden[:, 1:prob_sample_len, :].reshape(
                 -1, draft_hidden.shape[-1]
             ),
             lm_head=lm_head,
         )
-        draft_next = draft_next.view(bs, effective_verify_len - 1)
-        draft_next_probs = draft_next_probs.view(bs, effective_verify_len - 1)
+        draft_next = draft_next.view(bs, prob_sample_len - 1)
+        draft_next_probs = draft_next_probs.view(bs, prob_sample_len - 1)
         draft_tokens_full = self._draft_block_tokens_buf[:bs]  # [bs, block_size]
         draft_tokens_full[:, 0].copy_(block_ids[:, 0])
-        draft_tokens_full[:, 1:effective_verify_len].copy_(draft_next)
+        draft_tokens_full[:, 1:prob_sample_len].copy_(draft_next)
         assert self._draft_block_probs_buf is not None
-        self._draft_block_probs_buf[:bs, : effective_verify_len - 1].copy_(draft_next_probs)
+        self._draft_block_probs_buf[:bs, : prob_sample_len - 1].copy_(draft_next_probs)
 
         # --- Draft-prob adaptive: select optimal verify step count per batch ---
         # Runs AFTER draft probs are stored and BEFORE verify-side truncation.
-        # activate_step_by_batch (pre-draft) already restored effective_verify_len to
-        # block_size for DraftProbAdaptiveController, so all block_size-1 probs are filled.
+        # prob_sample_len == block_size for DraftProbAdaptiveController, so all
+        # block_size-1 probs are available in _draft_block_probs_buf.
         if isinstance(self.adaptive_controller, DraftProbAdaptiveController):
             ctrl = self.adaptive_controller
-            n_prob_cols = effective_verify_len - 1
-            # Lazily allocate or expand the side buffer that get_optimal_verify_steps reads.
-            if ctrl._per_step_draft_probs is None or ctrl._per_step_draft_probs.shape[0] < bs:
-                ctrl.init_side_buffer(
-                    max_bs=max(bs, ctrl._fixed_draft_steps),
-                    device=str(self.device),
+            cands = ctrl.candidates_for_bs(bs)
+            if len(cands) <= 1:
+                # Single (or empty) candidate for this BS tier: the verify length is
+                # fixed and can never switch, so skip the per-step prob copy, the
+                # seqlen GPU->CPU sync, the throughput scoring, AND the (expensive,
+                # per-element .item()) draft-prob logging entirely. Activating only
+                # happens once when the cached state does not yet match.
+                target_k = cands[0] if cands else ctrl._fixed_draft_steps
+                if target_k + 1 != effective_verify_len:
+                    ctrl._activate(target_k)
+                    effective_verify_len = self._effective_verify_len
+            else:
+                # Clamp to ctrl._fixed_draft_steps (buffer column count) to guard against
+                # a misconfigured fixed_draft_steps < block_size - 1.
+                n_prob_cols = min(prob_sample_len - 1, ctrl._fixed_draft_steps)
+                # Pass the eager-computed probs buffer directly (no side-buffer copy):
+                # the scorer reads it in place, so we avoid a per-step device-to-device
+                # copy and the side-buffer allocation entirely.
+                probs_view = self._draft_block_probs_buf[:bs, :n_prob_cols]
+                # avg_seqlen only feeds a nearest-neighbour ITL bucket lookup, so a CPU
+                # read (kept in sync with seq_lens by prepare_for_decode) is exact enough
+                # and avoids a GPU->CPU sync every decode step.
+                _sl_cpu = batch.seq_lens_cpu
+                if _sl_cpu is not None:
+                    _avg_seqlen = float(
+                        (_sl_cpu.float().mean() + _sl_cpu.max()) / 2.0
+                    )
+                else:
+                    _sl = batch.seq_lens.float()
+                    _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
+                optimal_k = ctrl.get_optimal_verify_steps(
+                    batch_size=bs,
+                    avg_seqlen=_avg_seqlen,
+                    current_steps=effective_verify_len - 1,
+                    probs_override=probs_view,
                 )
-            # Copy eager-computed probs (outside CUDA graph) into the controller buffer.
-            ctrl._per_step_draft_probs[:bs, :n_prob_cols].copy_(
-                self._draft_block_probs_buf[:bs, :n_prob_cols]
-            )
-            _sl = batch.seq_lens.float()
-            _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
-            optimal_k = ctrl.get_optimal_verify_steps(
-                batch_size=bs,
-                avg_seqlen=_avg_seqlen,
-                current_steps=effective_verify_len - 1,
-            )
-            if optimal_k + 1 != effective_verify_len:
-                ctrl._activate(optimal_k)
-                # _activate → apply_runtime_state → updates _effective_verify_len
-                effective_verify_len = self._effective_verify_len
+                if optimal_k + 1 != effective_verify_len:
+                    ctrl._activate(optimal_k)
+                    # _activate → apply_runtime_state → updates _effective_verify_len
+                    effective_verify_len = self._effective_verify_len
 
         # Adaptive truncation: send only the first effective_verify_len tokens to the target.
         if effective_verify_len < self.block_size:
@@ -1514,9 +1540,14 @@ class DFlashWorker:
 
         # Pre-draft adaptive step selection: runs BEFORE drafting.
         # - EMA / batch-size-aware (AdaptiveController): switches verify_len by BS tier.
-        # - DraftProbAdaptiveController: restores to block_size so all probs are captured.
         # - ThroughputAwareAdaptiveController: same as EMA but also uses avg_seqlen.
-        if self.adaptive_controller is not None:
+        # - DraftProbAdaptiveController: NO pre-draft call needed.
+        #   DFlash always drafts at fixed block_size regardless of _effective_verify_len,
+        #   so there is no draft-graph to restore.  The verify-len decision from the
+        #   previous round persists until the post-draft scoring overwrites it.
+        if self.adaptive_controller is not None and not isinstance(
+            self.adaptive_controller, DraftProbAdaptiveController
+        ):
             _bs = batch.batch_size()
             if isinstance(self.adaptive_controller, ThroughputAwareAdaptiveController):
                 _sl = batch.seq_lens.float()

@@ -472,6 +472,20 @@ class DraftProbAdaptiveController(AdaptiveController):
     def candidate_steps(self) -> list[int]:
         return sorted({s for slot in self._bs_params.values() for s in slot.candidate_steps})
 
+    def candidates_for_bs(self, batch_size: int) -> list[int]:
+        """Per-BS-tier candidate verify steps, clamped to ``fixed_draft_steps``.
+
+        Routes by the actual ``batch_size`` (same as the EMA / throughput-aware
+        controllers) so that per-BS restrictions like ``"1": [15]`` are honored
+        instead of falling back to the global union ``self.candidate_steps``.
+        """
+        bs_key = self._find_closest_bs(batch_size)
+        return [
+            k
+            for k in self._bs_params[bs_key].candidate_steps
+            if 1 <= k <= self._fixed_draft_steps
+        ]
+
     def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
         if self._cuda_graph_bs is None:
             return batch_size
@@ -557,49 +571,78 @@ class DraftProbAdaptiveController(AdaptiveController):
         self,
         batch_size: int,
         avg_seqlen: float,
+        *,
+        include_seq_detail: bool = False,
+        probs_override: Optional[torch.Tensor] = None,
     ) -> tuple[list[dict], Optional[torch.Tensor], int]:
         """Score every candidate verify step from the current draft prob buffer.
 
         Returns ``(score_rows, probs[:batch_size], best_k)``.  Each row has
-        keys ``steps``, ``expected``, ``itl_cost``, ``score``, and per-seq
-        ``seq_expected`` (1 + sum of cumprods for that candidate k).
+        keys ``steps``, ``expected``, ``itl_cost``, ``score``; the per-seq
+        ``seq_expected`` field is only populated when ``include_seq_detail`` is
+        True (it is only needed for logging and forcing it costs a device→host
+        copy per candidate every decode step).
+
+        When ``probs_override`` is given (DFlash path), it is read directly and
+        the internal ``_per_step_draft_probs`` side buffer is bypassed — this
+        avoids a per-step device-to-device copy and the side-buffer allocation.
+
+        All candidate ``k`` share a single ``cumprod`` over the widest candidate
+        and a single device→host sync, instead of one ``.item()`` /
+        ``.cpu().tolist()`` per candidate.
         """
-        if self._per_step_draft_probs is None or self._itl_table is None:
+        if self._itl_table is None:
             return [], None, self._fixed_draft_steps
 
-        probs = self._per_step_draft_probs[:batch_size]  # [bs, fixed_draft_steps]
+        if probs_override is not None:
+            probs = probs_override  # [bs, >=max_k]
+        elif self._per_step_draft_probs is not None:
+            probs = self._per_step_draft_probs[:batch_size]  # [bs, fixed_draft_steps]
+        else:
+            return [], None, self._fixed_draft_steps
 
-        candidates = [
-            k for k in self.candidate_steps if 1 <= k <= self._fixed_draft_steps
-        ]
+        candidates = self.candidates_for_bs(batch_size)
         if not candidates:
             return [], probs, self._fixed_draft_steps
+
+        # Shared cumprod over the widest candidate; prefix-sum over positions then
+        # over batch gives total_expected for every k from one sync.
+        max_k = max(candidates)
+        cum_prods = torch.cumprod(probs[:, :max_k], dim=1)  # [bs, max_k]
+        # col_sums[j] = sum_seq prod(p[0:j+1]); cumsum over j → prefix sums per k.
+        prefix_col_sums = torch.cumsum(cum_prods.sum(dim=0), dim=0)  # [max_k]
+        prefix_cpu = prefix_col_sums.cpu().tolist()  # single device→host sync
+
+        # Per-seq detail (1 + cumsum over positions) only when logging.
+        seq_detail: Optional[list[list[float]]] = None
+        if include_seq_detail:
+            seq_detail = (
+                (1.0 + torch.cumsum(cum_prods, dim=1)).detach().cpu().tolist()
+            )
 
         rows: list[dict] = []
         best_k = candidates[0]
         best_score = -float("inf")
 
         for k in candidates:
-            k_probs = probs[:, :k]
-            cum_prods = torch.cumprod(k_probs, dim=1)
-            # Per-seq: 1 (bonus) + sum_j prod(p[0:j+1])
-            seq_expected = 1.0 + cum_prods.sum(dim=1)
-            total_expected = float(seq_expected.sum().item())
+            # total_expected(k) = sum_seq (1 + sum_{j<k} prod(p[0:j+1]))
+            #                   = batch_size + prefix_col_sums[k-1]
+            total_expected = float(batch_size) + prefix_cpu[k - 1]
 
             itl_cost = self._itl_table.lookup(avg_seqlen, batch_size, k)
             score: Optional[float] = None
             if itl_cost is not None and itl_cost > 0:
                 score = total_expected / itl_cost
 
-            rows.append(
-                {
-                    "steps": float(k),
-                    "expected": total_expected,
-                    "itl_cost": itl_cost,
-                    "score": score,
-                    "seq_expected": seq_expected.detach().cpu().tolist(),
-                }
-            )
+            row = {
+                "steps": float(k),
+                "expected": total_expected,
+                "itl_cost": itl_cost,
+                "score": score,
+            }
+            if seq_detail is not None:
+                row["seq_expected"] = [seq_detail[s][k - 1] for s in range(batch_size)]
+            rows.append(row)
 
             if score is not None and score > best_score:
                 best_score = score
@@ -612,6 +655,7 @@ class DraftProbAdaptiveController(AdaptiveController):
         batch_size: int,
         avg_seqlen: float,
         current_steps: Optional[int] = None,
+        probs_override: Optional[torch.Tensor] = None,
     ) -> int:
         """After draft: read per-step probs and return the optimal verify step count.
 
@@ -628,8 +672,15 @@ class DraftProbAdaptiveController(AdaptiveController):
             avg_seqlen: (avg + max) / 2 of current sequence lengths, used to
                 look up ITL cost.
             current_steps: Active STS before the verify switch (for logging only).
+            probs_override: When given, read draft probs directly from this tensor
+                instead of the internal side buffer (DFlash eager-prob path).
         """
-        rows, probs, best_k = self.draft_prob_score_breakdown(batch_size, avg_seqlen)
+        rows, probs, best_k = self.draft_prob_score_breakdown(
+            batch_size,
+            avg_seqlen,
+            include_seq_detail=self._log_draft_prob_decision,
+            probs_override=probs_override,
+        )
         if probs is None:
             return self._fixed_draft_steps
 
