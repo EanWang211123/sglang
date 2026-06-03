@@ -872,16 +872,27 @@ class DFlashWorker:
         # activate_step_by_batch (pre-draft) already restored effective_verify_len to
         # block_size for DraftProbAdaptiveController, so all block_size-1 probs are filled.
         if isinstance(self.adaptive_controller, DraftProbAdaptiveController):
+            ctrl = self.adaptive_controller
+            n_prob_cols = effective_verify_len - 1
+            # Lazily allocate or expand the side buffer that get_optimal_verify_steps reads.
+            if ctrl._per_step_draft_probs is None or ctrl._per_step_draft_probs.shape[0] < bs:
+                ctrl.init_side_buffer(
+                    max_bs=max(bs, ctrl._fixed_draft_steps),
+                    device=str(self.device),
+                )
+            # Copy eager-computed probs (outside CUDA graph) into the controller buffer.
+            ctrl._per_step_draft_probs[:bs, :n_prob_cols].copy_(
+                self._draft_block_probs_buf[:bs, :n_prob_cols]
+            )
             _sl = batch.seq_lens.float()
             _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
-            optimal_k = self.adaptive_controller.get_optimal_verify_steps_from_probs(
-                probs=self._draft_block_probs_buf[:bs, : effective_verify_len - 1],
+            optimal_k = ctrl.get_optimal_verify_steps(
                 batch_size=bs,
                 avg_seqlen=_avg_seqlen,
                 current_steps=effective_verify_len - 1,
             )
             if optimal_k + 1 != effective_verify_len:
-                self.adaptive_controller._activate(optimal_k)
+                ctrl._activate(optimal_k)
                 # _activate → apply_runtime_state → updates _effective_verify_len
                 effective_verify_len = self._effective_verify_len
 
