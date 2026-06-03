@@ -603,6 +603,7 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+    enable_speculative_timing_logging: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -5879,6 +5880,14 @@ class ServerArgs:
             default=ServerArgs.speculative_skip_dp_mlp_sync,
             help="Skip the extra MLP sync that the scheduler performs before merging a new batch "
             "when speculative decoding + DP attention are both enabled.",
+        )
+        parser.add_argument(
+            "--enable-speculative-timing-logging",
+            action="store_true",
+            default=ServerArgs.enable_speculative_timing_logging,
+            help="Enable per-step timing logging for decode. Speculative paths log "
+            "draft / verify / draft-extend; baseline (no spec) logs target forward only. "
+            "Only rank-0 prints. Adds torch.cuda.synchronize() calls per logged decode step.",
         )
 
         # Multi-layer Eagle speculative decoding

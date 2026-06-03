@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -322,6 +323,7 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+        self._enable_timing_logging = server_args.enable_speculative_timing_logging
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
@@ -468,6 +470,21 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
+        should_log_baseline_timing = (
+            self._enable_timing_logging
+            and self.tp_rank == 0
+            and not self.is_draft_worker
+            and not is_verify
+            and not self.enable_spec
+            and batch is not None
+            and not batch.forward_mode.is_extend()
+            and not batch.is_extend_in_batch
+        )
+        if should_log_baseline_timing:
+            torch.cuda.synchronize()
+            _step_t0 = time.perf_counter()
+            _forward_t0 = time.perf_counter()
+
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
                 forward_batch,
@@ -523,6 +540,17 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, forward_batch
                     )
+
+            if should_log_baseline_timing:
+                torch.cuda.synchronize()
+                forward_time = time.perf_counter() - _forward_t0
+                step_wall_time = time.perf_counter() - _step_t0
+                logger.info(
+                    "[Baseline Step Timing] "
+                    f"bs={batch.batch_size()}, "
+                    f"forward={forward_time * 1000:.2f}ms, "
+                    f"step_wall={step_wall_time * 1000:.2f}ms"
+                )
 
             return batch_result
         else:
