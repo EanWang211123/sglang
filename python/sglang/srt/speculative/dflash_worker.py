@@ -22,6 +22,11 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController, SpecRuntimeState
+from sglang.srt.speculative.throughput_aware_controller import (
+    DraftProbAdaptiveController,
+    ThroughputAwareAdaptiveController,
+    load_throughput_config,
+)
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -245,7 +250,9 @@ class DFlashWorker:
         # length. When adaptive is disabled this equals block_size (no truncation).
         self._effective_verify_len: int = self.block_size
         self.adaptive_controller: Optional[AdaptiveController] = None
-        if server_args.speculative_adaptive:
+        if server_args.speculative_adaptive_throughput_config is not None:
+            self._init_draft_prob_adaptive_controller(server_args)
+        elif server_args.speculative_adaptive:
             self._init_adaptive_controller(server_args)
 
     @property
@@ -275,6 +282,49 @@ class DFlashWorker:
             )
         )
         self.adaptive_controller.init_states()
+
+    def _init_draft_prob_adaptive_controller(self, server_args: ServerArgs) -> None:
+        """Initialize a throughput-aware controller for DFlash.
+
+        Checks whether ``enable_draft_prob_adaptive`` is set in the config:
+        - **True** → :class:`DraftProbAdaptiveController` (per-batch, draft-prob scoring).
+          DFlash always drafts with the full ``block_size``; after the draft forward the
+          greedy probs (in ``_draft_block_probs_buf``) drive per-batch verify-step selection.
+        - **False / absent** → :class:`ThroughputAwareAdaptiveController` (sliding-window
+          EMA + offline ITL table; same as Eagle's throughput-aware path).
+
+        In both cases a single ``SpecRuntimeState`` for each candidate verify length is
+        built here; only the target attention backend and CUDA graph differ per bucket.
+        """
+        cfg = load_throughput_config(server_args.speculative_adaptive_throughput_config)
+
+        def _build_and_register(ctrl: AdaptiveController) -> None:
+            ctrl.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.block_size - 1,
+                    speculative_num_draft_tokens=self.block_size,
+                    draft_attn_backend=self.draft_model_runner.attn_backend,
+                    cuda_graph_runner=None,
+                    target_attn_backend=self.target_worker.model_runner.attn_backend,
+                    target_graph_runner=self.target_worker.model_runner.graph_runner,
+                    draft_extend_attn_backend=None,
+                    cuda_graph_runner_for_draft_extend=None,
+                )
+            )
+            ctrl.init_states()
+
+        if cfg.get("enable_draft_prob_adaptive", False):
+            self.adaptive_controller = DraftProbAdaptiveController(
+                self,
+                throughput_config_path=server_args.speculative_adaptive_throughput_config,
+            )
+            _build_and_register(self.adaptive_controller)
+        else:
+            self.adaptive_controller = ThroughputAwareAdaptiveController(
+                self,
+                throughput_config_path=server_args.speculative_adaptive_throughput_config,
+            )
+            _build_and_register(self.adaptive_controller)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -816,6 +866,24 @@ class DFlashWorker:
         draft_tokens_full[:, 1:effective_verify_len].copy_(draft_next)
         assert self._draft_block_probs_buf is not None
         self._draft_block_probs_buf[:bs, : effective_verify_len - 1].copy_(draft_next_probs)
+
+        # --- Draft-prob adaptive: select optimal verify step count per batch ---
+        # Runs AFTER draft probs are stored and BEFORE verify-side truncation.
+        # activate_step_by_batch (pre-draft) already restored effective_verify_len to
+        # block_size for DraftProbAdaptiveController, so all block_size-1 probs are filled.
+        if isinstance(self.adaptive_controller, DraftProbAdaptiveController):
+            _sl = batch.seq_lens.float()
+            _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
+            optimal_k = self.adaptive_controller.get_optimal_verify_steps_from_probs(
+                probs=self._draft_block_probs_buf[:bs, : effective_verify_len - 1],
+                batch_size=bs,
+                avg_seqlen=_avg_seqlen,
+                current_steps=effective_verify_len - 1,
+            )
+            if optimal_k + 1 != effective_verify_len:
+                self.adaptive_controller._activate(optimal_k)
+                # _activate → apply_runtime_state → updates _effective_verify_len
+                effective_verify_len = self._effective_verify_len
 
         # Adaptive truncation: send only the first effective_verify_len tokens to the target.
         if effective_verify_len < self.block_size:
@@ -1433,13 +1501,22 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
-        # Batch-size-aware adaptive: switch effective_verify_len based on current BS.
-        # The EMA from the previous on_verify_complete may have updated the optimal step
-        # for this BS tier, so we query and activate before drafting.
+        # Pre-draft adaptive step selection: runs BEFORE drafting.
+        # - EMA / batch-size-aware (AdaptiveController): switches verify_len by BS tier.
+        # - DraftProbAdaptiveController: restores to block_size so all probs are captured.
+        # - ThroughputAwareAdaptiveController: same as EMA but also uses avg_seqlen.
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(
-                batch.batch_size(), self.speculative_num_steps
-            )
+            _bs = batch.batch_size()
+            if isinstance(self.adaptive_controller, ThroughputAwareAdaptiveController):
+                _sl = batch.seq_lens.float()
+                _avg_seqlen = float((_sl.mean() + _sl.max()) / 2.0)
+                self.adaptive_controller.activate_step_by_batch(
+                    _bs, self.speculative_num_steps, avg_seqlen=_avg_seqlen
+                )
+            else:
+                self.adaptive_controller.activate_step_by_batch(
+                    _bs, self.speculative_num_steps
+                )
 
         self._prepare_for_speculative_decoding(batch, draft_input)
 
