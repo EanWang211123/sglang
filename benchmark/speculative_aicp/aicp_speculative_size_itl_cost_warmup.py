@@ -101,6 +101,7 @@ _STRIP_FLAGS = frozenset(
         "--speculative-num-steps",
         "--speculative-eagle-topk",
         "--speculative-num-draft-tokens",
+        "--speculative-dflash-verify-step",
         "--port",
     }
 )
@@ -147,6 +148,21 @@ def extract_model_path_from_command(cmd: str) -> Optional[str]:
     for i, tok in enumerate(tokens):
         if tok in ("--model-path", "--model") and i + 1 < len(tokens):
             return tokens[i + 1]
+    return None
+
+
+def extract_dflash_block_size_from_command(cmd: str) -> Optional[int]:
+    """Read ``--speculative-dflash-block-size`` from a launch command string."""
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None
+    for i, tok in enumerate(tokens):
+        if tok == "--speculative-dflash-block-size" and i + 1 < len(tokens):
+            try:
+                return int(tokens[i + 1])
+            except ValueError:
+                return None
     return None
 
 
@@ -236,8 +252,21 @@ class Config:
             raise ValueError("batch_size_capture_list values must be >= 1")
         if self.combo_per_batch_size < 1:
             raise ValueError("combo_per_batch_size must be >= 1")
-        if any(s < 1 for s in self.test_spec_size_list):
-            raise ValueError("test_spec_size_list values must be >= 1")
+        min_spec = 0 if self.speculative_algorithm.upper() == "DFLASH" else 1
+        if any(s < min_spec for s in self.test_spec_size_list):
+            raise ValueError(
+                f"test_spec_size_list values must be >= {min_spec} "
+                f"for speculative_algorithm={self.speculative_algorithm!r}"
+            )
+        if self.speculative_algorithm.upper() == "DFLASH":
+            block_size = extract_dflash_block_size_from_command(self.base_command)
+            if block_size is not None:
+                bad = [s for s in self.test_spec_size_list if s >= block_size]
+                if bad:
+                    raise ValueError(
+                        f"DFLASH verify_step must be < block_size ({block_size}); "
+                        f"invalid test_spec_size_list entries: {bad}"
+                    )
         if self.output_len <= 1:
             raise ValueError("output_len must be > 1 to measure ITL")
         if not self.tokenizer_path:
@@ -321,10 +350,14 @@ def build_server_command(
     base_command has already been cleaned by normalize_command (no spec flags,
     no --port).  --port is further injected by launch_server_cmd.
 
-    For speculative mode we only inject the three core flags:
-      --speculative-algorithm EAGLE
+    For EAGLE/EAGLE3 speculative mode we inject:
+      --speculative-algorithm <algo>
       --speculative-num-steps  <spec_size>
       --speculative-eagle-topk <topk>
+
+    For DFLASH, ``test_spec_size_list`` sweeps ``--speculative-dflash-verify-step``
+    (0 <= verify_step < block_size).  ``--speculative-dflash-block-size`` must
+    stay in ``base_command``; ``speculative_num_steps`` is forced to 1 by SGLang.
 
     Draft model path injection:
       - speculative_draft_model_path == "" (default, MTP mode):
@@ -335,12 +368,15 @@ def build_server_command(
     """
     cmd = cfg.base_command.strip()
     if spec_size is not None:
-        cmd = (
-            cmd
-            + f" --speculative-algorithm {cfg.speculative_algorithm}"
-            + f" --speculative-num-steps {spec_size}"
-            + f" --speculative-eagle-topk {cfg.speculative_eagle_topk}"
-        )
+        cmd += f" --speculative-algorithm {cfg.speculative_algorithm}"
+        if cfg.speculative_algorithm.upper() == "DFLASH":
+            cmd += f" --speculative-dflash-verify-step {spec_size}"
+        else:
+            cmd = (
+                cmd
+                + f" --speculative-num-steps {spec_size}"
+                + f" --speculative-eagle-topk {cfg.speculative_eagle_topk}"
+            )
         if cfg.speculative_draft_model_path:
             cmd += f" --speculative-draft-model-path {cfg.speculative_draft_model_path}"
     return cmd

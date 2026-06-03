@@ -1,0 +1,34 @@
+{
+  "_comment": "DFLASH ITL warmup for Qwen3.5-4B. test_spec_size_list sweeps --speculative-dflash-verify-step (NOT --speculative-num-steps). Valid range: 0 <= verify_step < block_size (16). Output JSONL field spec_size = verify_step.",
+  "base_command": "CUDA_VISIBLE_DEVICES=4,5,6,7 python -m sglang.launch_server --model-path /nfs_models/Qwen/Qwen3.5-4B/ --tp-size 4 --speculative-dflash-block-size 16 --mem-fraction-static 0.65 --context-length 8192 --max-running-requests 48 --disable-radix-cache --cuda-graph-bs 1 2 4 8 12 16 24 32 40 --port 30000",
+
+  "_seqlen_note": "Cover your production input token distribution. itl_cost trend depends strongly on seqlen.",
+  "seqlen_min": 128,
+  "seqlen_max": 2048,
+  "seqlen_step": 256,
+  "output_len": 256,
+
+  "_batch_note": "Aligned with --cuda-graph-bs capture points from base_command.",
+  "batch_size_capture_list": [1, 2, 4, 8, 12, 16, 24, 32, 40],
+  "min_batch_size": 1,
+  "max_batch_size": 40,
+  "batch_size_step": 4,
+
+  "_verify_step_note": "verify_step=7 -> target verify len=8 tokens per spec cycle. Must satisfy 0 <= verify_step < block_size (16).",
+  "test_spec_size_list": [1, 3, 5, 7, 9, 11, 13, 15],
+
+  "speculative_algorithm": "DFLASH",
+  "speculative_eagle_topk": 1,
+  "speculative_draft_model_path": "/nfs_models/z-lab/Qwen3.5-4B-DFlash/",
+
+  "combo_per_batch_size": 5,
+  "wait_all_prefill_before_itl": true,
+
+  "host": "127.0.0.1",
+  "tokenizer_path": "",
+  "warmup_seqlen": 512,
+  "warmup_output_len": 32,
+  "seed": 1,
+
+  "output_path": "dflash_qwen35_4b_itl_cost_results.jsonl"
+}
