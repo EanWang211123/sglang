@@ -868,6 +868,21 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
+                # FA3's split-KV combine kernel (flash_fwd_combine_launch_template.h)
+                # processes query tokens in tiles of kBlockM=16. When max_seqlen_q is
+                # not a multiple of 16 and num_splits > 1, the combine kernel accesses
+                # intermediate workspace positions [seq * roundup16(max_seqlen_q) + 14/15]
+                # while the workspace is only allocated for [seq * max_seqlen_q], causing
+                # an illegal memory access (OOB). This affects DFLASH TARGET_VERIFY with
+                # speculative_num_draft_tokens % 16 != 0 (e.g. verify_step=13 → q_len=14).
+                # Force num_splits=1 to skip the multi-split combine kernel in this case.
+                _extend_num_splits = self.num_splits
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and max_seqlen_q % 16 != 0
+                    and self.fa_impl_ver == 3
+                ):
+                    _extend_num_splits = 1
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -884,7 +899,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=_extend_num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     **kwargs,
