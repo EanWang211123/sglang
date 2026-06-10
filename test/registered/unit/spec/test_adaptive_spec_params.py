@@ -6,10 +6,12 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
+    validate_adaptive_initial_steps,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestAdaptiveStepSlot(unittest.TestCase):
@@ -239,9 +241,10 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
             f.flush()
             params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
         self.assertEqual(params._bs_list, [1, 32])
-        self.assertEqual(params._slots[1].candidate_steps, [1, 5])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5])
         self.assertEqual(params._slots[1].up_hysteresis, 0.3)
-        self.assertEqual(params._slots[32].candidate_steps, [1, 2])
+        self.assertEqual(params._slots[32].candidate_steps, [1, 2, 3])
+
 
     def test_invalid_config_raises(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -370,6 +373,41 @@ class TestResolveCandidateSteps(unittest.TestCase):
                 initial_steps=3, cfg_path=f.name
             )
         self.assertEqual(steps, [2, 3, 4])
+
+    def test_unions_and_dedups_across_slots(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 5]},
+                    "8": {"candidate_steps": [3, 5, 7]},
+                },
+                f,
+            )
+            f.flush()
+            steps = resolve_candidate_steps_from_config(
+                initial_steps=3, cfg_path=f.name
+            )
+        self.assertEqual(steps, [1, 3, 5, 7])
+
+
+class TestValidateAdaptiveInitialSteps(unittest.TestCase):
+    def test_accepts_value_from_any_slot(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 5]},
+                    "8": {"candidate_steps": [1, 3, 7]},
+                },
+                f,
+            )
+            f.flush()
+            # Membership in any slot is enough: 5 lives in the smallest slot,
+            # 7 only in a larger slot -- both accepted.
+            validate_adaptive_initial_steps(5, cfg_path=f.name)
+            validate_adaptive_initial_steps(7, cfg_path=f.name)
+            # 9 is in no slot -> rejected.
+            with self.assertRaises(ValueError):
+                validate_adaptive_initial_steps(9, cfg_path=f.name)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ DEFAULT_DFLASH_ADAPTIVE_CONFIG: dict[str, dict] = {
 }
 
 
+
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
     if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
@@ -85,7 +86,7 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     if server_args.enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
-            "(MultiLayerEagleWorker does not implement adaptive)"
+            "(MultiLayerEagleWorkerV2 does not implement adaptive)"
         )
     if server_args.enable_two_batch_overlap:
         return (
@@ -209,6 +210,22 @@ def build_per_bs_params(
     return bs_list, bs_params
 
 
+def validate_adaptive_initial_steps(
+    initial_steps: int,
+    cfg_path: str | None = None,
+) -> None:
+    """Require the initial step to be a candidate of some BS slot."""
+    _, bs_entries = _load_adaptive_config(cfg_path)
+    all_steps: set[int] = set()
+    for entry in bs_entries.values():
+        all_steps.update(entry["candidate_steps"])
+    if initial_steps not in all_steps:
+        raise ValueError(
+            f"--speculative-num-steps={initial_steps} is not in the adaptive "
+            f"config candidate_steps {sorted(all_steps)}. Pass one of those values."
+        )
+
+
 class AdaptiveStepSlot:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
@@ -324,6 +341,7 @@ class AdaptiveSpeculativeParams:
         cfg, bs_entries = _load_adaptive_config(cfg_path, is_dflash=is_dflash)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
+        self._cuda_graph_bs: list[int] | None = None
         for bs, entry in sorted(bs_entries.items()):
             merged = {**cfg, **entry}
             # AdaptiveStepSlot handles fallback internally: if initial_steps
@@ -332,7 +350,6 @@ class AdaptiveSpeculativeParams:
                 initial_steps=initial_steps,
                 cfg=merged,
             )
-        self._cuda_graph_bs: list[int] | None = None
 
         first_slot = self._slots[self._bs_list[0]]
         log_info_on_rank0(

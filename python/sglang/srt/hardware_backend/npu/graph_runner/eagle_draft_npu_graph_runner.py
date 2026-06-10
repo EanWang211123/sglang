@@ -29,7 +29,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_worker import EAGLEWorker
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 from sglang.srt.utils import is_npu
 
@@ -47,7 +47,7 @@ if is_npu():
 class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(
         self,
-        eagle_worker: EAGLEWorker,
+        eagle_worker: "EagleDraftWorker",
         init_max_bs: Optional[int] = None,
     ):
         super().__init__(eagle_worker, init_max_bs=init_max_bs)
