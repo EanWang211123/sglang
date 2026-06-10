@@ -145,8 +145,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
+        # For DFLASH, the target model verifies only (verify_step+1) tokens per
+        # request, not the full block_size. Use max_speculative_num_draft_tokens
+        # (= dflash_target_verify_token_num when non-adaptive) so that cu_seqlens_q
+        # step and max_seqlen_q match the actual query tensor layout built by
+        # cuda_graph_runner (num_tokens_per_bs = dflash_target_verify_token_num).
+        # For all other algorithms max_speculative_num_draft_tokens falls back to
+        # speculative_num_draft_tokens, so there is no behavior change.
         self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
+            model_runner.server_args.max_speculative_num_draft_tokens
+            or model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
 
