@@ -302,6 +302,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "HYV3ForCausalLM",
     ]:
         if server_args.speculative_draft_model_path is None:
+            if server_args.speculative_algorithm == "EAGLE3":
+                raise ValueError(
+                    "EAGLE3 requires --speculative-draft-model-path. "
+                    "For built-in MTP on DeepSeek/GLM models, use "
+                    "--speculative-algorithm EAGLE instead."
+                )
             server_args.speculative_draft_model_path = server_args.model_path
             server_args.speculative_draft_model_revision = server_args.revision
         else:
@@ -309,9 +315,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
-                logger.warning(
-                    "DeepSeek MTP does not require setting speculative_draft_model_path."
-                )
+                if server_args.speculative_algorithm != "EAGLE3":
+                    logger.warning(
+                        "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
+
+    _maybe_set_eagle3_draft_attention_backend(server_args, model_arch)
 
     if (
         not server_args.speculative_adaptive
@@ -507,6 +516,45 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
         )
 
     server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+
+
+def _maybe_set_eagle3_draft_attention_backend(
+    server_args: ServerArgs, target_arch: str
+) -> None:
+    """Llama EAGLE3 drafts cannot use the target's DSV4 attention backend."""
+    if server_args.speculative_algorithm != "EAGLE3":
+        return
+    if server_args.speculative_draft_attention_backend is not None:
+        return
+    if server_args.speculative_draft_model_path is None:
+        return
+
+    target_backend = (
+        server_args.decode_attention_backend
+        or server_args.prefill_attention_backend
+        or server_args.attention_backend
+    )
+    if target_backend != "dsv4" and target_arch != "DeepseekV4ForCausalLM":
+        return
+
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_cfg = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+    )
+    draft_archs = getattr(draft_cfg, "architectures", None) or []
+    if "LlamaForCausalLMEagle3" not in draft_archs:
+        return
+
+    fallback = "fa3" if target_backend == "fa3" else "flashinfer"
+    server_args.speculative_draft_attention_backend = fallback
+    logger.info(
+        "Auto-selected speculative_draft_attention_backend=%s for EAGLE3 draft "
+        "with DeepSeek-V4 target (target attention backend=%s).",
+        fallback,
+        target_backend,
+    )
 
 
 def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) -> tuple:

@@ -1749,6 +1749,7 @@ class DeepseekV4Model(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
+        self.layers_to_capture: List[int] = []
 
     def hc_head(
         self,
@@ -1824,7 +1825,14 @@ class DeepseekV4Model(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
+        aux_hidden_states: List[torch.Tensor] = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                # EAGLE3/DFLASH aux taps: reduce mHC copies to a single hidden vector.
+                if hidden_states.ndim == 3:
+                    aux_hidden_states.append(hidden_states.mean(dim=1))
+                else:
+                    aux_hidden_states.append(hidden_states)
             layer = self.layers[i]
             last_layer = layer
             ctx = (
@@ -1868,7 +1876,9 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, pre_hc_head
+        if len(aux_hidden_states) == 0:
+            return hidden_states, pre_hc_head
+        return (hidden_states, pre_hc_head), aux_hidden_states
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -2002,8 +2012,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-        hidden_states, pre_hc_head = hidden_states
+            (hidden_states, pre_hc_head), aux_hidden_states = hidden_states
+        else:
+            hidden_states, pre_hc_head = hidden_states
 
         return self.logits_processor(
             input_ids,
@@ -2479,6 +2490,36 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_logical_experts=config.n_routed_experts,
             num_groups=None,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # Draft configs (e.g. ManiacLabs/DeepSeek-V4-Flash-EAGLE3.1) use
+            # output-of-layer ids starting at 1; shift by +1 to capture before
+            # the next layer runs, matching DeepSeek-V2/V3 EAGLE3 behavior.
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = [DeepseekV4ForCausalLM]
