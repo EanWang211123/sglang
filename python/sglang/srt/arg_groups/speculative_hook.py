@@ -258,6 +258,26 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     )
 
 
+def _read_dspark_checkpoint_gamma(server_args: ServerArgs) -> Optional[int]:
+    from sglang.srt.speculative.dspark_components.dspark_utils import (
+        parse_dspark_draft_config,
+    )
+
+    model_override_args = json.loads(server_args.json_model_override_args)
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=model_override_args,
+        model_config_parser=server_args.model_config_parser,
+    )
+    return parse_dspark_draft_config(
+        draft_hf_config=draft_hf_config
+    ).resolve_gamma(default=None)
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
@@ -403,6 +423,34 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 )
 
     if gamma is not None:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        ragged_verify_mode = read_ragged_verify_mode()
+        if ragged_verify_mode is not RaggedVerifyMode.STATIC:
+            config_gamma: Optional[int] = None
+            try:
+                config_gamma = _read_dspark_checkpoint_gamma(server_args)
+            except Exception as e:
+                logger.warning(
+                    "Failed to read DSpark gamma from draft model config; "
+                    "skipping --speculative-dspark-block-size consistency check. "
+                    "Error: %s",
+                    e,
+                )
+            if config_gamma is not None and int(config_gamma) != int(gamma):
+                raise ValueError(
+                    "DSpark --speculative-dspark-block-size "
+                    f"(= {gamma}) does not match the draft checkpoint "
+                    f"dspark_block_size={config_gamma}. "
+                    f"SGLANG_RAGGED_VERIFY_MODE={ragged_verify_mode.value!r} "
+                    "requires the CLI block size to match the checkpoint; use "
+                    f"--speculative-dspark-block-size {config_gamma}, or unset "
+                    "the flag to inherit the checkpoint value."
+                )
+
         verify_window = int(gamma) + 1
         if (
             server_args.speculative_num_draft_tokens is not None

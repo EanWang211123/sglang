@@ -185,6 +185,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     server_args.speculative_num_draft_tokens,
                     config_gamma,
                 )
+        self._align_draft_model_gamma()
         self.verify_num_draft_tokens = self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
 
@@ -433,6 +434,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
+
+    def _align_draft_model_gamma(self) -> None:
+        model_gamma = int(getattr(self.draft_model, "gamma", self.gamma))
+        if model_gamma == self.gamma:
+            return
+        self.draft_model.gamma = int(self.gamma)
+        if hasattr(self.draft_model, "block_size"):
+            self.draft_model.block_size = int(self.gamma)
+        if self.tp_rank == 0:
+            logger.info(
+                "DSpark aligned draft model gamma from checkpoint (%s) to runtime (%s).",
+                model_gamma,
+                self.gamma,
             )
 
     def _maybe_build_draft_sampler(self):

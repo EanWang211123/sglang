@@ -765,10 +765,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        if bs == 0:
+            return None
+        gamma = int(x_post_hc.shape[0] // bs)
+        if gamma < 1 or bs * gamma != int(x_post_hc.shape[0]):
+            raise ValueError(
+                "DSpark compute_confidence expected x_post_hc to pack "
+                f"{bs} request(s) with a uniform gamma, but got "
+                f"x_post_hc.shape[0]={int(x_post_hc.shape[0])}."
+            )
+        x_post_hc = x_post_hc.view(bs, gamma, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : gamma - 1]], dim=1
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
