@@ -864,15 +864,24 @@ class DeepseekV4AttnBackend(
         )
 
     def _ensure_verify_bs_buffers(self) -> None:
-        if hasattr(self, "extend_seq_lens_buffer"):
-            return
         num_reqs = self.req_to_token.shape[0]
-        self.extend_seq_lens_buffer = torch.full(
-            (num_reqs,),
-            self.speculative_num_draft_tokens,
-            **self.cuda_int32_kwargs,
+        need_alloc = not hasattr(self, "extend_seq_lens_buffer") or (
+            self.extend_seq_lens_buffer.is_inference()
         )
-        self.extend_start_loc_buffer = torch.zeros(num_reqs, **self.cuda_int32_kwargs)
+        if not need_alloc:
+            return
+        # FlashInfer autotune runs _dummy_run under inference_mode(), which would
+        # make these buffers inference tensors. CUDA graph capture later mutates
+        # them outside inference_mode, so allocate as normal tensors.
+        with torch.inference_mode(False):
+            self.extend_seq_lens_buffer = torch.full(
+                (num_reqs,),
+                self.speculative_num_draft_tokens,
+                **self.cuda_int32_kwargs,
+            )
+            self.extend_start_loc_buffer = torch.zeros(
+                num_reqs, **self.cuda_int32_kwargs
+            )
 
     def init_forward_metadata_target_verify(
         self,
