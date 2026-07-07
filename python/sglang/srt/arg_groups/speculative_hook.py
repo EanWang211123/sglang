@@ -441,14 +441,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     e,
                 )
             if config_gamma is not None and int(config_gamma) != int(gamma):
-                raise ValueError(
-                    "DSpark --speculative-dspark-block-size "
-                    f"(= {gamma}) does not match the draft checkpoint "
-                    f"dspark_block_size={config_gamma}. "
-                    f"SGLANG_RAGGED_VERIFY_MODE={ragged_verify_mode.value!r} "
-                    "requires the CLI block size to match the checkpoint; use "
-                    f"--speculative-dspark-block-size {config_gamma}, or unset "
-                    "the flag to inherit the checkpoint value."
+                logger.warning(
+                    "DSpark --speculative-dspark-block-size=%s overrides the draft "
+                    "checkpoint dspark_block_size=%s under "
+                    "SGLANG_RAGGED_VERIFY_MODE=%s; runtime gamma follows the CLI "
+                    "value. Refit STS/SPS artifacts for gamma=%s when using a "
+                    "non-checkpoint block size.",
+                    gamma,
+                    config_gamma,
+                    ragged_verify_mode.value,
+                    gamma,
                 )
 
         verify_window = int(gamma) + 1

@@ -443,6 +443,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model.gamma = int(self.gamma)
         if hasattr(self.draft_model, "block_size"):
             self.draft_model.block_size = int(self.gamma)
+        confidence_head = getattr(self.draft_model, "confidence_head", None)
+        if confidence_head is not None:
+            sts_temperatures = getattr(confidence_head, "sts_temperatures", None)
+            if (
+                sts_temperatures is not None
+                and sts_temperatures.ndim == 1
+                and sts_temperatures.numel() > 1
+                and sts_temperatures.numel() != self.gamma
+            ):
+                raise ValueError(
+                    "DSpark STS calibration temperatures were fit for gamma="
+                    f"{sts_temperatures.numel()} but runtime gamma is {self.gamma}; "
+                    "refit --speculative-dspark-confidence-sts-path for the overridden "
+                    "block size or omit the table."
+                )
         if self.tp_rank == 0:
             logger.info(
                 "DSpark aligned draft model gamma from checkpoint (%s) to runtime (%s).",
