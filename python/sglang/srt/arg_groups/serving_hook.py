@@ -457,6 +457,73 @@ def handle_other_validations(server_args: Any):
     ):
         raise ValueError("--default-chat-template-kwargs must decode to a JSON object")
 
+    if cfg.enable_slo_aware_prefill:
+        if cfg.slo_prefill_ttft_slo_ms is None:
+            raise ValueError(
+                "--slo-prefill-ttft-slo-ms is required when "
+                "--enable-slo-aware-prefill is set."
+            )
+        if cfg.slo_prefill_tpot_slo_ms is None:
+            raise ValueError(
+                "--slo-prefill-tpot-slo-ms is required when "
+                "--enable-slo-aware-prefill is set."
+            )
+        if cfg.slo_prefill_ttft_slo_ms <= 0:
+            raise ValueError("--slo-prefill-ttft-slo-ms must be positive.")
+        if cfg.slo_prefill_tpot_slo_ms <= 0:
+            raise ValueError("--slo-prefill-tpot-slo-ms must be positive.")
+        if cfg.slo_prefill_ttft_stat not in ("max", "mean", "p90"):
+            raise ValueError(
+                "--slo-prefill-ttft-stat must be one of max, mean, p90."
+            )
+        if cfg.slo_prefill_tpot_stat not in ("max", "mean", "p90"):
+            raise ValueError(
+                "--slo-prefill-tpot-stat must be one of max, mean, p90."
+            )
+        if (
+            cfg.slo_prefill_initial_prefill_cost_ms_per_1k is not None
+            and cfg.slo_prefill_initial_prefill_cost_ms_per_1k <= 0
+        ):
+            raise ValueError(
+                "--slo-prefill-initial-prefill-cost-ms-per-1k must be positive."
+            )
+        if (
+            cfg.slo_prefill_initial_decode_cost_ms is not None
+            and cfg.slo_prefill_initial_decode_cost_ms <= 0
+        ):
+            raise ValueError(
+                "--slo-prefill-initial-decode-cost-ms must be positive."
+            )
+        if cfg.slo_prefill_profile_decode_context_len <= 0:
+            raise ValueError(
+                "--slo-prefill-profile-decode-context-len must be positive."
+            )
+        if cfg.slo_prefill_profile_decode_context_lens is not None and any(
+            context_len <= 0
+            for context_len in cfg.slo_prefill_profile_decode_context_lens
+        ):
+            raise ValueError(
+                "--slo-prefill-profile-decode-context-lens values must be positive."
+            )
+        if cfg.slo_prefill_yield_guard_ratio < 0:
+            raise ValueError("--slo-prefill-yield-guard-ratio must be non-negative.")
+        if cfg.slo_prefill_cache_hit_io_cost_ratio < 0:
+            raise ValueError(
+                "--slo-prefill-cache-hit-io-cost-ratio must be non-negative."
+            )
+        if cfg.slo_prefill_profile_decode_batch_sizes is not None and any(
+            batch_size <= 0
+            for batch_size in cfg.slo_prefill_profile_decode_batch_sizes
+        ):
+            raise ValueError(
+                "--slo-prefill-profile-decode-batch-sizes values must be positive."
+            )
+        if (
+            cfg.slo_prefill_min_chunk_size is not None
+            and cfg.slo_prefill_min_chunk_size <= 0
+        ):
+            raise ValueError("--slo-prefill-min-chunk-size must be positive.")
+
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":
         if cfg.pp_size > 1:
