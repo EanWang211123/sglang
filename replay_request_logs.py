@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Replay captured NewAPI request logs against an Anthropic-compatible endpoint.
+"""Replay captured NewAPI request logs against a local/staging SGLang server.
 
 The two JSON files in the repo root are Elasticsearch/NewAPI log exports. This
-script extracts `request_body` and POSTs it to `/v1/messages` so you can try to
-reproduce garbled or incorrect model responses locally or on a staging server.
+script extracts `request_body` and POSTs it to the matching API endpoint:
+
+- Anthropic Messages API: `/v1/messages`
+- OpenAI Chat Completions API: `/v1/chat/completions`
 
 Examples:
-  # Replay both logs to a local SGLang server
+  # Replay both logs to a local SGLang server (auto-detect API per file)
   python replay_request_logs.py
 
-  # Replay one file to a custom endpoint (matches the original log path)
+  # Anthropic log with original ?beta=true
   python replay_request_logs.py \\
     --file 000031_20260718021118414349793Bq8xEpGG.json \\
-    --base-url http://127.0.0.1:30000 \\
     --beta
 
-  # Non-streaming replay (easier to inspect full JSON response)
-  python replay_request_logs.py --no-stream --file 20260717085444934755845QBsJUv9X.json
+  # OpenAI-format log (must NOT go to /v1/messages)
+  python replay_request_logs.py \\
+    --file 20260717085444934755845QBsJUv9X.json \\
+    --no-stream \\
+    --api-key test123qy2wQs
 """
 
 from __future__ import annotations
@@ -36,6 +40,8 @@ DEFAULT_FILES = [
     "20260717085444934755845QBsJUv9X.json",
 ]
 
+ApiFormat = str  # "anthropic-messages" | "openai-chat"
+
 
 def load_log(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
@@ -51,12 +57,40 @@ def extract_request_body(log: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-def build_url(base_url: str, beta: bool) -> str:
-    base = base_url.rstrip("/")
-    if not base.endswith("/v1/messages"):
-        base = f"{base}/v1/messages"
+def detect_api_format(body: dict[str, Any], log: dict[str, Any]) -> ApiFormat:
+    endpoint = str(log.get("llm_endpoint") or "")
+    if "/v1/chat/completions" in endpoint:
+        return "openai-chat"
+    if "/v1/messages" in endpoint:
+        return "anthropic-messages"
 
-    if not beta:
+    messages = body.get("messages") or []
+    roles = {m.get("role") for m in messages if isinstance(m, dict)}
+    if "tool" in roles:
+        return "openai-chat"
+    if any(isinstance(m, dict) and m.get("tool_calls") for m in messages):
+        return "openai-chat"
+    if any(isinstance(m, dict) and "reasoning_content" in m for m in messages):
+        return "openai-chat"
+
+    tools = body.get("tools") or []
+    if tools and isinstance(tools[0], dict) and tools[0].get("type") == "function":
+        return "openai-chat"
+
+    return "anthropic-messages"
+
+
+def build_url(base_url: str, api_format: ApiFormat, beta: bool) -> str:
+    base = base_url.rstrip("/")
+    suffix = (
+        "/v1/chat/completions"
+        if api_format == "openai-chat"
+        else "/v1/messages"
+    )
+    if not (base.endswith("/v1/messages") or base.endswith("/v1/chat/completions")):
+        base = f"{base}{suffix}"
+
+    if not beta or api_format != "anthropic-messages":
         return base
 
     parsed = urlparse(base)
@@ -67,12 +101,46 @@ def build_url(base_url: str, beta: bool) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-def build_headers(api_key: str | None, extra_headers: list[str]) -> dict[str, str]:
+def sanitize_openai_content(content: Any) -> Any:
+    if isinstance(content, list):
+        cleaned: list[Any] = []
+        for block in content:
+            if isinstance(block, dict):
+                block = {k: v for k, v in block.items() if k != "cache_control"}
+            cleaned.append(block)
+        return cleaned
+    return content
+
+
+def prepare_request_body(body: dict[str, Any], api_format: ApiFormat) -> dict[str, Any]:
+    if api_format != "openai-chat":
+        return body
+
+    prepared = dict(body)
+    messages: list[Any] = []
+    for msg in prepared.get("messages") or []:
+        if not isinstance(msg, dict):
+            messages.append(msg)
+            continue
+        cleaned = dict(msg)
+        if "content" in cleaned:
+            cleaned["content"] = sanitize_openai_content(cleaned.get("content"))
+        messages.append(cleaned)
+    prepared["messages"] = messages
+    return prepared
+
+
+def build_headers(
+    api_key: str | None,
+    extra_headers: list[str],
+    api_format: ApiFormat,
+) -> dict[str, str]:
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream, application/json",
-        "anthropic-version": "2023-06-01",
     }
+    if api_format == "anthropic-messages":
+        headers["anthropic-version"] = "2023-06-01"
     if api_key:
         headers["x-api-key"] = api_key
         headers["Authorization"] = f"Bearer {api_key}"
@@ -103,14 +171,17 @@ def apply_overrides(
     return patched
 
 
-def summarize_request_body(body: dict[str, Any]) -> str:
+def summarize_request_body(body: dict[str, Any], api_format: ApiFormat) -> str:
     messages = body.get("messages") or []
     tools = body.get("tools") or []
+    roles = sorted({m.get("role") for m in messages if isinstance(m, dict) and m.get("role")})
     parts = [
+        f"api={api_format}",
         f"model={body.get('model')!r}",
         f"max_tokens={body.get('max_tokens')}",
         f"stream={body.get('stream')}",
         f"messages={len(messages)}",
+        f"roles={roles}",
     ]
     if tools:
         parts.append(f"tools={len(tools)}")
@@ -161,15 +232,18 @@ def replay_one(
     timeout: float,
     output_dir: Path,
     extra_headers: list[str],
+    api_override: str | None,
     dry_run: bool,
 ) -> int:
     log = load_log(log_path)
     body = extract_request_body(log)
     body = apply_overrides(body, stream=stream_override, model=model_override)
+    api_format = api_override or detect_api_format(body, log)
+    body = prepare_request_body(body, api_format)
     stream = bool(body.get("stream", False))
 
-    url = build_url(base_url, beta)
-    headers = build_headers(api_key, extra_headers)
+    url = build_url(base_url, api_format, beta)
+    headers = build_headers(api_key, extra_headers, api_format)
 
     print("=" * 72)
     print(f"file: {log_path.name}")
@@ -177,8 +251,9 @@ def replay_one(
         print(f"original endpoint: {log.get('llm_endpoint')}")
     if "prompt_tokens" in log:
         print(f"original prompt_tokens: {log.get('prompt_tokens')}")
+    print(f"detected api: {api_format}")
     print(f"target url: {url}")
-    print(f"request: {summarize_request_body(body)}")
+    print(f"request: {summarize_request_body(body, api_format)}")
 
     suffix = "sse.txt" if stream else "json"
     output_path = output_dir / f"{log_path.stem}.response.{suffix}"
@@ -214,7 +289,7 @@ def replay_one(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay captured NewAPI request logs to /v1/messages."
+        description="Replay captured NewAPI request logs to SGLang."
     )
     parser.add_argument(
         "--file",
@@ -225,7 +300,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--base-url",
         default="http://127.0.0.1:30000",
-        help="Server base URL or full /v1/messages URL. Default: http://127.0.0.1:30000",
+        help="Server base URL. Default: http://127.0.0.1:30000",
+    )
+    parser.add_argument(
+        "--api",
+        choices=("auto", "anthropic-messages", "openai-chat"),
+        default="auto",
+        help="Target API. Default: auto-detect from request_body.",
     )
     parser.add_argument(
         "--api-key",
@@ -319,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             output_dir=output_dir,
             extra_headers=args.header,
+            api_override=None if args.api == "auto" else args.api,
             dry_run=args.dry_run,
         )
         exit_code = max(exit_code, code)
