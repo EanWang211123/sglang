@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.decode_batch_sync_timer import DecodeBatchSyncTimer
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -561,10 +562,29 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
+            decode_timer: Optional[DecodeBatchSyncTimer] = None
+            if (
+                batch is not None
+                and not is_verify
+                and not self.is_draft_worker
+                and batch.forward_mode.is_decode()
+            ):
+                decode_timer = DecodeBatchSyncTimer(
+                    label="baseline",
+                    device=self.device,
+                    tp_rank=self.ps.tp_rank,
+                    bs=len(batch.reqs),
+                )
+                decode_timer.on_batch_start()
+
+            if decode_timer is not None:
+                decode_timer.phase_start()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if decode_timer is not None:
+                decode_timer.phase_end("forward")
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -591,13 +611,19 @@ class TpModelWorker(BaseTpWorker):
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
+                if decode_timer is not None:
+                    decode_timer.on_batch_end()
                 return batch_result
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                if decode_timer is not None:
+                    decode_timer.phase_start()
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                if decode_timer is not None:
+                    decode_timer.phase_end("sample")
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -615,6 +641,8 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, forward_batch
                     )
 
+            if decode_timer is not None:
+                decode_timer.on_batch_end()
             return batch_result
         else:
             out = self.model_runner.forward(

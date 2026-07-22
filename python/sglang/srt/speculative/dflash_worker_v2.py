@@ -29,7 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_decode_batch_timer import DFlashDecodeBatchTimer
+from sglang.srt.managers.decode_batch_sync_timer import DecodeBatchSyncTimer
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -1472,8 +1472,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
 
-        decode_timer = DFlashDecodeBatchTimer(
-            device=device, tp_rank=self.ps.tp_rank, bs=bs
+        decode_timer = DecodeBatchSyncTimer(
+            label="DFLASH", device=device, tp_rank=self.ps.tp_rank, bs=bs
         )
         decode_timer.on_batch_start()
         decode_timer.phase_start()
