@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_decode_batch_timer import DFlashDecodeBatchTimer
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -1471,6 +1472,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
 
+        decode_timer = DFlashDecodeBatchTimer(
+            device=device, tp_rank=self.ps.tp_rank, bs=bs
+        )
+        decode_timer.on_batch_start()
+        decode_timer.phase_start()
+
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -1633,6 +1640,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        decode_timer.phase_end("draft")
+        decode_timer.phase_start()
+
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -1783,6 +1793,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(new_seq_lens)
 
+        decode_timer.phase_end("verify")
+        decode_timer.phase_start()
+
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -1806,6 +1819,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+
+        decode_timer.phase_end("draft_extend")
+        decode_timer.on_batch_end()
 
         return GenerationBatchResult(
             logits_output=logits_output,
