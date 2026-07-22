@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -20,10 +20,17 @@ def decode_batch_sync_timing_enabled() -> bool:
     )
 
 
-def _sync_device(device: torch.device) -> None:
-    if device.type == "cpu":
+def _normalize_device(device: Union[str, torch.device]) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
+
+def _sync_device(device: Union[str, torch.device]) -> None:
+    dev = _normalize_device(device)
+    if dev.type == "cpu":
         return
-    torch.get_device_module(device).synchronize()
+    torch.get_device_module(dev).synchronize()
 
 
 class DecodeBatchSyncTimer:
@@ -44,12 +51,12 @@ class DecodeBatchSyncTimer:
         self,
         *,
         label: str,
-        device: torch.device,
+        device: Union[str, torch.device],
         tp_rank: int,
         bs: int,
     ) -> None:
         self._label = label
-        self._device = device
+        self._device = _normalize_device(device)
         self._tp_rank = int(tp_rank)
         self._bs = int(bs)
         self._enabled = decode_batch_sync_timing_enabled() and self._tp_rank == 0
