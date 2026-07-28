@@ -47,7 +47,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    commit_mamba_states_after_verify,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -1250,6 +1253,38 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._need_mamba_verify_commit:
             return
+
+        bs = int(commit_lens.shape[0])
+        block_size = int(self.block_size)
+        req_pool = self.target_worker.model_runner.req_to_token_pool
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        use_replayssm_commit = (
+            mamba_pool is not None
+            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        )
+        if use_replayssm_commit:
+            offsets = torch.arange(
+                0,
+                bs * block_size,
+                step=block_size,
+                dtype=torch.int32,
+                device=commit_lens.device,
+            )
+            accept_index = offsets[:, None] + torch.arange(
+                block_size,
+                dtype=torch.int32,
+                device=commit_lens.device,
+            )
+            commit_mamba_states_after_verify(
+                target_worker=self.target_worker,
+                batch=batch,
+                accept_lens=commit_lens,
+                accept_index=accept_index,
+                draft_token_num=block_size,
+            )
+            return
+
         attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
