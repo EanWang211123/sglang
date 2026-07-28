@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
+    MambaPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
@@ -1709,6 +1710,99 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+
+        # ReplaySSM spec-verify has a materially different allocation from the
+        # legacy speculative Mamba path: it has a per-slot ring and conv-window
+        # rollback buffer, but intentionally has no per-draft full SSM snapshot.
+        # The legacy accounting below charges ``D * mamba_cache_per_req`` and can
+        # leave multiple GB unassigned to the KV pool. Keep this calculation in
+        # sync with MambaPool's physical allocator.
+        use_gdn_replayssm_spec = (
+            has_spec_dec
+            and self.server_args.enable_gdn_replayssm_spec
+            and self.hybrid_gdn_config is not None
+            and not self.is_draft_worker
+        )
+        if use_gdn_replayssm_spec:
+            cache_params = config.mamba2_cache_params
+            num_mamba_layers = sum(
+                self.layer_info.start_layer <= layer_id < self.layer_info.end_layer
+                for layer_id in cache_params.layers
+            )
+            draft_tokens = int(
+                server_args.max_speculative_num_draft_tokens
+                or server_args.speculative_num_draft_tokens
+            )
+
+            def replay_bytes_for_slots(mamba_slots: int, spec_slots: int) -> int:
+                return MambaPool.estimate_gdn_replayssm_spec_bytes(
+                    cache_params=cache_params,
+                    num_mamba_layers=num_mamba_layers,
+                    mamba_slots=mamba_slots,
+                    spec_slots=spec_slots,
+                    speculative_num_draft_tokens=draft_tokens,
+                    linear_replayssm_cache_len=server_args.linear_replayssm_cache_len,
+                    speculative_eagle_topk=server_args.speculative_eagle_topk,
+                )
+
+            if server_args.max_mamba_cache_size is not None:
+                server_args.override(
+                    "mamba_pool.per_dp_shard",
+                    max_mamba_cache_size=server_args.max_mamba_cache_size
+                    // self.ps.attn_dp_size,
+                )
+            elif (
+                server_args.disable_radix_cache
+                and server_args.max_running_requests is not None
+            ):
+                server_args.override(
+                    "mamba_pool.from_max_running_requests",
+                    max_mamba_cache_size=server_args.max_running_requests
+                    // self.ps.attn_dp_size,
+                )
+            else:
+                ratio = self._calculate_mamba_ratio()
+                budget_bytes = int(
+                    total_rest_memory
+                    * server_args.mamba_full_memory_ratio
+                    / (1 + server_args.mamba_full_memory_ratio)
+                    * (1 << 30)
+                )
+                max_reqs = server_args.max_running_requests // self.ps.attn_dp_size
+                # The cost is monotonic but piecewise because spec slots are
+                # min(max_reqs, K // ratio). Binary search avoids preserving the
+                # legacy closed form, which assumes full SSM snapshots.
+                # One Mamba slot's persistent state + ring is the lower bound
+                # on the marginal cost of K. Do not use mamba_cache_per_req
+                # here: for PP it can describe more layers than this stage.
+                per_slot_floor = replay_bytes_for_slots(1, 0)
+                lo, hi = 0, max(1, budget_bytes // max(1, per_slot_floor))
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    spec_slots = min(max_reqs, mid // ratio) + 1
+                    if replay_bytes_for_slots(mid + 1, spec_slots) <= budget_bytes:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                server_args.override(
+                    "mamba_pool.memory_budget_replayssm", max_mamba_cache_size=lo
+                )
+
+            if server_args.max_mamba_cache_size <= 0:
+                raise RuntimeError(
+                    "Not enough GPU memory for GDN ReplaySSM state cache. "
+                    f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size}."
+                )
+
+            ratio = self._calculate_mamba_ratio()
+            capped_reqs = min(
+                server_args.max_running_requests // self.ps.attn_dp_size,
+                server_args.max_mamba_cache_size // ratio,
+            )
+            actual_bytes = replay_bytes_for_slots(
+                server_args.max_mamba_cache_size + 1, capped_reqs + 1
+            )
+            return total_rest_memory - actual_bytes / (1 << 30)
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size

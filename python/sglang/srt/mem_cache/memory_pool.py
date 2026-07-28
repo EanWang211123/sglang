@@ -326,6 +326,85 @@ class MambaPool:
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
     conv_window_axis = -1
 
+    @staticmethod
+    def estimate_gdn_replayssm_spec_bytes(
+        *,
+        cache_params: BaseLinearStateParams,
+        num_mamba_layers: int,
+        mamba_slots: int,
+        spec_slots: int,
+        speculative_num_draft_tokens: int,
+        linear_replayssm_cache_len: int,
+        speculative_eagle_topk: Optional[int],
+    ) -> int:
+        """Return the physical bytes allocated by the GDN ReplaySSM spec pool.
+
+        This mirrors the CUDA linear-chain allocation in ``__init__``.  Keeping
+        the estimator beside the allocator is important: the KV-capacity planner
+        must not charge the legacy ``intermediate_ssm`` snapshots when this path
+        deliberately omits them.
+        """
+        shape = cache_params.shape
+        conv_itemsize = cache_params.dtype.conv.itemsize
+        temporal_itemsize = cache_params.dtype.temporal.itemsize
+
+        conv_per_layer = sum(math.prod(conv_shape) for conv_shape in shape.conv)
+        temporal_per_layer = math.prod(shape.temporal)
+        main_state_bytes = num_mamba_layers * mamba_slots * (
+            conv_per_layer * conv_itemsize + temporal_per_layer * temporal_itemsize
+        )
+
+        hv, v_dim, k_dim = shape.temporal
+        h_k = getattr(shape, "num_k_heads_per_tp", hv)
+        ring_len = linear_replayssm_cache_len
+        # d/rawv, k/rawk use the activation dtype. g/beta are fp32 scalars
+        # for GDN (KDA is excluded by the ReplaySSM spec-verify gate).
+        ring_per_layer_slot = ring_len * (
+            2 * hv * v_dim * conv_itemsize
+            + 2 * h_k * k_dim * conv_itemsize
+            + 2 * hv * torch.empty((), dtype=torch.float32).element_size()
+        )
+        ring_bytes = num_mamba_layers * mamba_slots * ring_per_layer_slot
+        # write_pos, cache_base, is_flush are per slot, shared by all layers.
+        cursor_bytes = mamba_slots * (
+            torch.empty((), dtype=torch.int32).element_size() * 2
+            + torch.empty((), dtype=torch.int8).element_size()
+        )
+
+        dedup_conv_window = (
+            not shape.disable_conv_window_dedup
+            and conv_window_dedup_enabled(
+                False, False, speculative_eagle_topk, cache_params.is_kda
+            )
+        )
+        conv_intermediate_per_layer_slot = 0
+        for conv_shape in shape.conv:
+            if dedup_conv_window:
+                win_len = shape.conv_kernel - 1
+                if conv_shape[-1] == win_len:
+                    axis = len(conv_shape) - 1
+                elif conv_shape[0] == win_len:
+                    axis = 0
+                else:
+                    raise ValueError(
+                        f"conv_state shape {conv_shape} has no conv window axis"
+                    )
+                physical_shape = list(conv_shape)
+                physical_shape[axis] = speculative_num_draft_tokens + win_len - 1
+                conv_intermediate_per_layer_slot += math.prod(physical_shape)
+            else:
+                conv_intermediate_per_layer_slot += (
+                    speculative_num_draft_tokens * math.prod(conv_shape)
+                )
+        conv_intermediate_bytes = (
+            num_mamba_layers
+            * spec_slots
+            * conv_intermediate_per_layer_slot
+            * conv_itemsize
+        )
+
+        return main_state_bytes + ring_bytes + cursor_bytes + conv_intermediate_bytes
+
     @dataclass(frozen=True, kw_only=True)
     class State:
         conv: List[torch.Tensor]
