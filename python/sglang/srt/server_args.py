@@ -1824,6 +1824,16 @@ class ServerArgs:
         "constant-SPS table: the budget degenerates to verify-all (zero throughput "
         "gain by itself).",
     ] = None
+    speculative_dspark_cuda_graph_capture_config: A[
+        Optional[str],
+        "DSPARK compact ragged-verify only. Path to a batch-size-aware JSON config "
+        "that selects CUDA graph token tiers. It uses the adaptive speculative "
+        'decoding schema, for example {"4": {"candidate_steps": [2,4,5,6]}}. '
+        "Each candidate is the DSpark gamma/block size, so the per-request verify "
+        "query length is candidate + 1 and batch_size * (candidate + 1) produces "
+        "a token-keyed graph tier. Duplicate tiers are captured once. Omit to "
+        "retain the default decode.bs * verify-window tiers.",
+    ] = None
     speculative_dspark_confidence_sts_path: A[
         Optional[str],
         "DSPARK only. Optional path to a per-position STS (sequential temperature "
