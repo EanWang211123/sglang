@@ -166,6 +166,9 @@ class DSparkVerifyPlanner:
                 cfg=self._schedule_cfg,
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
+                use_graph_tier_candidates=(
+                    self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+                ),
             )
             self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
@@ -990,6 +993,7 @@ def compute_verify_token_budget(
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
+    candidate_batch_tokens: Optional[list[int]] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -998,28 +1002,47 @@ def compute_verify_token_budget(
     candidates = candidates[candidates >= cfg.survival_eps].to(torch.float64)
     candidates_sorted = torch.sort(candidates, descending=True).values
     prefix_sum = torch.cumsum(candidates_sorted, dim=0)
-
     tau_star = num_requests + torch.cat(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
+
+    candidate_budgets = torch.arange(tau_star.numel(), dtype=torch.int64)
+    if candidate_batch_tokens is not None:
+        # In compact mode, only budgets that land on a captured token-keyed
+        # graph have a distinct execution cost.
+        graph_budgets = sorted(
+            {
+                tier - num_requests
+                for tier in candidate_batch_tokens
+                if num_requests
+                <= tier
+                <= num_requests * max_len
+                and tier - num_requests < tau_star.numel()
+            }
+        )
+        if graph_budgets:
+            candidate_budgets = torch.tensor(graph_budgets, dtype=torch.int64)
+
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
             num_budgets=int(tau_star.numel()),
+            budgets=candidate_budgets,
         )
-        theta = tau_star / step_time
+        theta = tau_star[candidate_budgets] / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
-        batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
-        sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
-        theta = tau_star * sps
+        sps = _lookup_sps_tensor(
+            sps_table=sps_table, batch_tokens=num_requests + candidate_budgets
+        )
+        theta = tau_star[candidate_budgets] * sps
         idx = int(torch.argmax(theta))
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
-        budget=idx,
+        budget=int(candidate_budgets[idx]),
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
     )
@@ -1036,14 +1059,20 @@ def _lookup_sps_tensor(
 
 
 def _additive_step_time_tensor(
-    *, table: SpsAdditiveCostTable, num_requests: int, num_budgets: int
+    *,
+    table: SpsAdditiveCostTable,
+    num_requests: int,
+    num_budgets: int,
+    budgets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
     m_probes = torch.tensor(table.m_probes, dtype=torch.float64)
     theta_vals = torch.tensor(table.theta_seconds, dtype=torch.float64)
-    m = (num_requests + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
+    if budgets is None:
+        budgets = torch.arange(num_budgets, dtype=torch.float64)
+    m = (num_requests + budgets.to(torch.float64)).clamp_(
         min=float(table.m_probes[0]), max=float(table.m_probes[-1])
     )
     hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
@@ -1063,11 +1092,13 @@ class HostConfidenceBudgetPlanner:
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,
+        use_graph_tier_candidates: bool = False,
     ) -> None:
         cfg.validate()
         self.sps_table = sps_table
         self.cfg = cfg
         self._model_runner = model_runner
+        self._use_graph_tier_candidates = use_graph_tier_candidates
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
@@ -1102,10 +1133,16 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
+        candidate_batch_tokens = (
+            ragged_capture_num_tokens(model_runner=self._model_runner)
+            if self._use_graph_tier_candidates
+            else None
+        )
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
+            candidate_batch_tokens=candidate_batch_tokens,
         )
         self.last_decision = decision
         return decision.budget
