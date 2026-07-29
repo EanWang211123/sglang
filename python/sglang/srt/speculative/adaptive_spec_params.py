@@ -87,13 +87,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def _load_adaptive_config(
+def load_batch_size_aware_config(
     cfg_path: str | None,
 ) -> tuple[dict, dict[int, dict]]:
-    """Load and validate adaptive config.
-
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
-    """
+    """Load the integer-BS-keyed ``candidate_steps`` JSON schema."""
     if cfg_path is not None:
         with open(cfg_path) as f:
             cfg = json.load(f)
@@ -130,7 +127,7 @@ def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
 ) -> list[int]:
     """Union of every BS slot's candidate steps; sizes the runtime buffers."""
-    _, bs_entries = _load_adaptive_config(cfg_path)
+    _, bs_entries = load_batch_size_aware_config(cfg_path)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
@@ -270,7 +267,7 @@ class AdaptiveSpeculativeParams:
         initial_steps: int,
         cfg_path: str | None = None,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        cfg, bs_entries = load_batch_size_aware_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
