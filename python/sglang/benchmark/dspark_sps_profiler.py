@@ -11,6 +11,7 @@ import logging
 import math
 import random
 import statistics
+import sys
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 def _load_module_by_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -38,6 +40,8 @@ try:
     )
     from sglang.benchmark.utils import get_tokenizer
     from sglang.srt.speculative.dspark_components.dspark_sps import (
+        Sps2DCostRow,
+        Sps2DCostTable,
         SpsAdditiveCostTable,
         load_sps_table_from_path,
         profile_sps_table,
@@ -53,6 +57,8 @@ except ImportError as exc:
         "dspark_sps",
         _benchmark_dir.parent / "srt/speculative/dspark_components/dspark_sps.py",
     )
+    Sps2DCostRow = _table_module.Sps2DCostRow
+    Sps2DCostTable = _table_module.Sps2DCostTable
     SpsAdditiveCostTable = _table_module.SpsAdditiveCostTable
     load_sps_table_from_path = _table_module.load_sps_table_from_path
     profile_sps_table = _table_module.profile_sps_table
@@ -295,6 +301,7 @@ def fit_profile(
     max_batch_tokens: Optional[int],
     self_check: bool,
     plot: bool,
+    direct_2d_table: bool = False,
 ) -> None:
     paths = out_paths(out=out)
     if not paths["rounds"].exists():
@@ -307,12 +314,26 @@ def fit_profile(
     if not summaries:
         raise RuntimeError(f"{paths['rounds']} has no rounds to fit.")
     offdiag = any(summary.get("frac") is not None for summary in summaries)
+    if direct_2d_table and not offdiag:
+        raise ValueError(
+            "--direct-2d-table requires rounds collected with --fracs."
+        )
 
     table = build_table_from_summaries(
-        summaries=summaries, max_batch_tokens=max_batch_tokens, offdiag=offdiag
+        summaries=summaries,
+        max_batch_tokens=max_batch_tokens,
+        offdiag=offdiag,
+        direct_2d_table=direct_2d_table,
     )
     paths["table"].write_text(table.to_json(), encoding="utf-8")
-    if offdiag:
+    if isinstance(table, Sps2DCostTable):
+        logger.info(
+            "Built Sps2DCostTable (%s batch-size rows, %s total cells) -> %s",
+            len(table.rows),
+            sum(len(row.batch_tokens) for row in table.rows),
+            paths["table"],
+        )
+    elif isinstance(table, SpsAdditiveCostTable):
         logger.info(
             "Fit SpsAdditiveCostTable (%s bs probes x %s M probes) -> %s",
             len(table.bs_probes),
@@ -349,7 +370,10 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
+    direct_2d_table: bool = False,
 ) -> None:
+    if direct_2d_table and fracs is None:
+        raise ValueError("--direct-2d-table requires --fracs.")
     run_profile(
         base_url=base_url,
         batch_sizes=batch_sizes,
@@ -364,6 +388,7 @@ def profile_all(
         max_batch_tokens=max_batch_tokens,
         self_check=self_check,
         plot=plot,
+        direct_2d_table=direct_2d_table,
     )
 
 
@@ -388,12 +413,17 @@ def summaries_to_cells(*, summaries: list[dict]) -> list[dict]:
 
 
 def build_table_from_summaries(
-    *, summaries: list[dict], max_batch_tokens: Optional[int], offdiag: bool
+    *,
+    summaries: list[dict],
+    max_batch_tokens: Optional[int],
+    offdiag: bool,
+    direct_2d_table: bool = False,
 ):
     if offdiag:
-        return build_additive_table_from_cells(
-            cells=summaries_to_cells(summaries=summaries)
-        )
+        cells = summaries_to_cells(summaries=summaries)
+        if direct_2d_table:
+            return build_2d_table_from_cells(cells=cells)
+        return build_additive_table_from_cells(cells=cells)
 
     by_batch_tokens: dict[int, list[float]] = {}
     for summary in summaries:
@@ -1010,6 +1040,8 @@ def postprocess_round(
 
 
 def fitted_step_time(*, table, bs: int, m: int) -> float:
+    if isinstance(table, Sps2DCostTable):
+        return table.step_time(num_reqs=bs, batch_tokens=m)
     if isinstance(table, SpsAdditiveCostTable):
         return table.step_time(num_reqs=bs, budget=max(0, m - bs))
     return 1.0 / table.lookup(m)
@@ -1125,7 +1157,7 @@ def plot_fit(*, cells: list[dict], table, plot_path: Path) -> None:
     )
     fig.update_yaxes(title_text="T = step time (ms)", rangemode="tozero", row=1, col=3)
     fig.update_layout(
-        title="DSpark SPS profiler: raw cells vs additive fit",
+        title="DSpark SPS profiler: raw cells vs cost-table lookup",
         legend_title="batch size",
         template="plotly_white",
         width=1700,
@@ -1157,6 +1189,40 @@ def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTabl
         alpha_seconds=[alpha[b] for b in bs_probes],
         m_probes=m_probes,
         theta_seconds=[theta[m] for m in m_probes],
+    )
+
+
+def build_2d_table_from_cells(*, cells: list[dict]) -> Sps2DCostTable:
+    if not cells:
+        raise RuntimeError("2D cost table needs at least one profiled cell.")
+
+    samples: dict[tuple[int, int], list[float]] = {}
+    for cell in cells:
+        bs = int(cell["bs"])
+        batch_tokens = int(cell["M"])
+        step_time = float(cell["T"])
+        if bs < 1 or batch_tokens < bs or step_time <= 0:
+            raise RuntimeError(
+                "Invalid 2D cost cell: expected bs >= 1, M >= bs, T > 0, got "
+                f"bs={bs}, M={batch_tokens}, T={step_time}."
+            )
+        samples.setdefault((bs, batch_tokens), []).append(step_time)
+
+    by_bs: dict[int, list[tuple[int, float]]] = {}
+    for (bs, batch_tokens), values in sorted(samples.items()):
+        by_bs.setdefault(bs, []).append(
+            (batch_tokens, statistics.median(values))
+        )
+
+    return Sps2DCostTable(
+        rows=[
+            Sps2DCostRow(
+                batch_size=bs,
+                batch_tokens=[batch_tokens for batch_tokens, _ in probes],
+                step_seconds=[step_time for _, step_time in probes],
+            )
+            for bs, probes in sorted(by_bs.items())
+        ]
     )
 
 
@@ -1297,7 +1363,14 @@ def write_manifest(
 def run_self_check(*, out_path: Path, offdiag: bool) -> None:
     table = load_sps_table_from_path(str(out_path))
     if offdiag:
-        run_additive_self_check(table=table)
+        if isinstance(table, Sps2DCostTable):
+            run_2d_self_check(table=table)
+        elif isinstance(table, SpsAdditiveCostTable):
+            run_additive_self_check(table=table)
+        else:
+            raise RuntimeError(
+                f"Off-diagonal self-check expected a 2D table, got {type(table)}."
+            )
         return
     if len(table.sample_batch_tokens) != len(table.sample_steps_per_sec):
         raise RuntimeError("Reloaded table has mismatched probe / SPS lengths.")
@@ -1351,6 +1424,26 @@ def run_additive_self_check(*, table: SpsAdditiveCostTable) -> None:
     )
 
 
+def run_2d_self_check(*, table: Sps2DCostTable) -> None:
+    for row in table.rows:
+        for batch_tokens, expected in zip(row.batch_tokens, row.step_seconds):
+            actual = table.step_time(
+                num_reqs=row.batch_size, batch_tokens=batch_tokens
+            )
+            if actual != expected or actual <= 0:
+                raise RuntimeError(
+                    "Reloaded 2D table lookup mismatch at "
+                    f"(bs={row.batch_size}, M={batch_tokens}): "
+                    f"{actual} != {expected}."
+                )
+    logger.info(
+        "Self-check passed: reloaded 2D table (%s batch-size rows, %s cells), "
+        "all exact lookups positive.",
+        len(table.rows),
+        sum(len(row.batch_tokens) for row in table.rows),
+    )
+
+
 def add_out_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--out",
@@ -1384,9 +1477,10 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Off-diagonal K-fraction sweep in (0, 1]. When given, the server "
         "must run SGLANG_RAGGED_VERIFY_MODE=compact and each (bs, frac) cell "
-        "pins dspark_force_budget_frac to profile T(bs, M); the fit is a 2D "
-        "SpsAdditiveCostTable. When omitted, the diagonal static sweep runs and "
-        "the fit is a 1D SpsCostTable.",
+        "pins dspark_force_budget_frac to profile T(bs, M). By default the fit "
+        "is the legacy SpsAdditiveCostTable; add --direct-2d-table to write a "
+        "direct Sps2DCostTable. When omitted, the diagonal static sweep runs "
+        "and the fit is a 1D SpsCostTable.",
     )
     parser.add_argument(
         "--batch-size",
@@ -1470,6 +1564,12 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_fit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--direct-2d-table",
+        action="store_true",
+        help="With off-diagonal --fracs data, write a direct T(bs, M) "
+        "Sps2DCostTable instead of the legacy additive regression table.",
+    )
     parser.add_argument(
         "--max-batch-tokens",
         type=int,
@@ -1557,6 +1657,7 @@ def cli_main() -> None:
             max_batch_tokens=args.max_batch_tokens,
             self_check=args.self_check,
             plot=args.plot,
+            direct_2d_table=args.direct_2d_table,
         )
     else:
         profile_all(
@@ -1570,6 +1671,7 @@ def cli_main() -> None:
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
             plot=args.plot,
+            direct_2d_table=args.direct_2d_table,
         )
 
 

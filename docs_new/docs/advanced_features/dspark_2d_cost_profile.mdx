@@ -1,0 +1,257 @@
+---
+title: "DSpark Direct 2D Cost Profiling"
+metatags:
+    description: "Profile and use a direct DSpark step-time table indexed by per-rank batch size and total verify tokens."
+---
+
+DSpark adaptive verification can use a direct two-dimensional cost table:
+
+```text
+(batch_size_per_rank, total_verify_tokens) -> step_time_seconds
+```
+
+This avoids estimating step time from total verify tokens alone or decomposing
+the cost into additive regression terms.
+
+## Cost table formats
+
+DSpark recognizes three JSON cost-table formats automatically:
+
+| Table | JSON discriminator | Runtime cost model |
+| --- | --- | --- |
+| `SpsCostTable` | `sample_batch_tokens` | One-dimensional floor lookup from total verify tokens to steps/second |
+| `SpsAdditiveCostTable` | `bias_seconds` | Additive regression over batch size and total verify tokens |
+| `Sps2DCostTable` | `rows` | Direct `(batch size, total verify tokens)` step-time lookup |
+
+An example direct 2D table is:
+
+```json
+{
+  "rows": [
+    {
+      "batch_size": 4,
+      "batch_tokens": [8, 16, 24, 32, 40],
+      "step_seconds": [0.0011, 0.0014, 0.0018, 0.0023, 0.0029]
+    },
+    {
+      "batch_size": 8,
+      "batch_tokens": [16, 32, 48, 64, 80],
+      "step_seconds": [0.0016, 0.0021, 0.0028, 0.0036, 0.0045]
+    }
+  ]
+}
+```
+
+All batch sizes in this document are per DP rank.
+
+## Lookup behavior
+
+For a runtime batch size `bs` and candidate verify budget `b`, DSpark queries:
+
+```text
+M = bs + b
+T = cost_table.step_time(bs, M)
+```
+
+The direct table applies the following rules:
+
+1. Use the exact batch-size row when it exists.
+2. Otherwise, use the numerically nearest batch-size row. A tie selects the
+   smaller batch size.
+3. Within the selected row, return an exact total-token probe when available.
+4. Otherwise, linearly interpolate between the neighboring total-token probes.
+5. Clamp values below or above the row's probe range to its first or last
+   measurement.
+
+The adaptive objective is:
+
+```text
+predicted_throughput(b) = expected_output_tokens(b) / T(bs, bs + b)
+```
+
+DSpark selects the candidate budget with the highest predicted throughput.
+
+## CUDA Graph capture configuration
+
+`candidate_steps` is the number of additional draft steps. The target query
+length includes one anchor token:
+
+```text
+query_length = candidate_step + 1
+total_verify_tokens = batch_size * query_length
+```
+
+For a DSpark block size (`gamma`) of 9, the following configuration captures
+2, 4, 6, 8, and 10 verify tokens per request for batch sizes below 48. Batch
+sizes starting at 48 use only 8 verify tokens per request.
+
+```json
+{
+  "1": {
+    "candidate_steps": [1, 3, 5, 7, 9]
+  },
+  "48": {
+    "candidate_steps": [7]
+  }
+}
+```
+
+The integer keys are lower bounds. DSpark selects the largest configured key
+that is no greater than the current batch size:
+
+```text
+batch sizes 1..47 -> slot "1"
+batch sizes 48+   -> slot "48"
+```
+
+For example, batch size 8 uses:
+
+```text
+candidate_steps       = [1, 3, 5, 7, 9]
+query_lengths         = [2, 4, 6, 8, 10]
+total_verify_tokens   = [16, 32, 48, 64, 80]
+```
+
+When a direct 2D table and a graph capture config are both present, compact
+DSpark derives runtime candidates only from the selected batch-size slot. Each
+configured total is mapped to the actual captured token graph tier. Without a
+capture config, DSpark retains the previous behavior and considers the global
+captured-token tier list.
+
+This batch-size-aware candidate restriction applies only to
+`Sps2DCostTable`; the legacy one-dimensional and additive tables retain their
+existing candidate-selection behavior.
+
+## Start a profiling server
+
+The profiling server must use compact verification, enable SPS records, and
+load the same graph capture configuration that will be used in production.
+
+```bash
+export SGLANG_RAGGED_VERIFY_MODE=compact
+export SGLANG_DSPARK_ENABLE_SPS_RECORD=1
+
+python -m sglang.launch_server \
+  --model <target-model> \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path <draft-model> \
+  --speculative-dspark-block-size 9 \
+  --speculative-dspark-cuda-graph-capture-config ../dynamic_capture.json \
+  <other-server-options>
+```
+
+Keep model, TP/DP topology, attention backend, CUDA Graph configuration, and
+`--speculative-dspark-align-verify-tokens-to-graph-tier` consistent between
+profiling and production.
+
+## Generate a direct 2D table
+
+For `gamma = 9`, the full additional budget is 9 tokens per request. To profile
+additional per-request budgets 1, 3, 5, 7, and 9, use:
+
+```text
+fracs = [1/9, 3/9, 5/9, 7/9, 9/9]
+```
+
+Run collection and fitting together:
+
+```bash
+python -m sglang.benchmark.dspark_sps_profiler all \
+  --base-url http://127.0.0.1:8000 \
+  --batch-size 1 4 8 16 24 32 \
+  --fracs \
+    0.1111111111111111 \
+    0.3333333333333333 \
+    0.5555555555555556 \
+    0.7777777777777778 \
+    1.0 \
+  --direct-2d-table \
+  --input-len 256 \
+  --out ../dspark_qwen3_14b_block9_compact_sps.json \
+  --no-plot
+```
+
+The resulting total-token probes are:
+
+| Batch size | Total verify-token probes |
+| ---: | --- |
+| 1 | 2, 4, 6, 8, 10 |
+| 4 | 8, 16, 24, 32, 40 |
+| 8 | 16, 32, 48, 64, 80 |
+| 16 | 32, 64, 96, 128, 160 |
+| 24 | 48, 96, 144, 192, 240 |
+| 32 | 64, 128, 192, 256, 320 |
+
+Repeated measurements of the same `(batch size, total verify tokens)` cell are
+reduced to the median step time.
+
+The `--direct-2d-table` flag distinguishes the new format:
+
+```text
+no --fracs                         -> SpsCostTable
+--fracs                            -> SpsAdditiveCostTable
+--fracs plus --direct-2d-table     -> Sps2DCostTable
+```
+
+For a split workflow, collect cells with `run`, then select the output format
+during `fit`:
+
+```bash
+python -m sglang.benchmark.dspark_sps_profiler run \
+  --base-url http://127.0.0.1:8000 \
+  --batch-size 1 4 8 16 24 32 \
+  --fracs 0.1111111111111111 0.3333333333333333 \
+          0.5555555555555556 0.7777777777777778 1.0 \
+  --input-len 256 \
+  --out ../dspark_qwen3_14b_block9_compact_sps.json
+
+python -m sglang.benchmark.dspark_sps_profiler fit \
+  --out ../dspark_qwen3_14b_block9_compact_sps.json \
+  --direct-2d-table \
+  --no-plot
+```
+
+## Use the table in production
+
+Disable SPS recording unless it is needed for diagnostics, then launch the
+production server with both the cost table and the same graph capture config:
+
+```bash
+export SGLANG_RAGGED_VERIFY_MODE=compact
+
+python -m sglang.launch_server \
+  --model <target-model> \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path <draft-model> \
+  --speculative-dspark-block-size 9 \
+  --speculative-dspark-cuda-graph-capture-config ../dynamic_capture.json \
+  --speculative-dspark-sps-table-path \
+    ../dspark_qwen3_14b_block9_compact_sps.json \
+  <other-server-options>
+```
+
+## Profiling and runtime alignment
+
+The profiler computes the requested logical total as:
+
+```text
+budget = int(frac * batch_size * gamma)
+logical_total = batch_size + budget
+```
+
+The measured step may replay a CUDA Graph whose token tier is the smallest
+captured tier that can contain that logical total. For an accurately labeled
+direct table, each requested logical total should therefore be present in the
+capture configuration and equal the replayed graph tier.
+
+Using the same graph capture configuration for profiling and production is
+necessary, but the key invariant is:
+
+```text
+profiled logical total == replayed graph token tier == runtime query total
+```
+
+If a requested total is not captured, it can be rounded upward during
+profiling. That would associate a larger graph's time with the smaller logical
+total. Define matching `candidate_steps` in the capture config and keep all
+shape-affecting server options identical to avoid this mismatch.

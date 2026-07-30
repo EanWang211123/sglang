@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import Optional, Union
 
@@ -22,9 +23,13 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_spec_params import (
+    load_batch_size_aware_config,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
+    Sps2DCostTable,
     SpsAdditiveCostTable,
     SpsCostTable,
     _interp_clamped,
@@ -168,6 +173,9 @@ class DSparkVerifyPlanner:
                 relay_lag_steps=relay_lag_steps,
                 use_graph_tier_candidates=(
                     self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+                ),
+                graph_capture_config_path=(
+                    self.server_args.speculative_dspark_cuda_graph_capture_config
                 ),
             )
             self._dynamic_graph_tier = not is_dp_attention_enabled()
@@ -991,7 +999,7 @@ class VerifyBudgetDecision(msgspec.Struct):
 def compute_verify_token_budget(
     *,
     history_survival_probs: torch.Tensor,
-    sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
+    sps_table: Union[SpsCostTable, SpsAdditiveCostTable, Sps2DCostTable],
     cfg: DSparkScheduleConfig,
     candidate_batch_tokens: Optional[list[int]] = None,
 ) -> VerifyBudgetDecision:
@@ -1023,22 +1031,32 @@ def compute_verify_token_budget(
         if graph_budgets:
             candidate_budgets = torch.tensor(graph_budgets, dtype=torch.int64)
 
-    if isinstance(sps_table, SpsAdditiveCostTable):
-        step_time = _additive_step_time_tensor(
-            table=sps_table,
-            num_requests=int(num_requests),
-            num_budgets=int(tau_star.numel()),
-            budgets=candidate_budgets,
-        )
-        theta = tau_star[candidate_budgets] / step_time
-        idx = int(torch.argmax(theta))
-        predicted_step_seconds = float(step_time[idx])
-    else:
+    if isinstance(sps_table, SpsCostTable):
         sps = _lookup_sps_tensor(
             sps_table=sps_table, batch_tokens=num_requests + candidate_budgets
         )
         theta = tau_star[candidate_budgets] * sps
-        idx = int(torch.argmax(theta))
+        step_time = None
+    else:
+        step_time = (
+            _2d_step_time_tensor(
+                table=sps_table,
+                num_requests=int(num_requests),
+                batch_tokens=num_requests + candidate_budgets,
+            )
+            if isinstance(sps_table, Sps2DCostTable)
+            else _additive_step_time_tensor(
+                table=sps_table,
+                num_requests=int(num_requests),
+                budgets=candidate_budgets,
+            )
+        )
+        theta = tau_star[candidate_budgets] / step_time
+
+    idx = int(torch.argmax(theta))
+    if step_time is not None:
+        predicted_step_seconds = float(step_time[idx])
+    else:
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
     return VerifyBudgetDecision(
@@ -1062,25 +1080,49 @@ def _additive_step_time_tensor(
     *,
     table: SpsAdditiveCostTable,
     num_requests: int,
-    num_budgets: int,
-    budgets: Optional[torch.Tensor] = None,
+    budgets: torch.Tensor,
 ) -> torch.Tensor:
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
-    m_probes = torch.tensor(table.m_probes, dtype=torch.float64)
-    theta_vals = torch.tensor(table.theta_seconds, dtype=torch.float64)
-    if budgets is None:
-        budgets = torch.arange(num_budgets, dtype=torch.float64)
-    m = (num_requests + budgets.to(torch.float64)).clamp_(
-        min=float(table.m_probes[0]), max=float(table.m_probes[-1])
+    return floor + _interp_clamped_tensor(
+        probes=table.m_probes,
+        values=table.theta_seconds,
+        inputs=num_requests + budgets,
     )
-    hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
+
+
+def _2d_step_time_tensor(
+    *,
+    table: Sps2DCostTable,
+    num_requests: int,
+    batch_tokens: torch.Tensor,
+) -> torch.Tensor:
+    row = table.rows[table.row_index(num_requests)]
+    return _interp_clamped_tensor(
+        probes=row.batch_tokens,
+        values=row.step_seconds,
+        inputs=batch_tokens,
+    )
+
+
+def _interp_clamped_tensor(
+    *, probes: list[int], values: list[float], inputs: torch.Tensor
+) -> torch.Tensor:
+    probe_tensor = torch.tensor(probes, dtype=torch.float64)
+    value_tensor = torch.tensor(values, dtype=torch.float64)
+    if probe_tensor.numel() == 1:
+        return torch.full(inputs.shape, float(value_tensor[0]), dtype=torch.float64)
+
+    inputs = inputs.to(torch.float64).clamp_(
+        min=float(probes[0]), max=float(probes[-1])
+    )
+    hi = torch.bucketize(inputs, probe_tensor, right=True).clamp_(
+        1, probe_tensor.numel() - 1
+    )
     lo = hi - 1
-    span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
-    frac = (m - m_probes[lo]) / span
-    theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
-    return floor + theta_at_m
+    frac = (inputs - probe_tensor[lo]) / (probe_tensor[hi] - probe_tensor[lo])
+    return value_tensor[lo] + frac * (value_tensor[hi] - value_tensor[lo])
 
 
 class HostConfidenceBudgetPlanner:
@@ -1088,17 +1130,29 @@ class HostConfidenceBudgetPlanner:
     def __init__(
         self,
         *,
-        sps_table: SpsCostTable,
+        sps_table: Union[SpsCostTable, SpsAdditiveCostTable, Sps2DCostTable],
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,
         use_graph_tier_candidates: bool = False,
+        graph_capture_config_path: Optional[str] = None,
     ) -> None:
         cfg.validate()
         self.sps_table = sps_table
         self.cfg = cfg
         self._model_runner = model_runner
         self._use_graph_tier_candidates = use_graph_tier_candidates
+        self._graph_capture_entries: Optional[dict[int, dict]] = None
+        self._graph_capture_batch_sizes: list[int] = []
+        if (
+            use_graph_tier_candidates
+            and isinstance(sps_table, Sps2DCostTable)
+            and graph_capture_config_path
+        ):
+            _, self._graph_capture_entries = load_batch_size_aware_config(
+                graph_capture_config_path
+            )
+            self._graph_capture_batch_sizes = sorted(self._graph_capture_entries)
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
@@ -1133,10 +1187,8 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
-        candidate_batch_tokens = (
-            ragged_capture_num_tokens(model_runner=self._model_runner)
-            if self._use_graph_tier_candidates
-            else None
+        candidate_batch_tokens = self._candidate_batch_tokens(
+            num_requests=int(survival.shape[0])
         )
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
@@ -1146,6 +1198,26 @@ class HostConfidenceBudgetPlanner:
         )
         self.last_decision = decision
         return decision.budget
+
+    def _candidate_batch_tokens(self, *, num_requests: int) -> Optional[list[int]]:
+        if not self._use_graph_tier_candidates:
+            return None
+        captured = ragged_capture_num_tokens(model_runner=self._model_runner)
+        if captured is None or self._graph_capture_entries is None:
+            return captured
+
+        slot_index = (
+            bisect.bisect_right(self._graph_capture_batch_sizes, num_requests) - 1
+        )
+        slot = self._graph_capture_batch_sizes[max(0, slot_index)]
+        candidate_steps = self._graph_capture_entries[slot]["candidate_steps"]
+        return sorted(
+            {
+                round_up_grid(num_requests * (int(step) + 1), captured)
+                for step in candidate_steps
+                if num_requests * (int(step) + 1) <= captured[-1]
+            }
+        )
 
     def take_last_decision(self) -> Optional[VerifyBudgetDecision]:
         decision = self.last_decision
@@ -1205,7 +1277,7 @@ def build_sps_cost_table(
     *,
     server_args: ServerArgs,
     verify_num_draft_tokens: int,
-) -> Union[SpsCostTable, SpsAdditiveCostTable]:
+) -> Union[SpsCostTable, SpsAdditiveCostTable, Sps2DCostTable]:
     sps_table_path = server_args.speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)

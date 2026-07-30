@@ -103,6 +103,74 @@ class SpsAdditiveCostTable(msgspec.Struct, frozen=True):
         return msgspec.json.decode(data.encode("utf-8"), type=cls)
 
 
+class Sps2DCostRow(msgspec.Struct, frozen=True):
+    batch_size: int
+    batch_tokens: list[int]
+    step_seconds: list[float]
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 1:
+            raise ValueError(
+                f"Sps2DCostRow batch_size must be >= 1, got {self.batch_size}."
+            )
+        if not self.batch_tokens:
+            raise ValueError("Sps2DCostRow requires at least one batch_tokens probe.")
+        if self.batch_tokens != sorted(set(self.batch_tokens)):
+            raise ValueError(
+                "Sps2DCostRow batch_tokens must be strictly increasing, got "
+                f"{self.batch_tokens}."
+            )
+        if len(self.batch_tokens) != len(self.step_seconds):
+            raise ValueError(
+                "Sps2DCostRow batch_tokens and step_seconds must have equal length, "
+                f"got {len(self.batch_tokens)} vs {len(self.step_seconds)}."
+            )
+        if any(value <= 0 for value in self.step_seconds):
+            raise ValueError(
+                f"Sps2DCostRow step_seconds must all be > 0, got {self.step_seconds}."
+            )
+
+    def step_time(self, batch_tokens: int) -> float:
+        return _interp_clamped(self.batch_tokens, self.step_seconds, batch_tokens)
+
+
+class Sps2DCostTable(msgspec.Struct, frozen=True):
+    rows: list[Sps2DCostRow]
+
+    def __post_init__(self) -> None:
+        if not self.rows:
+            raise ValueError("Sps2DCostTable requires at least one batch-size row.")
+        batch_sizes = [row.batch_size for row in self.rows]
+        if batch_sizes != sorted(set(batch_sizes)):
+            raise ValueError(
+                "Sps2DCostTable rows must have strictly increasing batch_size, got "
+                f"{batch_sizes}."
+            )
+
+    def row_index(self, batch_size: int) -> int:
+        """Return the exact or nearest profiled batch-size row; ties use lower bs."""
+        batch_sizes = [row.batch_size for row in self.rows]
+        hi = bisect.bisect_left(batch_sizes, batch_size)
+        if hi == 0:
+            return 0
+        if hi == len(batch_sizes):
+            return len(batch_sizes) - 1
+        lo = hi - 1
+        if batch_size - batch_sizes[lo] <= batch_sizes[hi] - batch_size:
+            return lo
+        return hi
+
+    def step_time(self, *, num_reqs: int, batch_tokens: int) -> float:
+        return self.rows[self.row_index(num_reqs)].step_time(batch_tokens)
+
+    def to_json(self) -> str:
+        return msgspec.json.encode(self).decode("utf-8")
+
+    @classmethod
+    def from_json(cls, data: str) -> Sps2DCostTable:
+        return msgspec.json.decode(data.encode("utf-8"), type=cls)
+
+
 def profile_sps_table(
     *,
     probes: list[tuple[int, float]],
@@ -145,7 +213,10 @@ def profile_sps_table(
 def load_sps_table_from_path(path: str):
     with open(path, "r", encoding="utf-8") as f:
         data = f.read()
-    if '"bias_seconds"' in data:
+    payload = msgspec.json.decode(data.encode("utf-8"))
+    if isinstance(payload, dict) and "rows" in payload:
+        return Sps2DCostTable.from_json(data)
+    if isinstance(payload, dict) and "bias_seconds" in payload:
         return SpsAdditiveCostTable.from_json(data)
     return SpsCostTable.from_json(data)
 
@@ -158,7 +229,9 @@ def build_uninitialized_sps_table(*, max_batch_tokens: int) -> SpsCostTable:
     )
 
 
-def is_uninitialized_sps_table(table: SpsCostTable | SpsAdditiveCostTable) -> bool:
-    if isinstance(table, SpsAdditiveCostTable):
+def is_uninitialized_sps_table(
+    table: SpsCostTable | SpsAdditiveCostTable | Sps2DCostTable,
+) -> bool:
+    if isinstance(table, (SpsAdditiveCostTable, Sps2DCostTable)):
         return False
     return len(table.sample_batch_tokens) <= 1
