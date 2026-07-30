@@ -2092,6 +2092,16 @@ class ServerArgs:
         "off the schedule is byte-for-byte unchanged.",
         NS("spec"),
     ] = False
+    speculative_dspark_current_step_budget: A[
+        bool,
+        "DSPARK compact ragged-verify only. Select the verify-token budget from "
+        "the current draft step's confidence on GPU instead of the default lagged "
+        "host-side planner. The planner evaluates only captured CUDA-graph token "
+        "tiers and produces the per-request verify lengths from the same ranking. "
+        "Under DP attention, the per-tier expected-token vectors are summed across "
+        "ranks before selecting one shared graph tier. Off by default.",
+        NS("spec"),
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

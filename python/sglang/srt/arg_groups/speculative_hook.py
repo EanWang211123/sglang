@@ -409,6 +409,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     )
 
     ragged_mode = read_ragged_verify_mode()
+    if server_args.speculative_dspark_current_step_budget:
+        if ragged_mode is not RaggedVerifyMode.COMPACT:
+            raise ValueError(
+                "--speculative-dspark-current-step-budget requires "
+                "SGLANG_RAGGED_VERIFY_MODE=compact."
+            )
+        if server_args.disable_cuda_graph:
+            raise ValueError(
+                "--speculative-dspark-current-step-budget requires decode CUDA graphs."
+            )
     if (
         server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT

@@ -432,11 +432,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+        if not self._verify_planner.is_compact_mode:
+            return None
+        if batch.global_num_tokens is None:
+            if self._verify_planner.current_step_dp_sync_enabled:
+                raise RuntimeError(
+                    "DSpark current-step DP budget requires global request counts "
+                    "on idle ranks."
+                )
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
             return None
+        if self._verify_planner.uses_current_step_budget:
+            return self._verify_planner.schedule_current_step_layout(
+                confidence=None,
+                req_pool_indices=None,
+                prefix_lens=None,
+                global_num_reqs=global_bs,
+            )[1]
         return idle_ragged_layout(
             tier_num_reqs=global_bs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
@@ -544,13 +558,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 confidence_tap=proposal.confidence_tap,
             )
 
-        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
-            draft_input=draft_input,
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=batch.req_pool_indices,
-        )
-
         global_num_reqs = (
             max(batch.global_num_tokens)
             if self._draft_is_moe
@@ -558,15 +565,45 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
-        )
+        dp_tier_num_tokens = self._dp_verify_tier_num_tokens(batch)
+        if self._verify_planner.uses_current_step_budget:
+            verify_token_budget, layout = (
+                self._verify_planner.schedule_current_step_layout(
+                    confidence=confidence,
+                    req_pool_indices=batch.req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    global_num_reqs=global_num_reqs,
+                )
+            )
+            batch.spec_verify_tier_num_tokens = (
+                -1
+                if verify_token_budget is None
+                else min(
+                    bs + verify_token_budget,
+                    bs * self.verify_num_draft_tokens,
+                )
+            )
+            dp_tier_num_tokens = (
+                layout.graph_num_tokens
+                if global_num_reqs is not None and layout is not None
+                else None
+            )
+        else:
+            verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+                draft_input=draft_input,
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=batch.req_pool_indices,
+            )
+            layout = self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=dp_tier_num_tokens,
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = torch.cat(
@@ -678,7 +715,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            dp_tier_num_tokens=dp_tier_num_tokens,
         )
 
         next_draft_input = make_next_draft_input(

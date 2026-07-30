@@ -88,6 +88,16 @@ class DSparkVerifyPlanner:
         self._align_verify_tokens_to_graph_tier = (
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
+        self._current_step_budget = server_args.speculative_dspark_current_step_budget
+        self._current_step_cost_cache: dict[
+            int, tuple[torch.Tensor, torch.Tensor, bool]
+        ] = {}
+        self._current_step_rank_cache: dict[int, torch.Tensor] = {}
+        self._current_step_tier_cpu = None
+        self._current_step_copy_stream = None
+        self._current_step_decision_ready = None
+        self._current_step_copy_done = None
+        self._current_step_warned_sps_coverage = False
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
 
@@ -134,6 +144,7 @@ class DSparkVerifyPlanner:
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
+        self._current_step_dp_sync_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
@@ -170,38 +181,67 @@ class DSparkVerifyPlanner:
                     self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 ),
             )
-            self._dynamic_graph_tier = not is_dp_attention_enabled()
-            self._dp_tier_gather_enabled = (
+            dp_attention_enabled = is_dp_attention_enabled()
+            self._dynamic_graph_tier = not dp_attention_enabled
+            dp_tier_sync_required = (
+                dp_attention_enabled
+                and require_mlp_tp_gather(self.server_args)
+                and not self.server_args.speculative_skip_dp_mlp_sync
+            )
+            dp_graph_tier_sync_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-                and is_dp_attention_enabled()
+                and dp_tier_sync_required
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
-                and require_mlp_tp_gather(self.server_args)
-                and not self.server_args.disable_overlap_schedule
-                and not self.server_args.speculative_skip_dp_mlp_sync
                 and self.server_args.disaggregation_mode == "null"
                 and self.server_args.pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
+            self._dp_tier_gather_enabled = (
+                not self._current_step_budget
+                and dp_graph_tier_sync_enabled
+                and not self.server_args.disable_overlap_schedule
+            )
+            self._current_step_dp_sync_enabled = (
+                self._current_step_budget and dp_graph_tier_sync_enabled
+            )
+            if (
+                self._current_step_budget
+                and dp_tier_sync_required
+                and not self._current_step_dp_sync_enabled
+            ):
+                raise ValueError(
+                    "DSpark current-step budget under DP attention requires compact "
+                    "graph DP synchronization with attn_tp=1, attn_cp=1, pp_size=1, "
+                    "disaggregation disabled, and scheduler all-gather enabled."
+                )
             if tp_rank == 0:
                 sps_table_source = (
                     self.server_args.speculative_dspark_sps_table_path
                     or "uninitialized"
                 )
-                logger.info(
-                    "DSpark ragged-verify scheduler enabled (mode=%s, lag=%d, "
-                    "relay_lag=%d, sps_table=%s, graph_tier=%s).",
-                    self._ragged_verify_mode.value,
-                    self._budget_planner.lag_steps,
-                    relay_lag_steps,
-                    sps_table_source,
-                    (
+                if self._current_step_budget:
+                    graph_tier_mode = (
+                        "current-step-dp"
+                        if self._current_step_dp_sync_enabled
+                        else "current-step"
+                    )
+                else:
+                    graph_tier_mode = (
                         "dynamic"
                         if self._dynamic_graph_tier
                         else (
                             "dp-gathered" if self._dp_tier_gather_enabled else "pinned"
                         )
-                    ),
+                    )
+                logger.info(
+                    "DSpark ragged-verify scheduler enabled (mode=%s, lag=%d, "
+                    "relay_lag=%d, sps_table=%s, graph_tier=%s).",
+                    self._ragged_verify_mode.value,
+                    0 if self._current_step_budget else self._budget_planner.lag_steps,
+                    relay_lag_steps,
+                    sps_table_source,
+                    graph_tier_mode,
                 )
                 if isinstance(sps_table, SpsCostTable) and is_uninitialized_sps_table(
                     sps_table
@@ -245,6 +285,14 @@ class DSparkVerifyPlanner:
         return self._is_verify_all
 
     @property
+    def uses_current_step_budget(self) -> bool:
+        return self._current_step_budget
+
+    @property
+    def current_step_dp_sync_enabled(self) -> bool:
+        return self._current_step_dp_sync_enabled
+
+    @property
     def mode_value(self) -> str:
         return self._ragged_verify_mode.value
 
@@ -252,6 +300,8 @@ class DSparkVerifyPlanner:
     def lag_steps(self) -> Optional[int]:
         if self._budget_planner is None:
             return None
+        if self._current_step_budget:
+            return 0
         return self._budget_planner.lag_steps
 
     def take_budget_decision(self) -> Optional[VerifyBudgetDecision]:
@@ -386,6 +436,13 @@ class DSparkVerifyPlanner:
         the draft input by prepare_verify_budget; otherwise compute it now."""
         if not self.schedules_verify_budget or confidence is None:
             return None
+        if (
+            self.server_args.disable_overlap_schedule
+            and self._uses_uniform_verify_all_fast_path()
+        ):
+            budget = self._full_verify_budget(int(req_pool_indices.shape[0]))
+            self._budget_planner.last_decision = VerifyBudgetDecision(budget=budget)
+            return budget
         if not self.server_args.disable_overlap_schedule:
             budget = draft_input.verify_token_budget
         else:
@@ -416,9 +473,26 @@ class DSparkVerifyPlanner:
         return None if synced_budget < 0 else synced_budget
 
     def confidence_budget_prepare(self):
-        if not self.schedules_verify_budget:
+        if not self.schedules_verify_budget or self._current_step_budget:
             return None
         return self.prepare_verify_budget
+
+    def _uses_uniform_verify_all_fast_path(self) -> bool:
+        forced_budget_frac = (
+            self._budget_planner.forced_budget_frac
+            if self._budget_planner is not None
+            else None
+        )
+        return (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and not envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
+            and forced_budget_frac is None
+        )
+
+    def _full_verify_budget(self, bs: int) -> int:
+        floor_len = max(self._schedule_cfg.min_verify_len, 1)
+        return int(bs) * (self.verify_num_draft_tokens - floor_len)
 
     def _budget_from_resolved(
         self,
@@ -441,6 +515,270 @@ class DSparkVerifyPlanner:
             )
         )
 
+    def schedule_current_step_layout(
+        self,
+        *,
+        confidence: Optional[torch.Tensor],
+        req_pool_indices: Optional[torch.Tensor],
+        prefix_lens: Optional[torch.Tensor],
+        global_num_reqs: Optional[int],
+    ) -> tuple[Optional[int], Optional[RaggedVerifyLayout]]:
+        """Plan the current compact verify step entirely on device.
+
+        All ranks evaluate the same captured token tiers. Under DP attention,
+        each rank contributes its expected accepted-token curve and the curves
+        are summed before selecting one common tier. The selected tier is the
+        only device value copied to the host; the same on-device ranking also
+        produces the local per-request verify lengths.
+        """
+        assert self._current_step_budget
+        local_bs = 0 if confidence is None else int(confidence.shape[0])
+        is_idle = confidence is None
+        tier_num_reqs = local_bs if global_num_reqs is None else global_num_reqs
+        tier_data = self._current_step_tiers_and_cost(tier_num_reqs)
+        if tier_data is None:
+            if is_idle:
+                return None, idle_ragged_layout(
+                    tier_num_reqs=tier_num_reqs,
+                    dp_tier_num_tokens=None,
+                    device=self.device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    model_runner=self.model_runner,
+                )
+            assert req_pool_indices is not None and prefix_lens is not None
+            return None, self.schedule_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=self.device,
+                confidence=confidence,
+                budget=None,
+                global_num_reqs=global_num_reqs,
+            )
+
+        tiers, cost, cost_is_step_time = tier_data
+        floor_len = max(self._schedule_cfg.min_verify_len, 1)
+        floor_tokens = local_bs * floor_len
+
+        survival = None
+        order = None
+        valid = None
+        sorted_valid = None
+        if local_bs > 0:
+            assert confidence is not None
+            survival = compute_sort_survival(confidence)[
+                :, : self._schedule_cfg.resolved_max_verify_len()
+            ]
+            # Position-major flattening plus a stable value sort reproduces the
+            # original top-k tie-break: probability, then position, then request.
+            flat_survival = survival.transpose(0, 1).contiguous().reshape(-1)
+            valid = flat_survival >= self._schedule_cfg.survival_eps
+            ranked_survival = torch.where(
+                valid,
+                flat_survival,
+                torch.full_like(flat_survival, float("-inf")),
+            )
+            sorted_survival, order = torch.sort(
+                ranked_survival, descending=True, stable=True
+            )
+            sorted_valid = sorted_survival >= self._schedule_cfg.survival_eps
+            sorted_gain = torch.where(
+                sorted_valid, sorted_survival, torch.zeros_like(sorted_survival)
+            ).to(torch.float64)
+            prefix_gain = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.float64, device=confidence.device),
+                    torch.cumsum(sorted_gain, dim=0),
+                ]
+            )
+            local_budgets = (tiers - floor_tokens).clamp_(
+                min=0, max=flat_survival.numel()
+            )
+            local_tau = local_bs + prefix_gain[local_budgets]
+        else:
+            local_tau = torch.zeros_like(tiers, dtype=torch.float64)
+
+        global_tau = local_tau
+        if self._current_step_dp_sync_enabled:
+            global_tau = get_tp_group().all_reduce(global_tau)
+
+        forced_frac = self._budget_planner.forced_budget_frac
+        if forced_frac is None:
+            score = global_tau / cost if cost_is_step_time else global_tau * cost
+            if local_bs > 0 and not self._current_step_dp_sync_enabled:
+                # Match the host planner: do not consider a graph tier whose
+                # budget extends beyond all candidates surviving survival_eps.
+                assert valid is not None
+                candidate_valid = local_budgets <= valid.sum(dtype=torch.int64)
+                score = torch.where(
+                    candidate_valid, score, torch.full_like(score, float("-inf"))
+                )
+            selected_idx = torch.argmax(score)
+        else:
+            target_tier = tier_num_reqs + int(
+                float(forced_frac) * tier_num_reqs * (self.verify_num_draft_tokens - 1)
+            )
+            selected_idx = torch.argmin(torch.abs(tiers - target_tier))
+        selected_tier_device = tiers[selected_idx]
+
+        self._start_current_step_tier_copy(selected_tier_device)
+
+        verify_lens = None
+        if local_bs > 0:
+            assert (
+                confidence is not None
+                and order is not None
+                and sorted_valid is not None
+            )
+            selected_budget_device = (selected_tier_device - floor_tokens).clamp_(
+                min=0, max=order.numel()
+            )
+            rank_positions = self._current_step_rank_cache.get(order.numel())
+            if rank_positions is None:
+                rank_positions = torch.arange(
+                    order.numel(), dtype=order.dtype, device=order.device
+                )
+                self._current_step_rank_cache[order.numel()] = rank_positions
+            selected_by_rank = sorted_valid & (rank_positions < selected_budget_device)
+            selected_extra = torch.zeros(
+                local_bs, dtype=torch.int32, device=confidence.device
+            )
+            selected_extra.scatter_add_(
+                0, order.remainder(local_bs), selected_by_rank.to(torch.int32)
+            )
+            verify_lens = (selected_extra + floor_len).clamp_(
+                min=floor_len,
+                max=self._schedule_cfg.resolved_max_verify_len(),
+            )
+
+            broadcast_group, group_size = verify_lens_broadcast_group(
+                tp_size=self.server_args.tp_size
+            )
+            if group_size > 1:
+                broadcast_group.broadcast(verify_lens, src=0)
+
+        selected_tier = self._finish_current_step_tier_copy()
+        local_budget = min(
+            max(selected_tier - floor_tokens, 0),
+            local_bs * (self.verify_num_draft_tokens - floor_len),
+        )
+        self._budget_planner.last_decision = VerifyBudgetDecision(budget=local_budget)
+
+        if is_idle:
+            return local_budget, idle_ragged_layout(
+                tier_num_reqs=tier_num_reqs,
+                dp_tier_num_tokens=selected_tier,
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+            )
+
+        assert (
+            req_pool_indices is not None
+            and prefix_lens is not None
+            and verify_lens is not None
+        )
+        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+            assert survival is not None
+            self._log_verify_lens_decision(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                budget=local_budget,
+                sort_survival=survival,
+                verify_lens=verify_lens,
+                tier_num_reqs=tier_num_reqs,
+                graph_num_tokens=selected_tier,
+            )
+        return local_budget, RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=verify_lens,
+            graph_num_tokens=selected_tier,
+        )
+
+    def _current_step_tiers_and_cost(
+        self, tier_num_reqs: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, bool]]:
+        cached = self._current_step_cost_cache.get(tier_num_reqs)
+        if cached is not None:
+            return cached
+        max_slots = ragged_capture_max_slots(model_runner=self.model_runner)
+        if max_slots is None or tier_num_reqs > max_slots:
+            return None
+        capture_tiers = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if capture_tiers is None:
+            return None
+        candidate_tiers = [
+            tier
+            for tier in capture_tiers
+            if tier_num_reqs <= tier <= tier_num_reqs * self.verify_num_draft_tokens
+        ]
+        if not candidate_tiers:
+            return None
+        captured_candidates = candidate_tiers
+        table = self._budget_planner.sps_table
+        if isinstance(table, SpsCostTable):
+            profiled_candidates = [
+                tier for tier in candidate_tiers if tier <= table.max_batch_tokens
+            ]
+            if profiled_candidates:
+                candidate_tiers = profiled_candidates
+            if (
+                len(profiled_candidates) != len(captured_candidates)
+                and not self._current_step_warned_sps_coverage
+            ):
+                logger.warning(
+                    "DSpark current-step graph candidates extend past the SPS "
+                    "profile (max_batch_tokens=%d). Unprofiled tiers are excluded "
+                    "when a covered tier exists; profile the runtime block size and "
+                    "full concurrency range for accurate budget selection.",
+                    table.max_batch_tokens,
+                )
+                self._current_step_warned_sps_coverage = True
+        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+            logger.warning(
+                "[DSPARK-CURRENT] tier_bs=%d captured_graph_candidates=%s "
+                "eligible_candidates=%s",
+                tier_num_reqs,
+                captured_candidates,
+                candidate_tiers,
+            )
+
+        if isinstance(table, SpsAdditiveCostTable):
+            cost_values = [
+                table.step_time(num_reqs=tier_num_reqs, budget=tier - tier_num_reqs)
+                for tier in candidate_tiers
+            ]
+            cost_is_step_time = True
+        else:
+            cost_values = [table.lookup(tier) for tier in candidate_tiers]
+            cost_is_step_time = False
+        resolved = (
+            torch.tensor(candidate_tiers, dtype=torch.int64, device=self.device),
+            torch.tensor(cost_values, dtype=torch.float64, device=self.device),
+            cost_is_step_time,
+        )
+        self._current_step_cost_cache[tier_num_reqs] = resolved
+        return resolved
+
+    def _start_current_step_tier_copy(self, tier: torch.Tensor) -> None:
+        device_module = torch.get_device_module(tier.device)
+        if self._current_step_copy_stream is None:
+            self._current_step_tier_cpu = torch.empty(
+                (), dtype=torch.int64, pin_memory=True
+            )
+            self._current_step_copy_stream = device_module.Stream()
+            self._current_step_decision_ready = device_module.Event()
+            self._current_step_copy_done = device_module.Event()
+
+        current_stream = device_module.current_stream()
+        self._current_step_decision_ready.record(current_stream)
+        self._current_step_copy_stream.wait_event(self._current_step_decision_ready)
+        with device_module.stream(self._current_step_copy_stream):
+            self._current_step_tier_cpu.copy_(tier, non_blocking=True)
+            self._current_step_copy_done.record()
+
+    def _finish_current_step_tier_copy(self) -> int:
+        self._current_step_copy_done.synchronize()
+        return int(self._current_step_tier_cpu.item())
+
     def schedule_layout(
         self,
         *,
@@ -454,17 +792,7 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        forced_budget_frac = (
-            self._budget_planner.forced_budget_frac
-            if self._budget_planner is not None
-            else None
-        )
-        if (
-            self._is_verify_all
-            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-            and not envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
-            and forced_budget_frac is None
-        ):
+        if self._uses_uniform_verify_all_fast_path():
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips. SPS
@@ -662,6 +990,8 @@ class DSparkVerifyPlanner:
         budget: int,
         sort_survival: torch.Tensor,
         verify_lens: torch.Tensor,
+        tier_num_reqs: Optional[int] = None,
+        graph_num_tokens: Optional[int] = None,
     ) -> None:
         cfg = self._schedule_cfg
         max_len = cfg.resolved_max_verify_len()
@@ -677,6 +1007,15 @@ class DSparkVerifyPlanner:
             cfg.min_verify_len,
             max_len,
         )
+        if graph_num_tokens is not None:
+            logger.info(
+                "[DSPARK-CURRENT] local_bs=%d tier_bs=%d graph_tokens=%d "
+                "actual_tokens=%d",
+                len(req_ids),
+                len(req_ids) if tier_num_reqs is None else tier_num_reqs,
+                graph_num_tokens,
+                sum(lens),
+            )
         for row in range(len(req_ids)):
             survival_str = "[" + ", ".join(f"{p:.3f}" for p in sort_rows[row]) + "]"
             logger.info(
@@ -1014,9 +1353,7 @@ def compute_verify_token_budget(
             {
                 tier - num_requests
                 for tier in candidate_batch_tokens
-                if num_requests
-                <= tier
-                <= num_requests * max_len
+                if num_requests <= tier <= num_requests * max_len
                 and tier - num_requests < tau_star.numel()
             }
         )
