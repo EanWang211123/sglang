@@ -56,7 +56,7 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if not algo.is_dspark():
+    if not algo.is_dflash_family():
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 

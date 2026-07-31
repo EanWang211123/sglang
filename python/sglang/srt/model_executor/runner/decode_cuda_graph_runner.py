@@ -420,11 +420,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _build_ragged_verify_capture_shapes(self) -> list[tuple[int, int, int]]:
-        cfg_path = (
-            self.model_runner.server_args.speculative_dspark_cuda_graph_capture_config
-            if self.model_runner.spec_algorithm.is_dspark()
-            else None
-        )
+        if self.model_runner.spec_algorithm.is_dspark():
+            cfg_path = (
+                self.model_runner.server_args.speculative_dspark_cuda_graph_capture_config
+            )
+        elif self.model_runner.spec_algorithm.is_dflash():
+            cfg_path = (
+                self.model_runner.server_args.speculative_dflash_cuda_graph_capture_config
+            )
+        else:
+            cfg_path = None
         if cfg_path is None:
             return [
                 (bs, self.captured_req_width, bs * self.captured_req_width)
@@ -448,14 +453,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 query_len = candidate_step + 1
                 if not 1 <= query_len <= self.captured_req_width:
                     raise ValueError(
-                        f"DSpark graph capture candidate step {candidate_step} for "
+                        f"{self.model_runner.spec_algorithm} graph capture candidate "
+                        f"step {candidate_step} for "
                         f"BS slot {slot} produces query length {query_len}, which "
                         f"must be in [1, {self.captured_req_width}]"
                     )
                 num_tokens = bs * query_len
                 if num_tokens % token_alignment:
                     raise ValueError(
-                        f"DSpark graph tier {num_tokens} must be divisible by "
+                        f"{self.model_runner.spec_algorithm} graph tier {num_tokens} "
+                        f"must be divisible by "
                         f"the TP/CP token alignment {token_alignment}"
                     )
                 if num_tokens not in seen_tiers:

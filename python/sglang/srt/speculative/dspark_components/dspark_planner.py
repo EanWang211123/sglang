@@ -67,7 +67,14 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc_2d: torch.Tensor
 
 
-class DSparkVerifyPlanner:
+class AdaptiveVerifyPlanner:
+    """Shared adaptive-verify policy.
+
+    DSpark supplies scores from its confidence head; DFlash supplies the
+    selected draft-token probabilities. Graph-tier selection, cost modeling,
+    overlap relay, and per-request verify-length scheduling stay identical.
+    """
+
     def __init__(
         self,
         *,
@@ -78,6 +85,11 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        external_score: bool = False,
+        algorithm_label: str = "DSpark",
+        sps_table_path: Optional[str] = None,
+        align_verify_tokens_to_graph_tier: Optional[bool] = None,
+        profiling_enabled: Optional[bool] = None,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -85,13 +97,35 @@ class DSparkVerifyPlanner:
         self.device = device
         self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
+        self.algorithm_label = algorithm_label
+        self._external_score = bool(external_score)
+        self._sps_table_path = (
+            server_args.speculative_dspark_sps_table_path
+            if sps_table_path is None and algorithm_label == "DSpark"
+            else sps_table_path
+        )
         self._align_verify_tokens_to_graph_tier = (
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+            if align_verify_tokens_to_graph_tier is None
+            else bool(align_verify_tokens_to_graph_tier)
+        )
+        self._profiling_enabled = (
+            envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
+            if profiling_enabled is None
+            else bool(profiling_enabled)
         )
 
-        self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        self._confidence_head = (
+            getattr(self.draft_model, "confidence_head", None)
+            if self.draft_model is not None
+            else None
+        )
 
-        sts_path = server_args.speculative_dspark_confidence_sts_path
+        sts_path = (
+            server_args.speculative_dspark_confidence_sts_path
+            if algorithm_label == "DSpark"
+            else None
+        )
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
             sts_temperatures = torch.tensor(
@@ -137,20 +171,20 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if self._confidence_head is None and not self._external_score:
                 raise ValueError(
-                    f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                    f"schedules per-request verify lengths from the draft confidence "
-                    f"head, but this DSpark draft checkpoint has no confidence head -- "
-                    f"the checkpoint is wrong/incomplete (it ships no "
-                    f"enable_confidence_head + trained confidence_head weights). Use a "
-                    f"draft checkpoint that includes the confidence head, or run "
+                    f"{self.algorithm_label} ragged-verify mode "
+                    f"{self._ragged_verify_mode.value!r} schedules per-request verify "
+                    f"lengths from conditional acceptance scores, but no internal "
+                    f"confidence head or external score source is available. Provide "
+                    f"a score source, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             self._require_prep_in_cuda_graph()
             sps_table = build_sps_cost_table(
                 server_args=self.server_args,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
+                sps_table_path=self._sps_table_path,
             )
             self._is_verify_all = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
@@ -184,13 +218,11 @@ class DSparkVerifyPlanner:
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
             if tp_rank == 0:
-                sps_table_source = (
-                    self.server_args.speculative_dspark_sps_table_path
-                    or "uninitialized"
-                )
+                sps_table_source = self._sps_table_path or "uninitialized"
                 logger.info(
-                    "DSpark ragged-verify scheduler enabled (mode=%s, lag=%d, "
+                    "%s ragged-verify scheduler enabled (mode=%s, lag=%d, "
                     "relay_lag=%d, sps_table=%s, graph_tier=%s).",
+                    self.algorithm_label,
                     self._ragged_verify_mode.value,
                     self._budget_planner.lag_steps,
                     relay_lag_steps,
@@ -207,15 +239,17 @@ class DSparkVerifyPlanner:
                     sps_table
                 ):
                     logger.warning(
-                        "DSpark SPS table is uninitialized (flat): the verify "
+                        "%s SPS table is uninitialized (flat): the verify "
                         "budget degenerates to verify-all (zero scheduling gain). "
-                        "Pass a profiled --speculative-dspark-sps-table-path."
+                        "Pass a profiled SPS table.",
+                        self.algorithm_label,
                     )
 
     def _require_prep_in_cuda_graph(self) -> None:
         if not envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             raise ValueError(
-                f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
+                f"{self.algorithm_label} ragged-verify mode "
+                f"{self._ragged_verify_mode.value!r} "
                 f"requires SGLANG_PREP_IN_CUDA_GRAPH=1 (the captured-graph prepare "
                 f"path). It is currently disabled, which would put per-step "
                 f"verify_lens_cpu host reads on the critical path. Set "
@@ -224,7 +258,7 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._confidence_head is not None or self._external_score
 
     @property
     def last_confidence_raw(self) -> Optional[torch.Tensor]:
@@ -267,13 +301,22 @@ class DSparkVerifyPlanner:
     def compute_confidence_tensor(
         self,
         *,
-        draft_hidden: Optional[torch.Tensor],
-        anchor_tokens: torch.Tensor,
-        draft_tokens: torch.Tensor,
+        draft_hidden: Optional[torch.Tensor] = None,
+        anchor_tokens: Optional[torch.Tensor] = None,
+        draft_tokens: Optional[torch.Tensor] = None,
         confidence_tap: Optional[torch.Tensor] = None,
+        external_score: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
+        if external_score is not None:
+            if external_score.ndim != 2 or external_score.shape[1] != self.gamma:
+                raise ValueError(
+                    f"{self.algorithm_label} adaptive verify expected external score "
+                    f"shape [bs, {self.gamma}], got {tuple(external_score.shape)}."
+                )
+            return expect(_CONFIDENCE, external_score.to(torch.float32))
         if self._confidence_head is None:
             return None
+        assert anchor_tokens is not None and draft_tokens is not None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
             assert (
@@ -462,7 +505,7 @@ class DSparkVerifyPlanner:
         if (
             self._is_verify_all
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-            and not envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
+            and not self._profiling_enabled
             and forced_budget_frac is None
         ):
             # Verify-all: the uniform layout (or None, past the captured grid)
@@ -960,6 +1003,10 @@ def compute_confidence(
     return confidence
 
 
+class DSparkVerifyPlanner(AdaptiveVerifyPlanner):
+    """DSpark compatibility facade for the shared adaptive planner."""
+
+
 class DSparkScheduleConfig(msgspec.Struct):
     gamma: int
     min_verify_len: int = 1
@@ -1205,8 +1252,10 @@ def build_sps_cost_table(
     *,
     server_args: ServerArgs,
     verify_num_draft_tokens: int,
+    sps_table_path: Optional[str] = None,
 ) -> Union[SpsCostTable, SpsAdditiveCostTable]:
-    sps_table_path = server_args.speculative_dspark_sps_table_path
+    if sps_table_path is None:
+        sps_table_path = server_args.speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(

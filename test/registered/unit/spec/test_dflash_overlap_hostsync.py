@@ -128,6 +128,44 @@ class TestDflashDraftSamplerVocabParallel(CustomTestCase):
             vocab=512, hidden=64, bs=3, block_size=8, world=4, dtype=torch.float32
         )
 
+    def test_emits_selected_token_probability_for_adaptive_verify(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
+
+        device = torch.device("cuda" if _HAS_CUDA else "cpu")
+        generator = torch.Generator(device=device).manual_seed(7)
+        bs, block_size, vocab, hidden = 2, 5, 64, 16
+        weight = torch.randn(
+            vocab,
+            hidden,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        hidden_states = torch.randn(
+            bs * block_size,
+            hidden,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        sampler = _DflashDraftSampler(
+            weight=weight,
+            block_size=block_size,
+            num_org=vocab,
+            org_vocab_start=0,
+            max_bs=bs,
+            emit_probs=True,
+        )
+        sampler(hidden_states)
+
+        draft_hidden = hidden_states.view(bs, block_size, hidden)[:, 1:].reshape(
+            -1, hidden
+        )
+        logits = draft_hidden @ weight.T
+        expected = torch.softmax(logits, dim=-1).amax(dim=-1)
+        actual = sampler.out_probs[: bs * (block_size - 1)]
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
     def test_shard_boundary_tie_resolves_to_first_global_index(self):
         # Duplicate row 10 (shard 0) at row 200 (shard 1): identical logits, so
         # a correct fold must pick 10 (torch.argmax first-max semantics).

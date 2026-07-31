@@ -2047,6 +2047,21 @@ class ServerArgs:
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         NS("spec"),
     ] = None
+    speculative_dflash_sps_table_path: A[
+        Optional[str],
+        "DFLASH adaptive verify only. Path to a pre-profiled SPS/additive cost "
+        "table consumed by the compact ragged-verify scheduler. The table must be "
+        "profiled for the exact DFLASH draft/target/runtime configuration.",
+        NS("spec"),
+    ] = None
+    speculative_dflash_cuda_graph_capture_config: A[
+        Optional[str],
+        "DFLASH compact ragged-verify only. Path to a batch-size-aware JSON "
+        "config selecting token-keyed target-verify CUDA graph tiers. "
+        "candidate_steps denotes the number of proposed DFLASH tokens, so the "
+        "captured query length is candidate_steps + 1 for the anchor token.",
+        NS("spec"),
+    ] = None
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
