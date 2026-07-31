@@ -316,6 +316,28 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_draft_tokens=inferred_block_size,
         )
 
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    ragged_mode = read_ragged_verify_mode()
+    if (
+        ragged_mode is not RaggedVerifyMode.STATIC
+        and int(cfg.speculative_num_draft_tokens) < 2
+    ):
+        raise ValueError(
+            "DFLASH adaptive verify requires speculative_num_draft_tokens >= 2 "
+            "(one anchor plus at least one draft token), got "
+            f"{cfg.speculative_num_draft_tokens}."
+        )
+    if cfg.speculative_dflash_sps_table_path and ragged_mode is RaggedVerifyMode.STATIC:
+        logger.warning(
+            "--speculative-dflash-sps-table-path feeds the adaptive verify "
+            "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; "
+            "it will be a no-op."
+        )
+
     if cfg.speculative_draft_window_size is not None:
         draft_tokens = int(cfg.speculative_num_draft_tokens)
         if cfg.speculative_draft_window_size < draft_tokens:

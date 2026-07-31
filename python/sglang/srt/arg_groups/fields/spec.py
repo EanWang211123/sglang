@@ -73,6 +73,12 @@ class Spec(msgspec.Struct):
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_sps_table_path: A[
+        Optional[str],
+        "DFLASH adaptive verify only. Path to a pre-profiled SPS/additive cost "
+        "table consumed by the compact ragged-verify scheduler. The table must be "
+        "profiled for the exact DFLASH draft/target/runtime configuration.",
+    ] = None
     speculative_domino_candidate_pool_size: A[
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",

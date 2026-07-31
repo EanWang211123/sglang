@@ -5,6 +5,7 @@ keep-list."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -67,13 +68,13 @@ class _FakeTpGroup:
 
     def __init__(self, world_size):
         self.world_size = world_size
-        self.recording = True
+        self.phase = 0
         self.recorded = {}  # (rank, call_idx) -> tensor
         self.rank = 0
         self.call_idx = 0
 
     def all_gather_into_tensor(self, output, input_):
-        if self.recording:
+        if self.phase == 0:
             self.recorded[(self.rank, self.call_idx)] = input_.clone()
         else:
             output.copy_(
@@ -83,9 +84,27 @@ class _FakeTpGroup:
             )
         self.call_idx += 1
 
+    def all_reduce(self, input_):
+        reduce_key = ("reduce", self.rank, self.call_idx)
+        if self.phase == 1:
+            self.recorded[reduce_key] = input_.clone()
+            output = input_
+        elif self.phase == 2:
+            output = sum(
+                self.recorded[("reduce", r, self.call_idx)]
+                for r in range(self.world_size)
+            )
+        else:
+            output = input_
+        self.call_idx += 1
+        # Deliberately out-of-place, matching supported GroupCoordinator paths.
+        return output
+
 
 class TestDflashDraftSamplerVocabParallel(CustomTestCase):
-    def _run(self, vocab, hidden, bs, block_size, world, dtype, weight=None):
+    def _run(
+        self, vocab, hidden, bs, block_size, world, dtype, weight=None, emit_probs=False
+    ):
         from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
 
         device = torch.device("cuda" if _HAS_CUDA else "cpu")
@@ -105,11 +124,14 @@ class TestDflashDraftSamplerVocabParallel(CustomTestCase):
                 org_vocab_start=r * shard,
                 max_bs=bs,
                 tp_group=group,
+                emit_probs=emit_probs,
             )
             for r in range(world)
         ]
-        for phase_recording in (True, False):
-            group.recording = phase_recording
+        # Phase 0 records all-gather inputs; phase 1 records partitions after
+        # those gathers resolve; phase 2 replays the out-of-place all-reduce.
+        for phase in range(3):
+            group.phase = phase
             for r, s in enumerate(samplers):
                 group.rank, group.call_idx = r, 0
                 s(hs)
@@ -123,10 +145,69 @@ class TestDflashDraftSamplerVocabParallel(CustomTestCase):
             torch.testing.assert_close(
                 s.out[:n], ref, rtol=0, atol=0, msg=f"rank {r} mismatch"
             )
+            if emit_probs:
+                logits = torch.matmul(ref_hs.to(weight.dtype), weight.T).float()
+                expected_probs = torch.softmax(logits, dim=-1).amax(dim=-1)
+                torch.testing.assert_close(
+                    s.out_probs[:n],
+                    expected_probs,
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=f"rank {r} probability mismatch",
+                )
 
     def test_matches_full_vocab_argmax(self):
         self._run(
             vocab=512, hidden=64, bs=3, block_size=8, world=4, dtype=torch.float32
+        )
+
+    def test_emits_selected_token_probability_for_adaptive_verify(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
+
+        device = torch.device("cuda" if _HAS_CUDA else "cpu")
+        generator = torch.Generator(device=device).manual_seed(7)
+        bs, block_size, vocab, hidden = 2, 5, 64, 16
+        weight = torch.randn(
+            vocab,
+            hidden,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        hidden_states = torch.randn(
+            bs * block_size,
+            hidden,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        sampler = _DflashDraftSampler(
+            weight=weight,
+            block_size=block_size,
+            num_org=vocab,
+            org_vocab_start=0,
+            max_bs=bs,
+            emit_probs=True,
+        )
+        sampler(hidden_states)
+
+        draft_hidden = hidden_states.view(bs, block_size, hidden)[:, 1:].reshape(
+            -1, hidden
+        )
+        logits = draft_hidden @ weight.T
+        expected = torch.softmax(logits, dim=-1).amax(dim=-1)
+        actual = sampler.out_probs[: bs * (block_size - 1)]
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_tp_emits_globally_normalized_probability(self):
+        self._run(
+            vocab=64,
+            hidden=16,
+            bs=2,
+            block_size=5,
+            world=4,
+            dtype=torch.float32,
+            emit_probs=True,
         )
 
     def test_shard_boundary_tie_resolves_to_first_global_index(self):
@@ -147,6 +228,71 @@ class TestDflashDraftSamplerVocabParallel(CustomTestCase):
             weight=weight,
         )
 
+
+class TestSelectorAdaptiveProbability(CustomTestCase):
+    def test_follows_realized_transition_rows(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _selector_path_probs
+
+        candidate_ids = torch.tensor([[[10, 11], [20, 21], [30, 31]]])
+        scores = torch.tensor(
+            [
+                [
+                    [[0.0, 2.0], [9.0, 9.0]],
+                    [[1.0, 3.0], [4.0, 0.0]],
+                    [[0.0, 5.0], [2.0, 1.0]],
+                ]
+            ]
+        )
+        tokens = torch.tensor([[11, 20, 31]])
+
+        actual = _selector_path_probs(
+            candidate_ids=candidate_ids, scores=scores, tokens=tokens
+        )
+        expected = torch.stack(
+            (
+                torch.softmax(scores[0, 0, 0], dim=-1)[1],
+                torch.softmax(scores[0, 1, 1], dim=-1)[0],
+                torch.softmax(scores[0, 2, 0], dim=-1)[1],
+            )
+        )[None]
+        torch.testing.assert_close(actual, expected)
+
+
+class TestQuantizedHeadAdaptiveProbability(CustomTestCase):
+    def test_emits_selected_token_probability(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        weight = torch.randn(13, 7, generator=torch.Generator().manual_seed(3))
+        hidden = torch.randn(5, 7, generator=torch.Generator().manual_seed(4))
+
+        class _FakeQuantMethod:
+            @staticmethod
+            def apply(layer, x, bias):
+                del bias
+                return x @ layer.qweight.T
+
+        lm_head = SimpleNamespace(
+            qweight=weight,
+            quant_method=_FakeQuantMethod(),
+            org_vocab_size=weight.shape[0],
+        )
+        with patch(
+            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            return_value=SimpleNamespace(world_size=1),
+        ):
+            tokens, probs = DFlashWorkerV2._greedy_sample_from_quantized_head(
+                SimpleNamespace(),
+                hidden_states=hidden,
+                lm_head=lm_head,
+                chunk_size=2,
+                return_probs=True,
+            )
+
+        logits = hidden @ weight.T
+        torch.testing.assert_close(tokens, logits.argmax(dim=-1))
+        torch.testing.assert_close(
+            probs, torch.softmax(logits, dim=-1).amax(dim=-1)
+        )
 
 @unittest.skipUnless(_HAS_CUDA, "triton kernel requires CUDA")
 class TestRebuildCompactDraftReqToToken(CustomTestCase):

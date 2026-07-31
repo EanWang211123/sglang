@@ -119,7 +119,8 @@ def domino_greedy_rollout(
     vocab_size: int,
     shift_label: bool,
     candidate_pool_size: int,
-) -> torch.Tensor:
+    return_probs: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Generate a Domino chain using one block-shared base-logit candidate pool."""
     if draft_hidden.ndim != 3:
         raise ValueError(
@@ -157,10 +158,24 @@ def domino_greedy_rollout(
     )
     base_logits = F.linear(logits_input, weight).view(num_proposals, batch_size, -1)
 
-    first_ids = torch.argmax(base_logits[0], dim=-1).to(torch.long)
+    first_max, first_ids = torch.max(base_logits[0], dim=-1)
+    first_ids = first_ids.to(torch.long)
     proposals = [first_ids]
+    proposal_probs = (
+        [
+            torch.exp(
+                first_max.float()
+                - torch.logsumexp(base_logits[0].float(), dim=-1)
+            )
+        ]
+        if return_probs
+        else None
+    )
     if num_proposals == 1:
-        return first_ids[:, None]
+        tokens = first_ids[:, None]
+        if proposal_probs is None:
+            return tokens
+        return tokens, proposal_probs[0][:, None]
 
     candidate_ids = None
     candidate_base = None
@@ -190,23 +205,34 @@ def domino_greedy_rollout(
         )
         if candidate_ids is None:
             correction = embed_proj[2](correction_hidden)
-            next_ids = torch.argmax(base_logits[index] + correction, dim=-1).to(
-                torch.long
-            )
+            step_logits = base_logits[index] + correction
+            step_max, next_ids = torch.max(step_logits, dim=-1)
+            next_ids = next_ids.to(torch.long)
         else:
             correction = torch.bmm(
                 candidate_weight, correction_hidden.unsqueeze(-1)
             ).squeeze(-1)
-            candidate_position = torch.argmax(
-                candidate_base[index - 1] + correction, dim=-1
-            )
+            step_logits = candidate_base[index - 1] + correction
+            step_max, candidate_position = torch.max(step_logits, dim=-1)
             next_ids = torch.gather(
                 candidate_ids, 1, candidate_position[:, None]
             ).squeeze(1)
         proposals.append(next_ids)
+        if proposal_probs is not None:
+            # Match the distribution actually used by the proposal path: full
+            # vocabulary without a pool, or the corrected candidate-pool logits.
+            proposal_probs.append(
+                torch.exp(
+                    step_max.float()
+                    - torch.logsumexp(step_logits.float(), dim=-1)
+                )
+            )
         if index + 1 < num_proposals:
             gru_hidden = _domino_gru_cell(
                 prefix_gru, target_embedding(next_ids), gru_hidden[0]
             )[None]
 
-    return torch.stack(proposals, dim=1)
+    tokens = torch.stack(proposals, dim=1)
+    if proposal_probs is None:
+        return tokens
+    return tokens, torch.stack(proposal_probs, dim=1)
