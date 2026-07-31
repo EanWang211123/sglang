@@ -476,14 +476,13 @@ class DraftBlockProposer:
         # Graph bucket selection uses the raw per-rank request counts.  Keep
         # them separate from global_num_tokens_cpu below, which is scaled into
         # draft-token units for DP/MoE synchronization.
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        forward_batch.original_global_num_tokens_cpu = list(batch.global_num_tokens)
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
-        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
         num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
         if num_token_non_padded is not None:
