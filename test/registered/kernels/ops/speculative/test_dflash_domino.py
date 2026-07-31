@@ -83,6 +83,24 @@ class TestDFlashDominoRollout(CustomTestCase):
                 )
                 torch.testing.assert_close(batched, individual, rtol=0, atol=0)
 
+    def test_emits_selected_token_probabilities(self):
+        expected_tokens = self.rollout(self.hidden, self.bonus_tokens, pool_size=5)
+        tokens, probs = domino_greedy_rollout(
+            draft_hidden=self.hidden,
+            bonus_tokens=self.bonus_tokens,
+            target_embedding=self.embedding,
+            lm_head_weight=self.lm_head_weight,
+            prefix_gru=self.prefix_gru,
+            embed_proj=self.embed_proj,
+            vocab_size=31,
+            shift_label=True,
+            candidate_pool_size=5,
+            return_probs=True,
+        )
+        torch.testing.assert_close(tokens, expected_tokens, rtol=0, atol=0)
+        self.assertEqual(probs.shape, tokens.shape)
+        self.assertTrue(bool(((probs > 0) & (probs <= 1)).all()))
+
     def test_sampler_replays_with_new_inputs(self):
         sampler = _DominoDraftSampler(
             target_embedding=self.embedding,
