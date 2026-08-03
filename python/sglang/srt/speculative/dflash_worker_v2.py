@@ -52,9 +52,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
     assign_req_to_token_pool_func,
-    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
