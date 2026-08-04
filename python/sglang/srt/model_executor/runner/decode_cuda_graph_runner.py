@@ -1144,8 +1144,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
+        # Some draft runners reuse this capture loop but intentionally skip
+        # DecodeCudaGraphRunner.__init__; they are never ragged-verify graphs.
+        ragged_verify_mode = getattr(self, "ragged_verify_mode", False)
+
         # Capture larger token shapes first so cuda graphs share memory better.
-        if self.ragged_verify_mode:
+        if ragged_verify_mode:
             assert self.ragged_capture_shapes is not None
             capture_shapes = sorted(
                 self.ragged_capture_shapes,
@@ -1202,7 +1206,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ) as forward:
                         capture_kwargs = (
                             {"num_tokens": num_tokens}
-                            if self.ragged_verify_mode
+                            if ragged_verify_mode
                             else {}
                         )
                         if dsa_variant is None:
