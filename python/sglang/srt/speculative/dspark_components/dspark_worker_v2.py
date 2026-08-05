@@ -701,3 +701,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def get_confidence_budget_prepare(self):
         return self._verify_planner.confidence_budget_prepare()
+
+    def get_last_budget_decision(self):
+        return self._verify_planner.peek_budget_decision()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import bisect
 import logging
+from functools import lru_cache
 from typing import Optional, Union
 
 import msgspec
@@ -22,6 +24,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_spec_params import load_batch_size_aware_config
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -258,6 +261,11 @@ class DSparkVerifyPlanner:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
+
+    def peek_budget_decision(self) -> Optional[VerifyBudgetDecision]:
+        if self._budget_planner is None:
+            return None
+        return self._budget_planner.last_decision
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -850,6 +858,48 @@ def ragged_capture_num_tokens(*, model_runner) -> Optional[list[int]]:
     return runner.capture_num_tokens
 
 
+@lru_cache(maxsize=16)
+def _load_capture_config_entries(
+    cfg_path: str,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    _, entries = load_batch_size_aware_config(cfg_path)
+    return tuple(
+        (bs, tuple(sorted(set(entry["candidate_steps"]))))
+        for bs, entry in sorted(entries.items())
+    )
+
+
+def dspark_capture_config_candidate_batch_tokens(
+    *,
+    num_reqs: int,
+    verify_num_draft_tokens: int,
+    model_runner,
+) -> Optional[list[int]]:
+    capture_num_tokens = ragged_capture_num_tokens(model_runner=model_runner)
+    if capture_num_tokens is None:
+        return None
+
+    server_args = getattr(model_runner, "server_args", None)
+    cfg_path = getattr(server_args, "speculative_dspark_cuda_graph_capture_config", None)
+    if not cfg_path:
+        return capture_num_tokens
+
+    frozen_entries = _load_capture_config_entries(cfg_path)
+    configured_bs = [bs for bs, _ in frozen_entries]
+    slot_index = max(0, bisect.bisect_right(configured_bs, int(num_reqs)) - 1)
+    _, candidate_steps = frozen_entries[slot_index]
+
+    bs = int(num_reqs)
+    bs_aware_tiers = sorted(
+        {
+            bs * (step + 1)
+            for step in candidate_steps
+            if 1 <= step + 1 <= verify_num_draft_tokens
+        }
+    )
+    return bs_aware_tiers or capture_num_tokens
+
+
 def ragged_capture_max_slots(*, model_runner) -> Optional[int]:
     runner = model_runner.decode_cuda_graph_runner
     if runner is None or not runner.ragged_verify_mode:
@@ -1133,11 +1183,13 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
-        candidate_batch_tokens = (
-            ragged_capture_num_tokens(model_runner=self._model_runner)
-            if self._use_graph_tier_candidates
-            else None
-        )
+        candidate_batch_tokens = None
+        if self._use_graph_tier_candidates:
+            candidate_batch_tokens = dspark_capture_config_candidate_batch_tokens(
+                num_reqs=int(req_pool_indices_cpu.numel()),
+                verify_num_draft_tokens=self.cfg.resolved_max_verify_len(),
+                model_runner=self._model_runner,
+            )
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,

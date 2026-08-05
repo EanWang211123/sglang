@@ -1121,6 +1121,7 @@ class Scheduler(
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.slo_prefill_controller: Optional[SloAwarePrefillController] = None
+        self._slo_adaptive_decode_cost: Optional[Tuple[int, float]] = None
         self.slo_prefill_log_interval = max(self.server_args.decode_log_interval, 1)
         self.slo_prefill_log_ct = 0
         self.max_prefill_bs: int = 0
@@ -3074,6 +3075,21 @@ class Scheduler(
                     chunked_req=self.chunked_req,
                 )
             )
+            adaptive_cost = self._slo_adaptive_decode_cost
+            adaptive_cost_applied = (
+                adaptive_cost is not None
+                and slo_prefill_pressure_state.has_decode_work
+                and adaptive_cost[0]
+                == len(
+                    self.slo_prefill_controller._decode_reqs(
+                        self.running_batch.reqs
+                    )
+                )
+            )
+            if adaptive_cost_applied:
+                slo_prefill_pressure_state = dataclasses.replace(
+                    slo_prefill_pressure_state, decode_cost_s=adaptive_cost[1]
+                )
             slo_prefill_pressure_state = self._sync_slo_prefill_pressure_state(
                 slo_prefill_pressure_state
             )
@@ -3108,6 +3124,8 @@ class Scheduler(
                     f"prefill_cost_ms_per_1k="
                     f"{slo_prefill_decision.prefill_cost_per_token_s * 1e6:.3f}, "
                     f"decode_cost_ms={slo_prefill_decision.decode_cost_s * 1e3:.3f}, "
+                    f"decode_cost_source="
+                    f"{'adaptive-prev' if adaptive_cost_applied else 'profile'}, "
                     f"decode_context_len={slo_prefill_decision.decode_context_len}, "
                     f"ttft_future_cost_ms="
                     f"{slo_prefill_decision.ttft_future_prefill_cost_s * 1e3:.3f}, "
@@ -4140,6 +4158,20 @@ class Scheduler(
                 self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
+                    budget_decision = (
+                        self.draft_worker.get_last_budget_decision()
+                        if self.slo_prefill_controller is not None
+                        else None
+                    )
+                    if (
+                        batch.forward_mode.is_decode()
+                        and budget_decision is not None
+                        and budget_decision.predicted_step_seconds is not None
+                    ):
+                        self._slo_adaptive_decode_cost = (
+                            batch.batch_size(),
+                            budget_decision.predicted_step_seconds,
+                        )
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
