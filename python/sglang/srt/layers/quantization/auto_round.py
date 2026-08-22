@@ -538,18 +538,27 @@ class AutoRoundConfig(QuantizationConfig):
             )
 
         if isinstance(layer, FusedMoE):
-            if use_marlin:
+            if use_marlin and layer.params_dtype == torch.float16:
                 return GPTQMarlinMoEMethod(quant_args_marlin)
-            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+            if use_marlin:
+                # GPTQ Marlin MoE currently creates FP16 scales, so its scale
+                # dtype does not match BF16 model activations. Keep FP16 models
+                # on Marlin and route BF16 models through MoeWNA16 instead.
+                from sglang.srt.layers.quantization.moe_wna16 import (
+                    MoeWNA16Config,
+                )
 
-            config = {
-                "quant_method": "gptq",
-                "bits": weight_bits,
-                "group_size": group_size,
-                "sym": sym,
-                "lm_head": False,
-            }
-            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
+                config = {
+                    "quant_method": "gptq",
+                    "bits": weight_bits,
+                    "group_size": group_size,
+                    "sym": sym,
+                    "lm_head": False,
+                }
+                return MoeWNA16Config.from_config(config).get_quant_method(
+                    layer, prefix
+                )
+            return GPTQMoEMethod(quant_args)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
