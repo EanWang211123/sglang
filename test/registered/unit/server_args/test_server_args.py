@@ -143,6 +143,20 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_config_prefers_canonical_store_action_over_deprecated_alias(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        merged = ConfigArgumentMerger(parser)._convert_config_to_args(
+            {"mamba-radix-cache-strategy": "no_buffer"}
+        )
+        parsed = parser.parse_args(["--model-path", "dummy", *merged])
+
+        self.assertEqual(
+            merged, ["--mamba-radix-cache-strategy", "no_buffer"]
+        )
+        self.assertEqual(parsed.mamba_radix_cache_strategy, "no_buffer")
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):
