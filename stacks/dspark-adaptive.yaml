@@ -1,0 +1,74 @@
+version: 1
+name: dspark-adaptive
+output_branch: feat/adaptive_spec_dspark/main
+status: active
+last_rebuilt: 2026-09-01
+
+base:
+  branch: upstream/main
+  head_at_rebuild: 783af667fb
+
+components:
+  - order: 1
+    id: dspark-tp-budget-sync
+    source_branch: fix/fix-dspark-verlen-confict-tp-ranks
+    source_pr: https://github.com/sgl-project/sglang/pull/31195
+    inclusion: direct_base
+    integrated_head: b5f638520a0b8cf91950e26099c3ccee778d497d
+
+  - order: 2
+    id: dspark-runtime-gamma
+    source_branch: fix/fix-dspark-compact-confidence-head-with-vargamma
+    source_pr: https://github.com/sgl-project/sglang/pull/31016
+    inclusion: rebased_patch
+    integrated_commit: 4a7c602a7b
+
+  - order: 3
+    id: dspark-profiling-guard
+    inclusion: feature_commit
+    integrated_commit: 988846a4e0
+    subject: "fix: remove is_all_verify flag when dspark profiling"
+
+  - order: 4
+    id: dspark-batch-aware-graph-tier
+    inclusion: feature_commit
+    integrated_commit: f044291e72
+    subject: "feat : add batch-size-aware tier wthin compact graph"
+
+  - order: 5
+    id: dspark-pre-budget-token-tier
+    inclusion: feature_commit
+    integrated_commit: 4229b39483
+    subject: "[feat] add batched-token tier for pre budget compute"
+
+  - order: 6
+    id: dspark-draft-extend-ragged-guard
+    inclusion: feature_commit
+    integrated_commit: 1956aed8d8
+    subject: "fix : draft-extend graph ragged_verify_mode loss gaurd"
+
+  - order: 7
+    id: dspark-runtime-config-adaptation
+    inclusion: feature_commit
+    integrated_commit: dd72332235
+    subject: "fix(dspark): adapt graph tiers to runtime config"
+
+rebase_notes:
+  - >-
+    The old compact prefill-plan race commit was omitted because upstream/main
+    contains the official #32467 resolution.
+  - >-
+    The old TP budget broadcast commit was omitted because the composition base
+    contains the newer SpecTpSync-based implementation from PR #31195.
+  - >-
+    Batch-aware graph capture was adapted to preserve current main's DSA dual
+    graphs, ragged layout staging, breakable graph events, and runtime config bags.
+
+validation:
+  completed:
+    - black --check on affected Python files
+    - python compileall on affected Python files
+    - git diff --check
+  unavailable:
+    - full pytest on the current Windows host because the Linux resource module is unavailable
+

@@ -1,0 +1,71 @@
+version: 1
+repository: EanWang211123/sglang
+upstream_repository: sgl-project/sglang
+last_updated: 2026-09-01
+
+branches:
+  - id: dspark-tp-budget-sync
+    name: fix/fix-dspark-verlen-confict-tp-ranks
+    remote: origin
+    type: community_pr
+    status: open
+    upstream_base: upstream/main
+    upstream_pr:
+      number: 31195
+      url: https://github.com/sgl-project/sglang/pull/31195
+      title: "Fix(DSpark): Broadcast Verify Budget Across TP Ranks for Compact Graph Tier Alignment"
+    remote_head: b5f638520a0b8cf91950e26099c3ccee778d497d
+    summary: >-
+      Broadcast TP0's verify-token budget before layout and graph-tier
+      selection so every TP rank replays the same compact target-verify graph.
+    maintenance:
+      force_push_allowed: true
+      last_rebased: 2026-09-01
+    consumed_by:
+      - feat/adaptive_spec_dspark/main
+
+  - id: dspark-runtime-gamma
+    name: fix/fix-dspark-compact-confidence-head-with-vargamma
+    remote: origin
+    type: community_pr
+    status: open
+    upstream_base: upstream/main
+    upstream_pr:
+      number: 31016
+      url: https://github.com/sgl-project/sglang/pull/31016
+      title: "Fix(DSpark): Use Runtime Gamma In DSpark Confidence Head During CUDA Graph Capture"
+    remote_head: 0e73a13332fee0776ff9ef7d81e13d510dd3e2de
+    summary: >-
+      Pass runtime gamma into the DSpark confidence head so a CLI block-size
+      override does not reshape CUDA-graph capture tensors with checkpoint gamma.
+    maintenance:
+      force_push_allowed: true
+      last_remote_update: 2026-09-01
+    consumed_by:
+      - feat/adaptive_spec_dspark/main
+
+  - id: dspark-adaptive
+    name: feat/adaptive_spec_dspark/main
+    remote: origin
+    type: maintained_feature
+    status: active
+    upstream_base: upstream/main
+    composition_base:
+      branch: fix/fix-dspark-verlen-confict-tp-ranks
+      head: b5f638520a0b8cf91950e26099c3ccee778d497d
+    remote_head: dd72332235aab9a60419ed9121fb6bc3e4195338
+    manifest: stacks/dspark-adaptive.yaml
+    summary: >-
+      Deployable DSpark adaptive scheduling feature combining runtime gamma,
+      TP-consistent verify budgets, batch-size-aware compact graph capture, and
+      graph-tier-aware budget selection.
+    maintenance:
+      force_push_allowed: true
+      last_rebased: 2026-09-01
+    dependencies:
+      - branch: fix/fix-dspark-verlen-confict-tp-ranks
+        relation: direct_base
+      - branch: fix/fix-dspark-compact-confidence-head-with-vargamma
+        relation: rebased_patch
+        integrated_commit: 4a7c602a7b
+
