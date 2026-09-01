@@ -17,6 +17,12 @@ flowchart TD
     branch_dspark_runtime_gamma["PR #31016 / open<br/>fix/fix-dspark-compact-confidence-head-with-vargamma<br/>0e73a13332"]
     base_upstream_main --> branch_dspark_runtime_gamma
     click branch_dspark_runtime_gamma "https://github.com/sgl-project/sglang/pull/31016"
+    branch_gptq_marlin_moe_bf16_w2_scales["PR #35955 / open<br/>fix/gptq-marlin-moe-bf16-w2-scales<br/>4af6f2bba9"]
+    base_upstream_main --> branch_gptq_marlin_moe_bf16_w2_scales
+    click branch_gptq_marlin_moe_bf16_w2_scales "https://github.com/sgl-project/sglang/pull/35955"
+    branch_replayssm_dflash_dspark["PR #36683 / open<br/>feat/ssm-ring-replay/main<br/>a69c58ed51"]
+    base_upstream_main --> branch_replayssm_dflash_dspark
+    click branch_replayssm_dflash_dspark "https://github.com/sgl-project/sglang/pull/36683"
     branch_dspark_adaptive["Maintained feature / active<br/>feat/adaptive_spec_dspark/main<br/>dd72332235"]
     click branch_dspark_adaptive "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/main"
     branch_dspark_tp_budget_sync -->|"direct base"| branch_dspark_adaptive
@@ -25,7 +31,7 @@ flowchart TD
     classDef pr fill:#fff3cd,stroke:#b58900,color:#3d3200
     classDef feature fill:#d9f7e8,stroke:#238636,color:#12351d
     class base_upstream_main base
-    class branch_dspark_tp_budget_sync,branch_dspark_runtime_gamma pr
+    class branch_dspark_tp_budget_sync,branch_dspark_runtime_gamma,branch_gptq_marlin_moe_bf16_w2_scales,branch_replayssm_dflash_dspark pr
     class branch_dspark_adaptive feature
 ```
 
