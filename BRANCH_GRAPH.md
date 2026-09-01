@@ -11,6 +11,9 @@ Solid arrows are direct bases or ordered stack composition. Dotted arrows are re
 ```mermaid
 flowchart TD
     base_upstream_main["upstream/main<br/>783af667fb"]
+    branch_dflash_dp_attn["PR #29506 / open<br/>feat/dflash/dp-attn<br/>15704c74d9"]
+    base_upstream_main --> branch_dflash_dp_attn
+    click branch_dflash_dp_attn "https://github.com/sgl-project/sglang/pull/29506"
     branch_dspark_tp_budget_sync["PR #31195 / open<br/>fix/fix-dspark-verlen-confict-tp-ranks<br/>b5f638520a"]
     base_upstream_main --> branch_dspark_tp_budget_sync
     click branch_dspark_tp_budget_sync "https://github.com/sgl-project/sglang/pull/31195"
@@ -31,7 +34,7 @@ flowchart TD
     classDef pr fill:#fff3cd,stroke:#b58900,color:#3d3200
     classDef feature fill:#d9f7e8,stroke:#238636,color:#12351d
     class base_upstream_main base
-    class branch_dspark_tp_budget_sync,branch_dspark_runtime_gamma,branch_gptq_marlin_moe_bf16_w2_scales,branch_replayssm_dflash_dspark pr
+    class branch_dflash_dp_attn,branch_dspark_tp_budget_sync,branch_dspark_runtime_gamma,branch_gptq_marlin_moe_bf16_w2_scales,branch_replayssm_dflash_dspark pr
     class branch_dspark_adaptive feature
 ```
 

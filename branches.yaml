@@ -4,6 +4,29 @@ upstream_repository: sgl-project/sglang
 last_updated: 2026-09-01
 
 branches:
+  - id: dflash-dp-attn
+    name: feat/dflash/dp-attn
+    remote: origin
+    type: community_pr
+    status: open
+    upstream_base: upstream/main
+    upstream_pr:
+      number: 29506
+      url: https://github.com/sgl-project/sglang/pull/29506
+      title: "[FEAT][SpecDecode] Add DP attention support for DFLASH speculative decoding"
+    remote_head: 15704c74d951268a6ce0e4f8c75a69e8ed28a7a2
+    summary: >-
+      Run the DFlash draft and speculative state synchronization inside each
+      DP rank's attention-TP group, keep IDLE ranks in full-TP target verify,
+      align the DP-local CUDA graph path, and trim EP-padded target hidden rows.
+    maintenance:
+      force_push_allowed: true
+      last_rebased: 2026-09-01
+    validation:
+      status: passed
+      date: 2026-09-01
+      scope: DFlash serving with DP attention
+
   - id: dspark-tp-budget-sync
     name: fix/fix-dspark-verlen-confict-tp-ranks
     remote: origin

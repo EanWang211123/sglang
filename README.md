@@ -13,6 +13,7 @@ branch.
 
 | Branch | Type | Purpose |
 | --- | --- | --- |
+| `feat/dflash/dp-attn` | Community PR | Enable DFlash speculative decoding under DP attention with DP-local draft execution and synchronization. |
 | `fix/fix-dspark-verlen-confict-tp-ranks` | Community PR | Keep DSpark verify budgets and compact graph tiers consistent across TP ranks. |
 | `fix/fix-dspark-compact-confidence-head-with-vargamma` | Community PR | Use runtime gamma in the DSpark confidence head. |
 | `fix/gptq-marlin-moe-bf16-w2-scales` | Community PR | Fix BF16 and TP act-order w2 scale handling in GPTQ Marlin MoE. |
