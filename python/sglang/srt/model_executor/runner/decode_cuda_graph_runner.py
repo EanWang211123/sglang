@@ -545,7 +545,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _build_ragged_verify_capture_shapes(self) -> list[tuple[int, int, int]]:
         cfg_path = (
-            self.model_runner.server_args.speculative_dspark_cuda_graph_capture_config
+            get_spec().speculative_dspark_cuda_graph_capture_config
             if self.model_runner.spec_algorithm.is_dspark()
             else None
         )
@@ -565,9 +565,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         seen_tiers = set()
         shapes = []
         for bs in sorted(self.capture_bs):
-            slot = configured_bs[
-                max(0, bisect.bisect_right(configured_bs, bs) - 1)
-            ]
+            slot = configured_bs[max(0, bisect.bisect_right(configured_bs, bs) - 1)]
             for candidate_step in sorted(set(entries[slot]["candidate_steps"])):
                 query_len = candidate_step + 1
                 if not 1 <= query_len <= self.captured_req_width:
@@ -1162,9 +1160,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 for bs in reversed(self.capture_bs)
             ]
         capture_range = (
-            tqdm.tqdm(capture_shapes)
-            if get_parallel().tp_rank == 0
-            else capture_shapes
+            tqdm.tqdm(capture_shapes) if get_parallel().tp_rank == 0 else capture_shapes
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
@@ -1205,9 +1201,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
                         capture_kwargs = (
-                            {"num_tokens": num_tokens}
-                            if ragged_verify_mode
-                            else {}
+                            {"num_tokens": num_tokens} if ragged_verify_mode else {}
                         )
                         if dsa_variant is None:
                             self.capture_one_shape(

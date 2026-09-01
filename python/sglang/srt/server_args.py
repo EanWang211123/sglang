@@ -2127,6 +2127,7 @@ class ServerArgs:
         "query length is candidate + 1 and batch_size * (candidate + 1) produces "
         "a token-keyed graph tier. Duplicate tiers are captured once. Omit to "
         "retain the default decode.bs * verify-window tiers.",
+        NS("spec"),
     ] = None
     speculative_dspark_confidence_sts_path: A[
         Optional[str],

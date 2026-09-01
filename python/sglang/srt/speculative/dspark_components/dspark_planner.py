@@ -985,9 +985,7 @@ def compute_verify_token_budget(
             {
                 tier - num_requests
                 for tier in candidate_batch_tokens
-                if num_requests
-                <= tier
-                <= num_requests * max_len
+                if num_requests <= tier <= num_requests * max_len
                 and tier - num_requests < tau_star.numel()
             }
         )
