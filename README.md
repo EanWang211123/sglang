@@ -21,6 +21,31 @@ Machine-readable details live in [`branches.yaml`](branches.yaml). Composition
 details for the maintained feature live in
 [`stacks/dspark-adaptive.yaml`](stacks/dspark-adaptive.yaml).
 
+The generated branch and stack diagrams live in
+[`BRANCH_GRAPH.md`](BRANCH_GRAPH.md).
+
+## Generate the branch graph
+
+Install the only dependency and render the graph from the YAML registry:
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/render_branch_graph.py
+```
+
+Check that the committed graph is current without modifying files:
+
+```bash
+python scripts/render_branch_graph.py --check
+```
+
+Refresh every registered `remote_head` with `git ls-remote`, update
+`last_updated`, and regenerate the graph:
+
+```bash
+python scripts/render_branch_graph.py --refresh-heads
+```
+
 ## Update rules
 
 1. Update `remote_head` after rebasing or force-pushing a registered branch.
@@ -31,4 +56,5 @@ details for the maintained feature live in
    `--force-with-lease` when publishing it.
 5. Record conflict decisions and validation results in the corresponding stack
    manifest.
+6. Regenerate `BRANCH_GRAPH.md` after changing registry or stack YAML.
 
