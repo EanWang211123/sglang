@@ -77,6 +77,12 @@ components:
     integrated_commit: ed0a00def8
     subject: "fix(dspark): harden startup profiling lifecycle"
 
+  - order: 12
+    id: dspark-profile-grid-clamp
+    inclusion: feature_commit
+    integrated_commit: cda10685f9
+    subject: "fix(dspark): clamp startup profile grid to graph capacity"
+
 rebase_notes:
   - >-
     The old compact prefill-plan race commit was omitted because upstream/main
