@@ -26,7 +26,7 @@ flowchart TD
     branch_replayssm_dflash_dspark["PR #36683 / open<br/>feat/ssm-ring-replay/main<br/>a69c58ed51"]
     base_upstream_main --> branch_replayssm_dflash_dspark
     click branch_replayssm_dflash_dspark "https://github.com/sgl-project/sglang/pull/36683"
-    branch_dspark_adaptive["Maintained feature / active<br/>feat/adaptive_spec_dspark/main<br/>cda10685f9"]
+    branch_dspark_adaptive["Maintained feature / active<br/>feat/adaptive_spec_dspark/main<br/>8cf302673e"]
     click branch_dspark_adaptive "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/main"
     branch_dspark_tp_budget_sync -->|"direct base"| branch_dspark_adaptive
     branch_dspark_runtime_gamma -.->|"rebased patch / 4a7c602a7b"| branch_dspark_adaptive
@@ -71,6 +71,8 @@ flowchart LR
     stack_dspark_adaptive_10 --> stack_dspark_adaptive_11
     stack_dspark_adaptive_12["dspark-profile-grid-clamp<br/>feature_commit<br/>cda10685f9"]
     stack_dspark_adaptive_11 --> stack_dspark_adaptive_12
+    stack_dspark_adaptive_13["dspark-profile-prefill-split<br/>feature_commit<br/>8cf302673e"]
+    stack_dspark_adaptive_12 --> stack_dspark_adaptive_13
     stack_output_dspark_adaptive["feat/adaptive_spec_dspark/main<br/>active"]
-    stack_dspark_adaptive_12 --> stack_output_dspark_adaptive
+    stack_dspark_adaptive_13 --> stack_output_dspark_adaptive
 ```

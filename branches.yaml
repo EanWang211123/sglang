@@ -112,7 +112,7 @@ branches:
     composition_base:
       branch: fix/fix-dspark-verlen-confict-tp-ranks
       head: b5f638520a0b8cf91950e26099c3ccee778d497d
-    remote_head: cda10685f9c8c51fd67c3b2e4419342c994fb4fa
+    remote_head: 8cf302673e2b9d6d980a6aaec2d07a34a5c1148d
     manifest: stacks/dspark-adaptive.yaml
     summary: >-
       Deployable DSpark adaptive scheduling feature combining runtime gamma,

@@ -83,6 +83,12 @@ components:
     integrated_commit: cda10685f9
     subject: "fix(dspark): clamp startup profile grid to graph capacity"
 
+  - order: 13
+    id: dspark-profile-prefill-split
+    inclusion: feature_commit
+    integrated_commit: 8cf302673e
+    subject: "fix(dspark): split oversized profile prefills"
+
 rebase_notes:
   - >-
     The old compact prefill-plan race commit was omitted because upstream/main
