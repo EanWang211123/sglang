@@ -112,15 +112,16 @@ branches:
     composition_base:
       branch: fix/fix-dspark-verlen-confict-tp-ranks
       head: b5f638520a0b8cf91950e26099c3ccee778d497d
-    remote_head: dd72332235aab9a60419ed9121fb6bc3e4195338
+    remote_head: ed0a00def8b2aa8b9861bdd7b7c69f4e304dc5ba
     manifest: stacks/dspark-adaptive.yaml
     summary: >-
       Deployable DSpark adaptive scheduling feature combining runtime gamma,
-      TP-consistent verify budgets, batch-size-aware compact graph capture, and
-      graph-tier-aware budget selection.
+      TP-consistent verify budgets, batch-size-aware compact graph capture,
+      graph-tier-aware budget selection, and online startup cost profiling.
     maintenance:
       force_push_allowed: true
       last_rebased: 2026-09-01
+      last_remote_update: 2026-09-03
     dependencies:
       - branch: fix/fix-dspark-verlen-confict-tp-ranks
         relation: direct_base

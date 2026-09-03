@@ -2,7 +2,7 @@ version: 1
 name: dspark-adaptive
 output_branch: feat/adaptive_spec_dspark/main
 status: active
-last_rebuilt: 2026-09-01
+last_rebuilt: 2026-09-03
 
 base:
   branch: upstream/main
@@ -53,6 +53,30 @@ components:
     integrated_commit: dd72332235
     subject: "fix(dspark): adapt graph tiers to runtime config"
 
+  - order: 8
+    id: dspark-online-startup-profile
+    inclusion: feature_commit
+    integrated_commit: 7b91216041
+    subject: "feat(dspark): profile adaptive verify costs at startup"
+
+  - order: 9
+    id: dspark-profile-worker-api-fix
+    inclusion: feature_commit
+    integrated_commit: cf593179d0
+    subject: "fix(dspark): use current spec algorithm field in profiler"
+
+  - order: 10
+    id: dspark-profile-pool-fix
+    inclusion: feature_commit
+    integrated_commit: 01dcb70cf3
+    subject: "fix(dspark): use target model runner pools for profiling"
+
+  - order: 11
+    id: dspark-profile-lifecycle-fix
+    inclusion: feature_commit
+    integrated_commit: ed0a00def8
+    subject: "fix(dspark): harden startup profiling lifecycle"
+
 rebase_notes:
   - >-
     The old compact prefill-plan race commit was omitted because upstream/main
@@ -69,6 +93,6 @@ validation:
     - black --check on affected Python files
     - python compileall on affected Python files
     - git diff --check
+    - mypy on the startup profiler module
   unavailable:
     - full pytest on the current Windows host because the Linux resource module is unavailable
-

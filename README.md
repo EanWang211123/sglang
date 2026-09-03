@@ -18,7 +18,7 @@ branch.
 | `fix/fix-dspark-compact-confidence-head-with-vargamma` | Community PR | Use runtime gamma in the DSpark confidence head. |
 | `fix/gptq-marlin-moe-bf16-w2-scales` | Community PR | Fix BF16 and TP act-order w2 scale handling in GPTQ Marlin MoE. |
 | `feat/ssm-ring-replay/main` | Community PR | Support ReplaySSM verification for DFlash and DSpark on hybrid GDN models. |
-| `feat/adaptive_spec_dspark/main` | Maintained feature | Integrate DSpark runtime gamma, TP consistency, and batch-aware adaptive graph tiers. |
+| `feat/adaptive_spec_dspark/main` | Maintained feature | Integrate DSpark runtime gamma, TP consistency, batch-aware adaptive graph tiers, and online startup cost profiling. |
 
 Machine-readable details live in [`branches.yaml`](branches.yaml). Composition
 details for the maintained feature live in
