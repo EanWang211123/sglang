@@ -297,7 +297,14 @@ class DSparkProfileSession:
             self._teardown(reqs)
 
     def _build_batch(self) -> tuple[list[Req], ScheduleBatch]:
-        model_config = self.worker.model_config
+        model_runner = self.worker.model_runner
+        model_config = model_runner.model_config
+        req_to_token_pool = model_runner.req_to_token_pool
+        token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        if req_to_token_pool is None or token_to_kv_pool_allocator is None:
+            raise RuntimeError(
+                "DSpark startup profiling requires initialized target memory pools"
+            )
         vocab_size = getattr(model_config, "vocab_size", 32000)
         sampling_params = SamplingParams(
             temperature=0.0,
@@ -328,12 +335,12 @@ class DSparkProfileSession:
 
         return reqs, ScheduleBatch.init_new(
             reqs,
-            self.worker.req_to_token_pool,
-            self.worker.token_to_kv_pool_allocator,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
             self.tree_cache,
             model_config,
             False,
-            self.worker.model_runner.spec_algorithm,
+            model_runner.spec_algorithm,
         )
 
     def _run_decode(self, batch: ScheduleBatch) -> None:
