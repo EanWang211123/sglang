@@ -4,10 +4,10 @@ Config example::
 
     {
       "batch_sizes": [1, 4, 8, 16],
-      "seq_len": 2048,
+      "seq_len": 128,
       "query_lens_per_req": [2, 4, 6, 8],
-      "n_warmup": 5,
-      "n_measure": 10
+      "n_warmup": 1,
+      "n_measure": 3
     }
 """
 
@@ -45,10 +45,10 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class AdaptiveVerifyProfileConfig:
     batch_sizes: Optional[list[int]] = None
-    seq_len: int = 2048
+    seq_len: int = 128
     query_lens_per_req: Optional[list[int]] = None
-    n_warmup: int = 5
-    n_measure: int = 10
+    n_warmup: int = 1
+    n_measure: int = 3
 
 
 def load_adaptive_verify_profile_config(value: str) -> AdaptiveVerifyProfileConfig:
