@@ -29,7 +29,7 @@ import torch.distributed as dist
 from sglang.srt.distributed import get_world_group
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     ragged_capture_max_slots,
@@ -279,20 +279,10 @@ class DSparkProfileSession:
         self.forward_iter = 0
 
     def measure(self) -> float:
-        reqs, batch = self._build_batch()
+        reqs = self._build_reqs()
         primary_error = None
         try:
-            self._set_dp_counts(batch, self.batch_size * self.seq_len)
-            batch.prepare_for_extend()
-            if (
-                batch.input_ids is None
-                and getattr(batch, "prefill_input_ids_cpu", None) is not None
-            ):
-                batch.input_ids = batch.prefill_input_ids_cpu.to(
-                    self.worker.device, non_blocking=True
-                )
-                batch.prefill_input_ids_cpu = None
-            self._run_forward_isolated(batch)
+            batch = self._run_prefill(reqs)
 
             for _ in range(self.n_warmup):
                 self._run_decode(batch)
@@ -314,15 +304,9 @@ class DSparkProfileSession:
                     "an earlier profiling error"
                 )
 
-    def _build_batch(self) -> tuple[list[Req], ScheduleBatch]:
+    def _build_reqs(self) -> list[Req]:
         model_runner = self.worker.model_runner
         model_config = model_runner.model_config
-        req_to_token_pool = model_runner.req_to_token_pool
-        token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
-        if req_to_token_pool is None or token_to_kv_pool_allocator is None:
-            raise RuntimeError(
-                "DSpark startup profiling requires initialized target memory pools"
-            )
         vocab_size = getattr(model_config, "vocab_size", 32000)
         sampling_params = SamplingParams(
             temperature=0.0,
@@ -353,16 +337,61 @@ class DSparkProfileSession:
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
             reqs.append(req)
+        return reqs
 
-        return reqs, ScheduleBatch.init_new(
+    def _build_batch(self, reqs: list[Req]) -> ScheduleBatch:
+        model_runner = self.worker.model_runner
+        req_to_token_pool = model_runner.req_to_token_pool
+        token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        if req_to_token_pool is None or token_to_kv_pool_allocator is None:
+            raise RuntimeError(
+                "DSpark startup profiling requires initialized target memory pools"
+            )
+        return ScheduleBatch.init_new(
             reqs,
             req_to_token_pool,
             token_to_kv_pool_allocator,
             self.tree_cache,
-            model_config,
+            model_runner.model_config,
             False,
             model_runner.spec_algorithm,
         )
+
+    def _run_prefill(self, reqs: list[Req]) -> ScheduleBatch:
+        # DeepSeek-V4's compressor prefill plan stores num_q_tokens in uint16.
+        # Also honor the scheduler's resolved prefill admission/memory ceiling.
+        max_prefill_tokens = min(
+            int(get_schedule().max_prefill_tokens or (2**16 - 1)), 2**16 - 1
+        )
+        reqs_per_batch = max_prefill_tokens // self.seq_len
+        if reqs_per_batch < 1:
+            raise ValueError(
+                "adaptive verify profile seq_len exceeds the per-forward prefill "
+                f"limit: {self.seq_len} > {max_prefill_tokens}"
+            )
+
+        merged_batch = None
+        for start in range(0, len(reqs), reqs_per_batch):
+            prefill_reqs = reqs[start : start + reqs_per_batch]
+            batch = self._build_batch(prefill_reqs)
+            self._set_dp_counts(batch, len(prefill_reqs) * self.seq_len)
+            batch.prepare_for_extend()
+            if (
+                batch.input_ids is None
+                and getattr(batch, "prefill_input_ids_cpu", None) is not None
+            ):
+                batch.input_ids = batch.prefill_input_ids_cpu.to(
+                    self.worker.device, non_blocking=True
+                )
+                batch.prefill_input_ids_cpu = None
+            self._run_forward_isolated(batch)
+            if merged_batch is None:
+                merged_batch = batch
+            else:
+                merged_batch.merge_batch(batch)
+
+        assert merged_batch is not None
+        return merged_batch
 
     def _run_decode(self, batch: ScheduleBatch) -> None:
         batch.prepare_for_decode()
