@@ -5,7 +5,7 @@ Config example::
     {
       "batch_sizes": [1, 4, 8, 16],
       "seq_len": 2048,
-      "query_lens_per_req": [1, 4, 6, 8],
+      "query_lens_per_req": [2, 4, 6, 8],
       "n_warmup": 5,
       "n_measure": 10
     }
@@ -124,7 +124,7 @@ def resolve_profile_grid(
             f"profile batch size {batch_sizes[-1]} exceeds resolved per-rank "
             f"max_running_requests={max_batch_size_per_rank}"
         )
-    default_query_lens = [1, *range(4, max_query_len_per_req + 1, 2)]
+    default_query_lens = list(range(2, max_query_len_per_req + 1, 2))
     default_query_lens.append(max_query_len_per_req)
     query_lens = sorted(set(cfg.query_lens_per_req or default_query_lens))
     if query_lens[-1] > max_query_len_per_req:
@@ -149,7 +149,7 @@ def run_adaptive_verify_profile(
         max_batch_size_per_rank=max_running_requests,
         max_query_len_per_req=worker.verify_num_draft_tokens,
     )
-    _validate_profile_grid(worker, batch_sizes, query_lens)
+    batch_sizes = _validate_profile_grid(worker, batch_sizes, query_lens)
     num_cells = len(batch_sizes) * len(query_lens)
     if num_cells < 4:
         raise ValueError(
@@ -216,15 +216,19 @@ def run_adaptive_verify_profile(
     )
 
 
-def _validate_profile_grid(worker, batch_sizes, query_lens) -> None:
+def _validate_profile_grid(worker, batch_sizes, query_lens) -> list[int]:
     capture_tokens = ragged_capture_num_tokens(model_runner=worker.model_runner)
     max_slots = ragged_capture_max_slots(model_runner=worker.model_runner)
     if capture_tokens is None or max_slots is None:
         raise ValueError("adaptive verify profiling requires compact CUDA graphs")
     if batch_sizes[-1] > max_slots:
-        raise ValueError(
-            f"profile batch size {batch_sizes[-1]} exceeds compact graph "
-            f"max batch size {max_slots}"
+        original_max = batch_sizes[-1]
+        batch_sizes = sorted({min(batch_size, max_slots) for batch_size in batch_sizes})
+        logger.info(
+            "Clamped adaptive verify profile batch sizes to compact graph max "
+            "batch size %d (configured max was %d)",
+            max_slots,
+            original_max,
         )
     max_profile_tokens = max(
         batch_size * query_len for batch_size in batch_sizes for query_len in query_lens
@@ -234,6 +238,7 @@ def _validate_profile_grid(worker, batch_sizes, query_lens) -> None:
             f"profile batch tokens {max_profile_tokens} exceed compact graph "
             f"maximum {capture_tokens[-1]}"
         )
+    return batch_sizes
 
 
 @contextmanager
