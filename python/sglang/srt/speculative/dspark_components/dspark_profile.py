@@ -271,9 +271,11 @@ class DSparkProfileSession:
         self.n_warmup = n_warmup
         self.n_measure = n_measure
         self.device_mod = torch.get_device_module(worker.device)
+        self.forward_iter = 0
 
     def measure(self) -> float:
         reqs, batch = self._build_batch()
+        primary_error = None
         try:
             self._set_dp_counts(batch, self.batch_size * self.seq_len)
             batch.prepare_for_extend()
@@ -293,8 +295,19 @@ class DSparkProfileSession:
 
             samples = self._measure_decode_steps(batch)
             return statistics.median(self._reduce_mean_across_ranks(samples))
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self._teardown(reqs)
+            try:
+                self._teardown(reqs)
+            except Exception:
+                if primary_error is None:
+                    raise
+                logger.exception(
+                    "Failed to clean up DSpark profiling requests while handling "
+                    "an earlier profiling error"
+                )
 
     def _build_batch(self) -> tuple[list[Req], ScheduleBatch]:
         model_runner = self.worker.model_runner
@@ -330,7 +343,10 @@ class DSparkProfileSession:
             )
             req.full_untruncated_fill_ids = req.origin_input_ids
             req.logprob_start_len = -1
-            req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+            req.init_next_round_input(self.tree_cache)
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             reqs.append(req)
 
         return reqs, ScheduleBatch.init_new(
@@ -352,7 +368,13 @@ class DSparkProfileSession:
             batch.global_spec_verify_tier_num_tokens = [
                 verify_tokens
             ] * get_parallel().dp_size
-        self._run_forward_isolated(batch)
+        result = self._run_forward_isolated(batch)
+        if not result.can_run_cuda_graph:
+            raise RuntimeError(
+                "DSpark adaptive verify profiling did not run on a CUDA graph: "
+                f"batch_size={self.batch_size}, "
+                f"query_len_per_req={self.query_len_per_req}"
+            )
 
     def _measure_decode_steps(self, batch: ScheduleBatch) -> list[float]:
         events = []
@@ -385,7 +407,9 @@ class DSparkProfileSession:
         batch.global_num_tokens = counts
         batch.global_num_tokens_for_logprob = counts
 
-    def _run_forward_isolated(self, batch: ScheduleBatch) -> None:
+    def _run_forward_isolated(self, batch: ScheduleBatch):
+        self.forward_iter += 1
+        batch.forward_iter = self.forward_iter
         snapshot = {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
         sampling_info = batch.sampling_info
         if sampling_info is not None:
@@ -404,6 +428,7 @@ class DSparkProfileSession:
             for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
                 req.kv.kv_committed_len = int(seq_len)
         batch.input_ids = None
+        return result
 
     def _teardown(self, reqs: list[Req]) -> None:
         errors = []

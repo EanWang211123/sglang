@@ -1082,11 +1082,14 @@ def _additive_step_time_tensor(
     m = (num_requests + budgets.to(torch.float64)).clamp_(
         min=float(table.m_probes[0]), max=float(table.m_probes[-1])
     )
-    hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
-    lo = hi - 1
-    span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
-    frac = (m - m_probes[lo]) / span
-    theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
+    if m_probes.numel() == 1:
+        theta_at_m = theta_vals[0].expand_as(m)
+    else:
+        hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
+        lo = hi - 1
+        span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
+        frac = (m - m_probes[lo]) / span
+        theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
     return floor + theta_at_m
 
 
