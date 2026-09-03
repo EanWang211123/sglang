@@ -394,6 +394,9 @@ class DSparkProfileSession:
         return merged_batch
 
     def _run_decode(self, batch: ScheduleBatch) -> None:
+        # Profiling runs the same synthetic decode batch on every rank, so this
+        # mirrors the scheduler's successful decode-graph eligibility vote.
+        batch.can_run_decode_cuda_graph = True
         batch.prepare_for_decode()
         self._set_dp_counts(batch, self.batch_size)
         verify_tokens = self.batch_size * self.query_len_per_req
