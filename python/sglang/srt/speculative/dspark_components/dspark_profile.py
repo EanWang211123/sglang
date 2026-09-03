@@ -333,7 +333,7 @@ class DSparkProfileSession:
             self.tree_cache,
             model_config,
             False,
-            self.worker.speculative_algorithm,
+            self.worker.model_runner.spec_algorithm,
         )
 
     def _run_decode(self, batch: ScheduleBatch) -> None:
