@@ -132,6 +132,8 @@ class DSparkVerifyPlanner:
         self._ragged_verify_mode = read_ragged_verify_mode()
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
+        self._profile_verify_token_budget: Optional[int] = None
+        self._profile_verify_len_per_req: Optional[int] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
@@ -245,6 +247,20 @@ class DSparkVerifyPlanner:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
+
+    def set_profile_verify_token_budget(self, budget: Optional[int]) -> None:
+        self._profile_verify_token_budget = budget
+
+    def set_profile_verify_len_per_req(self, query_len: Optional[int]) -> None:
+        self._profile_verify_len_per_req = query_len
+
+    def install_sps_table(
+        self, table: Union[SpsCostTable, SpsAdditiveCostTable]
+    ) -> None:
+        if self._budget_planner is None:
+            raise RuntimeError("DSpark verify budget planner is not initialized")
+        self._budget_planner.sps_table = table
+        self._is_verify_all = False
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -373,7 +389,9 @@ class DSparkVerifyPlanner:
         the draft input by prepare_verify_budget; otherwise compute it now."""
         if not self.schedules_verify_budget or confidence is None:
             return None
-        if not get_schedule().disable_overlap_schedule:
+        if self._profile_verify_token_budget is not None:
+            budget = self._profile_verify_token_budget
+        elif not get_schedule().disable_overlap_schedule:
             budget = draft_input.verify_token_budget
         else:
             budget = self.compute_budget_sync(
@@ -436,6 +454,25 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if self._profile_verify_len_per_req is not None:
+            bs = int(req_pool_indices.shape[0])
+            tier_num_reqs = bs if global_num_reqs is None else global_num_reqs
+            tier_num_tokens = (
+                tier_num_reqs * self._profile_verify_len_per_req
+                if dp_tier_num_tokens is None
+                else dp_tier_num_tokens
+            )
+            verify_lens_cpu = [self._profile_verify_len_per_req] * bs
+            return RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=verify_lens_cpu,
+                device=device,
+                grid=verify_layout_grid(
+                    verify_lens_cpu=verify_lens_cpu,
+                    ragged_verify_mode=self._ragged_verify_mode,
+                    model_runner=self.model_runner,
+                ),
+                graph_num_tokens_floor=tier_num_tokens,
+            )
         forced_budget_frac = (
             self._budget_planner.forced_budget_frac
             if self._budget_planner is not None
@@ -446,6 +483,7 @@ class DSparkVerifyPlanner:
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
             and not envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
             and forced_budget_frac is None
+            and self._profile_verify_token_budget is None
         ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
@@ -1057,7 +1095,7 @@ class HostConfidenceBudgetPlanner:
     def __init__(
         self,
         *,
-        sps_table: SpsCostTable,
+        sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,

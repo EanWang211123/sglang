@@ -536,6 +536,33 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
         )
+    adaptive_profile_enabled = (
+        cfg.enable_adaptive_verify_profile or cfg.adaptive_verify_profile_config
+    )
+    if adaptive_profile_enabled:
+        if _is_npu:
+            raise ValueError(
+                "Adaptive verify profiling currently supports CUDA/ROCm only."
+            )
+        if cfg.speculative_dspark_sps_table_path:
+            raise ValueError(
+                "Adaptive verify profiling and --speculative-dspark-sps-table-path "
+                "are mutually exclusive."
+            )
+        if ragged_mode is not RaggedVerifyMode.COMPACT:
+            raise ValueError(
+                "Adaptive verify profiling requires SGLANG_RAGGED_VERIFY_MODE=compact."
+            )
+        if cfg.disable_cuda_graph:
+            raise ValueError(
+                "Adaptive verify profiling requires CUDA graph to be enabled."
+            )
+        if cfg.adaptive_verify_profile_config:
+            from sglang.srt.speculative.dspark_components.dspark_profile import (
+                load_adaptive_verify_profile_config,
+            )
+
+            load_adaptive_verify_profile_config(cfg.adaptive_verify_profile_config)
 
 
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:

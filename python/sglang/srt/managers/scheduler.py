@@ -1021,6 +1021,13 @@ class Scheduler(
             )
             self.draft_worker.init_hicache_draft_plan()
 
+    def maybe_run_spec_startup_profiling(self) -> None:
+        if self.draft_worker is not None:
+            self.draft_worker.run_startup_spec_profiling(
+                self.tree_cache,
+                max_running_requests=self.max_running_requests,
+            )
+
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
@@ -5451,6 +5458,8 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        scheduler.maybe_run_spec_startup_profiling()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
