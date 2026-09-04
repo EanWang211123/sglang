@@ -303,6 +303,12 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+    def run_startup_spec_profiling(
+        self, tree_cache, *, max_running_requests: int
+    ) -> None:
+        """Optional startup profiling hook, after graph capture and pool setup."""
+        pass
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         for runner in self.draft_worker.draft_runners:
             success, message = runner.weight_updater.update_weights_from_disk(

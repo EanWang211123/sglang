@@ -449,6 +449,24 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
+    def run_startup_spec_profiling(
+        self, tree_cache, *, max_running_requests: int
+    ) -> None:
+        if not (
+            self.server_args.enable_adaptive_verify_profile
+            or self.server_args.adaptive_verify_profile_config
+        ):
+            return
+        from sglang.srt.speculative.dspark_components.dspark_profile import (
+            run_adaptive_verify_profile,
+        )
+
+        run_adaptive_verify_profile(
+            worker=self,
+            tree_cache=tree_cache,
+            max_running_requests=max_running_requests,
+        )
+
     def dump_info_records(self) -> Optional[dict]:
         return self._observers.dump_info_records()
 

@@ -2118,9 +2118,25 @@ class ServerArgs:
         "gain by itself).",
         NS("spec"),
     ] = None
+    enable_adaptive_verify_profile: A[
+        bool,
+        "DSPARK compact verify only. Run startup adaptive-verify profiling with "
+        "the built-in profile grid. --adaptive-verify-profile-config overrides "
+        "the built-in parameters.",
+        NS("spec"),
+    ] = False
+    adaptive_verify_profile_config: A[
+        Optional[str],
+        "DSPARK compact verify only. Inline JSON startup-profiling config. "
+        "After CUDA graph capture, profiles (per-rank batch size, actual "
+        "verify-lens length) cells and installs the fitted two-dimensional SPS "
+        "cost table. "
+        "Keys: batch_sizes, seq_len, query_lens_per_req, n_warmup, n_measure.",
+        NS("spec"),
+    ] = None
     speculative_dspark_cuda_graph_capture_config: A[
         Optional[str],
-        "DSPARK compact ragged-verify only. Path to a batch-size-aware JSON config "
+        "DSPARK compact ragged-verify only. Inline batch-size-aware JSON config "
         "that selects CUDA graph token tiers. It uses the adaptive speculative "
         'decoding schema, for example {"4": {"candidate_steps": [2,4,5,6]}}. '
         "Each candidate is the DSpark gamma/block size, so the per-request verify "

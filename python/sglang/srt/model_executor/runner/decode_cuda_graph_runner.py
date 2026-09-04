@@ -544,18 +544,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_capture_shapes(self) -> list[tuple[int, int, int]]:
-        cfg_path = (
+        capture_config = (
             get_spec().speculative_dspark_cuda_graph_capture_config
             if self.model_runner.spec_algorithm.is_dspark()
             else None
         )
-        if cfg_path is None:
+        if capture_config is None:
             return [
                 (bs, self.captured_req_width, bs * self.captured_req_width)
                 for bs in self.capture_bs
             ]
 
-        _, entries = load_batch_size_aware_config(cfg_path)
+        _, entries = load_batch_size_aware_config(
+            capture_config,
+            inline_json=True,
+        )
         configured_bs = sorted(entries)
         token_alignment = (
             get_parallel().attn_tp_size if self.require_gathered_buffer else 1

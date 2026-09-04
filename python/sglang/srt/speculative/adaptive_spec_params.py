@@ -91,11 +91,16 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
 def load_batch_size_aware_config(
     cfg_path: str | None,
+    *,
+    inline_json: bool = False,
 ) -> tuple[dict, dict[int, dict]]:
     """Load the integer-BS-keyed ``candidate_steps`` JSON schema."""
     if cfg_path is not None:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
+        if inline_json:
+            cfg = json.loads(cfg_path)
+        else:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
     else:
         cfg = DEFAULT_ADAPTIVE_CONFIG
 

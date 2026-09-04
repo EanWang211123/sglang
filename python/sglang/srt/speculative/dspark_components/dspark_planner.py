@@ -132,6 +132,7 @@ class DSparkVerifyPlanner:
         self._ragged_verify_mode = read_ragged_verify_mode()
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
+        self._profile_verify_token_budget: Optional[int] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
@@ -245,6 +246,17 @@ class DSparkVerifyPlanner:
         if self._budget_planner is None:
             return None
         return self._budget_planner.take_last_decision()
+
+    def set_profile_verify_token_budget(self, budget: Optional[int]) -> None:
+        self._profile_verify_token_budget = budget
+
+    def install_sps_table(
+        self, table: Union[SpsCostTable, SpsAdditiveCostTable]
+    ) -> None:
+        if self._budget_planner is None:
+            raise RuntimeError("DSpark verify budget planner is not initialized")
+        self._budget_planner.install_sps_table(table)
+        self._is_verify_all = False
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
@@ -373,7 +385,9 @@ class DSparkVerifyPlanner:
         the draft input by prepare_verify_budget; otherwise compute it now."""
         if not self.schedules_verify_budget or confidence is None:
             return None
-        if not get_schedule().disable_overlap_schedule:
+        if self._profile_verify_token_budget is not None:
+            budget = self._profile_verify_token_budget
+        elif not get_schedule().disable_overlap_schedule:
             budget = draft_input.verify_token_budget
         else:
             budget = self.compute_budget_sync(
@@ -446,6 +460,7 @@ class DSparkVerifyPlanner:
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
             and not envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
             and forced_budget_frac is None
+            and self._profile_verify_token_budget is None
         ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
@@ -965,6 +980,7 @@ def compute_verify_token_budget(
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
     candidate_batch_tokens: Optional[list[int]] = None,
+    additive_step_time_by_budget: Optional[torch.Tensor] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -993,12 +1009,18 @@ def compute_verify_token_budget(
             candidate_budgets = torch.tensor(graph_budgets, dtype=torch.int64)
 
     if isinstance(sps_table, SpsAdditiveCostTable):
-        step_time = _additive_step_time_tensor(
-            table=sps_table,
-            num_requests=int(num_requests),
-            num_budgets=int(tau_star.numel()),
-            budgets=candidate_budgets,
-        )
+        if (
+            additive_step_time_by_budget is not None
+            and additive_step_time_by_budget.numel() >= tau_star.numel()
+        ):
+            step_time = additive_step_time_by_budget[candidate_budgets]
+        else:
+            step_time = _additive_step_time_tensor(
+                table=sps_table,
+                num_requests=int(num_requests),
+                num_budgets=int(tau_star.numel()),
+                budgets=candidate_budgets,
+            )
         theta = tau_star[candidate_budgets] / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
@@ -1044,11 +1066,14 @@ def _additive_step_time_tensor(
     m = (num_requests + budgets.to(torch.float64)).clamp_(
         min=float(table.m_probes[0]), max=float(table.m_probes[-1])
     )
-    hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
-    lo = hi - 1
-    span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
-    frac = (m - m_probes[lo]) / span
-    theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
+    if m_probes.numel() == 1:
+        theta_at_m = theta_vals[0].expand_as(m)
+    else:
+        hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
+        lo = hi - 1
+        span = (m_probes[hi] - m_probes[lo]).clamp_(min=1e-9)
+        frac = (m - m_probes[lo]) / span
+        theta_at_m = theta_vals[lo] + frac * (theta_vals[hi] - theta_vals[lo])
     return floor + theta_at_m
 
 
@@ -1057,7 +1082,7 @@ class HostConfidenceBudgetPlanner:
     def __init__(
         self,
         *,
-        sps_table: SpsCostTable,
+        sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
         cfg: DSparkScheduleConfig,
         model_runner,
         relay_lag_steps: int = 1,
@@ -1068,6 +1093,9 @@ class HostConfidenceBudgetPlanner:
         self.cfg = cfg
         self._model_runner = model_runner
         self._use_graph_tier_candidates = use_graph_tier_candidates
+        self._candidate_batch_tokens: Optional[list[int]] = None
+        self._candidate_batch_tokens_initialized = False
+        self._additive_step_time_cache: dict[int, torch.Tensor] = {}
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
@@ -1102,19 +1130,54 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
-        candidate_batch_tokens = (
-            ragged_capture_num_tokens(model_runner=self._model_runner)
-            if self._use_graph_tier_candidates
-            else None
+        candidate_batch_tokens = self._get_candidate_batch_tokens()
+        additive_step_time_by_budget = self._get_additive_step_time_by_budget(
+            num_requests=int(survival.shape[0]),
+            max_num_budgets=int(
+                survival[:, : self.cfg.resolved_max_verify_len()].numel()
+            )
+            + 1,
         )
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
             candidate_batch_tokens=candidate_batch_tokens,
+            additive_step_time_by_budget=additive_step_time_by_budget,
         )
         self.last_decision = decision
         return decision.budget
+
+    def install_sps_table(
+        self, table: Union[SpsCostTable, SpsAdditiveCostTable]
+    ) -> None:
+        self.sps_table = table
+        self._additive_step_time_cache.clear()
+
+    def _get_candidate_batch_tokens(self) -> Optional[list[int]]:
+        if not self._use_graph_tier_candidates:
+            return None
+        if not self._candidate_batch_tokens_initialized:
+            self._candidate_batch_tokens = ragged_capture_num_tokens(
+                model_runner=self._model_runner
+            )
+            self._candidate_batch_tokens_initialized = True
+        return self._candidate_batch_tokens
+
+    def _get_additive_step_time_by_budget(
+        self, *, num_requests: int, max_num_budgets: int
+    ) -> Optional[torch.Tensor]:
+        if not isinstance(self.sps_table, SpsAdditiveCostTable):
+            return None
+        cached = self._additive_step_time_cache.get(num_requests)
+        if cached is None or cached.numel() < max_num_budgets:
+            cached = _additive_step_time_tensor(
+                table=self.sps_table,
+                num_requests=num_requests,
+                num_budgets=max_num_budgets,
+            )
+            self._additive_step_time_cache[num_requests] = cached
+        return cached
 
     def take_last_decision(self) -> Optional[VerifyBudgetDecision]:
         decision = self.last_decision
