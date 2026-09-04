@@ -210,6 +210,7 @@ def run_adaptive_verify_profile(
         table,
         profile_batch_sizes=batch_sizes,
         profile_query_lens=query_lens,
+        profile_cells=cells,
     )
     logger.info(
         "DSpark adaptive verify profiling complete: %d cells, bs_probes=%s, "

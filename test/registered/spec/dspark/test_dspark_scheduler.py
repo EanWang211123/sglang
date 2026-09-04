@@ -11,6 +11,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
+    ProfileStepTimeIndex,
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
@@ -221,6 +222,53 @@ class TestProfileAlignedTierCandidates(CustomTestCase):
             max_verify_len=8,
         )
         self.assertEqual(tiers, [256, 512, 800, 1024])
+
+    def test_profile_step_time_index_uses_nearest_lower_batch_size(self):
+        index = ProfileStepTimeIndex(
+            cells=[
+                {"bs": 96, "M": 768, "T": 0.20},
+                {"bs": 128, "M": 1024, "T": 0.30},
+            ],
+            profile_batch_sizes=[96, 128],
+        )
+        self.assertAlmostEqual(
+            index.lookup(num_reqs=100, batch_tokens=800),
+            0.20,
+        )
+        self.assertAlmostEqual(
+            index.lookup(num_reqs=128, batch_tokens=1024),
+            0.30,
+        )
+
+    def test_budget_argmax_uses_profiled_step_times(self):
+        survival = torch.tensor([[0.99] * 7] * 128, dtype=torch.float32)
+        cfg = DSparkScheduleConfig(gamma=7)
+        table = SpsAdditiveCostTable(
+            bias_seconds=0.01,
+            bs_probes=[1, 128],
+            alpha_seconds=[0.0, 0.0],
+            m_probes=[256, 512, 768, 1024],
+            theta_seconds=[0.0, 0.01, 0.02, 0.50],
+        )
+        profile_only = [256, 512, 768, 1024]
+        profile_index = ProfileStepTimeIndex(
+            cells=[
+                {"bs": 128, "M": 256, "T": 0.10},
+                {"bs": 128, "M": 512, "T": 0.11},
+                {"bs": 128, "M": 768, "T": 0.12},
+                {"bs": 128, "M": 1024, "T": 0.13},
+            ],
+            profile_batch_sizes=[128],
+        )
+        decision = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            candidate_batch_tokens=profile_only,
+            profile_step_times=profile_index,
+        )
+        self.assertEqual(decision.budget, 128 * (8 - 1))
+        self.assertAlmostEqual(decision.predicted_step_seconds, 0.13)
 
     def test_budget_argmax_only_scans_profile_tiers(self):
         survival = torch.tensor([[0.99] * 7] * 128, dtype=torch.float32)

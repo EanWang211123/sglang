@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import Optional, Union
 
@@ -260,6 +261,7 @@ class DSparkVerifyPlanner:
         *,
         profile_batch_sizes: Optional[list[int]] = None,
         profile_query_lens: Optional[list[int]] = None,
+        profile_cells: Optional[list[dict]] = None,
     ) -> None:
         if self._budget_planner is None:
             raise RuntimeError("DSpark verify budget planner is not initialized")
@@ -268,6 +270,7 @@ class DSparkVerifyPlanner:
             self._budget_planner.set_profile_tier_grid(
                 batch_sizes=profile_batch_sizes,
                 query_lens=profile_query_lens,
+                profile_cells=profile_cells,
             )
         self._is_verify_all = False
 
@@ -1006,6 +1009,49 @@ class VerifyBudgetDecision(msgspec.Struct):
     predicted_theta: Optional[float] = None
 
 
+class ProfileStepTimeIndex:
+    """Direct (batch_size, batch_tokens) -> profiled step seconds lookup."""
+
+    def __init__(
+        self,
+        *,
+        cells: list[dict],
+        profile_batch_sizes: list[int],
+    ) -> None:
+        self._times: dict[tuple[int, int], float] = {
+            (int(cell["bs"]), int(cell["M"])): float(cell["T"]) for cell in cells
+        }
+        self._batch_sizes = sorted(set(int(bs) for bs in profile_batch_sizes))
+        if not self._batch_sizes:
+            raise ValueError("ProfileStepTimeIndex requires profile batch sizes")
+
+    def lookup(self, *, num_reqs: int, batch_tokens: int) -> Optional[float]:
+        key = self._resolve_key(num_reqs=num_reqs, batch_tokens=batch_tokens)
+        if key is None:
+            return None
+        return self._times.get(key)
+
+    def _resolve_key(
+        self, *, num_reqs: int, batch_tokens: int
+    ) -> Optional[tuple[int, int]]:
+        if num_reqs < 1 or batch_tokens < num_reqs:
+            return None
+        if batch_tokens % num_reqs:
+            return None
+        query_len = batch_tokens // num_reqs
+        exact = (num_reqs, batch_tokens)
+        if exact in self._times:
+            return exact
+        idx = bisect.bisect_right(self._batch_sizes, num_reqs) - 1
+        if idx < 0:
+            return None
+        lookup_bs = self._batch_sizes[idx]
+        lookup_key = (lookup_bs, lookup_bs * query_len)
+        if lookup_key in self._times:
+            return lookup_key
+        return None
+
+
 def resolve_profile_aligned_tier_batch_tokens(
     *,
     num_reqs: int,
@@ -1018,8 +1064,8 @@ def resolve_profile_aligned_tier_batch_tokens(
     Each candidate is ``num_reqs * query_len`` for a profiled per-request
     verify length. When a tier is not captured exactly, keep the profile tier
     if graph replay would round up to another profiled tier; otherwise drop it.
-    SPS ``alpha(bs)`` interpolation already handles unseen batch sizes via the
-    nearest lower ``bs`` probe from adaptive profiling.
+    Step-time lookup uses the same ``(bs, batch_tokens)`` keys recorded during
+    adaptive profiling, falling back to the nearest lower profiled batch size.
     """
     if num_reqs < 1 or not profile_query_lens:
         return []
@@ -1050,12 +1096,36 @@ def resolve_profile_aligned_tier_batch_tokens(
     return sorted(set(selected))
 
 
+def _profile_step_time_tensor(
+    *,
+    profile_step_times: ProfileStepTimeIndex,
+    sps_table: SpsAdditiveCostTable,
+    num_requests: int,
+    candidate_budgets: torch.Tensor,
+) -> torch.Tensor:
+    values = []
+    for budget in candidate_budgets.tolist():
+        batch_tokens = num_requests + int(budget)
+        step_seconds = profile_step_times.lookup(
+            num_reqs=num_requests,
+            batch_tokens=batch_tokens,
+        )
+        if step_seconds is None:
+            step_seconds = sps_table.step_time(
+                num_reqs=num_requests,
+                budget=int(budget),
+            )
+        values.append(step_seconds)
+    return torch.tensor(values, dtype=torch.float64)
+
+
 def compute_verify_token_budget(
     *,
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
     candidate_batch_tokens: Optional[list[int]] = None,
+    profile_step_times: Optional[ProfileStepTimeIndex] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -1084,12 +1154,20 @@ def compute_verify_token_budget(
             candidate_budgets = torch.tensor(graph_budgets, dtype=torch.int64)
 
     if isinstance(sps_table, SpsAdditiveCostTable):
-        step_time = _additive_step_time_tensor(
-            table=sps_table,
-            num_requests=int(num_requests),
-            num_budgets=int(tau_star.numel()),
-            budgets=candidate_budgets,
-        )
+        if profile_step_times is not None:
+            step_time = _profile_step_time_tensor(
+                profile_step_times=profile_step_times,
+                sps_table=sps_table,
+                num_requests=int(num_requests),
+                candidate_budgets=candidate_budgets,
+            )
+        else:
+            step_time = _additive_step_time_tensor(
+                table=sps_table,
+                num_requests=int(num_requests),
+                num_budgets=int(tau_star.numel()),
+                budgets=candidate_budgets,
+            )
         theta = tau_star[candidate_budgets] / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
@@ -1164,6 +1242,7 @@ class HostConfidenceBudgetPlanner:
         self._use_graph_tier_candidates = use_graph_tier_candidates
         self._profile_batch_sizes: Optional[list[int]] = None
         self._profile_query_lens: Optional[list[int]] = None
+        self._profile_step_times: Optional[ProfileStepTimeIndex] = None
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
@@ -1179,6 +1258,7 @@ class HostConfidenceBudgetPlanner:
         *,
         batch_sizes: Optional[list[int]],
         query_lens: list[int],
+        profile_cells: Optional[list[dict]] = None,
     ) -> None:
         if not query_lens:
             raise ValueError("profile tier grid requires non-empty query_lens")
@@ -1186,6 +1266,15 @@ class HostConfidenceBudgetPlanner:
             sorted(set(batch_sizes)) if batch_sizes is not None else None
         )
         self._profile_query_lens = sorted(set(int(v) for v in query_lens))
+        if profile_cells is not None:
+            if batch_sizes is None:
+                raise ValueError("profile cells require profile batch_sizes")
+            self._profile_step_times = ProfileStepTimeIndex(
+                cells=profile_cells,
+                profile_batch_sizes=batch_sizes,
+            )
+        else:
+            self._profile_step_times = None
 
     def compute_budget(
         self,
@@ -1227,11 +1316,17 @@ class HostConfidenceBudgetPlanner:
                     candidate_batch_tokens = capture_batch_tokens
             else:
                 candidate_batch_tokens = capture_batch_tokens
+        profile_step_times = (
+            self._profile_step_times
+            if self._profile_query_lens is not None
+            else None
+        )
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
             candidate_batch_tokens=candidate_batch_tokens,
+            profile_step_times=profile_step_times,
         )
         self.last_decision = decision
         return decision.budget
