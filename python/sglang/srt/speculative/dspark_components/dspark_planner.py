@@ -255,11 +255,20 @@ class DSparkVerifyPlanner:
         self._profile_verify_len_per_req = query_len
 
     def install_sps_table(
-        self, table: Union[SpsCostTable, SpsAdditiveCostTable]
+        self,
+        table: Union[SpsCostTable, SpsAdditiveCostTable],
+        *,
+        profile_batch_sizes: Optional[list[int]] = None,
+        profile_query_lens: Optional[list[int]] = None,
     ) -> None:
         if self._budget_planner is None:
             raise RuntimeError("DSpark verify budget planner is not initialized")
         self._budget_planner.sps_table = table
+        if profile_query_lens is not None:
+            self._budget_planner.set_profile_tier_grid(
+                batch_sizes=profile_batch_sizes,
+                query_lens=profile_query_lens,
+            )
         self._is_verify_all = False
 
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
@@ -997,6 +1006,50 @@ class VerifyBudgetDecision(msgspec.Struct):
     predicted_theta: Optional[float] = None
 
 
+def resolve_profile_aligned_tier_batch_tokens(
+    *,
+    num_reqs: int,
+    profile_query_lens: list[int],
+    capture_batch_tokens: Optional[list[int]] = None,
+    max_verify_len: int,
+) -> list[int]:
+    """Map runtime batch size to profiled verify tiers only.
+
+    Each candidate is ``num_reqs * query_len`` for a profiled per-request
+    verify length. When a tier is not captured exactly, keep the profile tier
+    if graph replay would round up to another profiled tier; otherwise drop it.
+    SPS ``alpha(bs)`` interpolation already handles unseen batch sizes via the
+    nearest lower ``bs`` probe from adaptive profiling.
+    """
+    if num_reqs < 1 or not profile_query_lens:
+        return []
+    tiers = sorted(
+        {
+            num_reqs * int(query_len)
+            for query_len in profile_query_lens
+            if 1 <= int(query_len) <= max_verify_len
+        }
+    )
+    if not tiers or capture_batch_tokens is None:
+        return tiers
+    profile_tier_set = set(tiers)
+    max_capture = capture_batch_tokens[-1]
+    selected: list[int] = []
+    for tier in tiers:
+        if tier > max_capture:
+            continue
+        if tier in capture_batch_tokens:
+            selected.append(tier)
+            continue
+        try:
+            rounded = round_up_grid(total=tier, grid=capture_batch_tokens)
+        except ValueError:
+            continue
+        if rounded in profile_tier_set:
+            selected.append(rounded)
+    return sorted(set(selected))
+
+
 def compute_verify_token_budget(
     *,
     history_survival_probs: torch.Tensor,
@@ -1109,6 +1162,8 @@ class HostConfidenceBudgetPlanner:
         self.cfg = cfg
         self._model_runner = model_runner
         self._use_graph_tier_candidates = use_graph_tier_candidates
+        self._profile_batch_sizes: Optional[list[int]] = None
+        self._profile_query_lens: Optional[list[int]] = None
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
@@ -1118,6 +1173,19 @@ class HostConfidenceBudgetPlanner:
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
         self._carry_pos = 0
+
+    def set_profile_tier_grid(
+        self,
+        *,
+        batch_sizes: Optional[list[int]],
+        query_lens: list[int],
+    ) -> None:
+        if not query_lens:
+            raise ValueError("profile tier grid requires non-empty query_lens")
+        self._profile_batch_sizes = (
+            sorted(set(batch_sizes)) if batch_sizes is not None else None
+        )
+        self._profile_query_lens = sorted(set(int(v) for v in query_lens))
 
     def compute_budget(
         self,
@@ -1143,11 +1211,22 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
-        candidate_batch_tokens = (
-            ragged_capture_num_tokens(model_runner=self._model_runner)
-            if self._use_graph_tier_candidates
-            else None
-        )
+        candidate_batch_tokens = None
+        if self._use_graph_tier_candidates:
+            capture_batch_tokens = ragged_capture_num_tokens(
+                model_runner=self._model_runner
+            )
+            if self._profile_query_lens is not None:
+                candidate_batch_tokens = resolve_profile_aligned_tier_batch_tokens(
+                    num_reqs=int(survival.shape[0]),
+                    profile_query_lens=self._profile_query_lens,
+                    capture_batch_tokens=capture_batch_tokens,
+                    max_verify_len=self.cfg.resolved_max_verify_len(),
+                )
+                if not candidate_batch_tokens:
+                    candidate_batch_tokens = capture_batch_tokens
+            else:
+                candidate_batch_tokens = capture_batch_tokens
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,

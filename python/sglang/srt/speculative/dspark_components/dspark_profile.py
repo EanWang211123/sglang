@@ -6,8 +6,8 @@ Config example::
       "batch_sizes": [1, 4, 8, 16],
       "seq_len": 128,
       "query_lens_per_req": [2, 4, 6, 8],
-      "n_warmup": 1,
-      "n_measure": 3
+      "n_warmup": 2,
+      "n_measure": 5
     }
 """
 
@@ -47,8 +47,8 @@ class AdaptiveVerifyProfileConfig:
     batch_sizes: Optional[list[int]] = None
     seq_len: int = 128
     query_lens_per_req: Optional[list[int]] = None
-    n_warmup: int = 1
-    n_measure: int = 3
+    n_warmup: int = 2
+    n_measure: int = 5
 
 
 def load_adaptive_verify_profile_config(value: str) -> AdaptiveVerifyProfileConfig:
@@ -206,13 +206,18 @@ def run_adaptive_verify_profile(
                 )
 
     table = fit_additive_sps_table(cells=cells)
-    worker._verify_planner.install_sps_table(table)
+    worker._verify_planner.install_sps_table(
+        table,
+        profile_batch_sizes=batch_sizes,
+        profile_query_lens=query_lens,
+    )
     logger.info(
         "DSpark adaptive verify profiling complete: %d cells, bs_probes=%s, "
-        "batch_token_probes=%s",
+        "batch_token_probes=%s, runtime_tier_query_lens=%s",
         len(cells),
         table.bs_probes,
         table.m_probes,
+        query_lens,
     )
 
 

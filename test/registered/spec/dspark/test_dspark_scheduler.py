@@ -14,6 +14,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
+    resolve_profile_aligned_tier_batch_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -200,6 +201,58 @@ class TestComputeVerifyTokenBudget(CustomTestCase):
             decision.predicted_step_seconds, 1.0 / expected_sps, places=9
         )
         self.assertGreater(decision.predicted_theta, 0.0)
+
+
+class TestProfileAlignedTierCandidates(CustomTestCase):
+    def test_resolve_profile_tiers_uses_runtime_batch_size(self):
+        tiers = resolve_profile_aligned_tier_batch_tokens(
+            num_reqs=128,
+            profile_query_lens=[2, 4, 6, 8],
+            capture_batch_tokens=[256, 512, 768, 1024],
+            max_verify_len=8,
+        )
+        self.assertEqual(tiers, [256, 512, 768, 1024])
+
+    def test_resolve_profile_tiers_keeps_rounded_profile_tier(self):
+        tiers = resolve_profile_aligned_tier_batch_tokens(
+            num_reqs=128,
+            profile_query_lens=[2, 4, 6, 8],
+            capture_batch_tokens=[256, 512, 800, 1024],
+            max_verify_len=8,
+        )
+        self.assertEqual(tiers, [256, 512, 800, 1024])
+
+    def test_budget_argmax_only_scans_profile_tiers(self):
+        survival = torch.tensor([[0.99] * 7] * 128, dtype=torch.float32)
+        cfg = DSparkScheduleConfig(gamma=7)
+        table = SpsAdditiveCostTable(
+            bias_seconds=0.01,
+            bs_probes=[1, 128],
+            alpha_seconds=[0.0, 0.0],
+            m_probes=[256, 512, 768, 1024],
+            theta_seconds=[0.0, 0.01, 0.02, 0.03],
+        )
+        all_capture = list(range(1, 1025))
+        profile_only = resolve_profile_aligned_tier_batch_tokens(
+            num_reqs=128,
+            profile_query_lens=[2, 4, 6, 8],
+            capture_batch_tokens=all_capture,
+            max_verify_len=8,
+        )
+        decision = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            candidate_batch_tokens=profile_only,
+        )
+        self.assertEqual(decision.budget, 128 * (8 - 1))
+        scan_all = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            candidate_batch_tokens=all_capture,
+        )
+        self.assertEqual(scan_all.budget, decision.budget)
 
 
 def _make_budget_planner() -> HostConfidenceBudgetPlanner:
