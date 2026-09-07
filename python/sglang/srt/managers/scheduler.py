@@ -4562,12 +4562,7 @@ class Scheduler(
                 committed = int(batch.seq_lens_cpu[i])
             else:
                 committed = int(batch.seq_lens[i].item())
-            req.kv_committed_len = committed
-            if req.kv is None:
-                raise RuntimeError(
-                    f"SLO profile request {req.rid} has no allocated KV state "
-                    "after prefill."
-                )
+            req.kv.kv_committed_len = committed
             req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, committed)
         if not batch.spec_algorithm.is_none():
             batch.spec_info = result.next_draft_input
@@ -4604,7 +4599,7 @@ class Scheduler(
         else:
             committed_lens = batch.seq_lens_cpu.tolist()
         for req, committed_len in zip(batch.reqs, committed_lens, strict=True):
-            req.kv_committed_len = int(committed_len)
+            req.kv.kv_committed_len = int(committed_len)
 
     def _carry_over_spec_forward_result(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -4703,46 +4698,22 @@ class Scheduler(
             synchronize()
 
     def _release_slo_profile_reqs(self, reqs: List[Req]) -> None:
+        errors = []
         for req in reqs:
-            self._force_release_slo_profile_req(req)
+            try:
+                self._force_release_slo_profile_req(req)
+            except Exception as exc:
+                errors.append(exc)
+                logger.exception("Failed to release SLO profile request %s", req.rid)
+        if errors:
+            raise RuntimeError(
+                f"Failed to release {len(errors)} SLO profile request(s)"
+            ) from errors[0]
 
     def _force_release_slo_profile_req(self, req: Req) -> None:
-        if req.req_pool_idx is None:
+        if not req.kv.holds_kv and not req.kv.holds_mamba:
             return
-
-        req_pool_idx = req.req_pool_idx
-        try:
-            kv_allocated_len = req.kv.kv_allocated_len if req.kv is not None else 0
-            kv_len = max(kv_allocated_len, req.kv_committed_len, 0)
-            if kv_len > 0:
-                kv_indices = self.req_to_token_pool.req_to_token[req_pool_idx, :kv_len]
-                self.token_to_kv_pool_allocator.free(kv_indices)
-            if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
-                self.req_to_token_pool, "free_mamba_cache"
-            ):
-                self.req_to_token_pool.free_mamba_cache(req)
-        except Exception as exc:
-            logger.debug(
-                "Failed to release SLO profile KV for %s: %s",
-                req.rid,
-                exc,
-                exc_info=True,
-            )
-        finally:
-            if req.req_pool_idx is not None:
-                try:
-                    self.req_to_token_pool.free(req)
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to release SLO profile req slot for %s: %s",
-                        req.rid,
-                        exc,
-                        exc_info=True,
-                    )
-            req.kv = None
-            req.kv_committed_len = 0
-            req.kv_committed_freed = True
-            req.kv_overallocated_freed = True
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
