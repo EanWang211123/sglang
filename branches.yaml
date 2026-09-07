@@ -85,7 +85,7 @@ branches:
       force_push_allowed: true
       last_remote_update: 2026-09-01
     consumed_by:
-      - feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+      - feat/pack/main
 
   - id: replayssm-dflash-dspark
     name: feat/ssm-ring-replay/main
@@ -105,7 +105,7 @@ branches:
       force_push_allowed: true
       last_remote_update: 2026-09-07
     consumed_by:
-      - feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+      - feat/pack/main
 
   - id: dspark-adaptive
     name: feat/adaptive_spec_dspark/main
@@ -133,10 +133,10 @@ branches:
         relation: rebased_patch
         integrated_commit: 4a7c602a7b
     consumed_by:
-      - feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+      - feat/pack/main
 
   - id: adaptive-dspark-replayssm-gptq-marlin-pack
-    name: feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+    name: feat/pack/main
     remote: origin
     type: maintained_feature
     status: active

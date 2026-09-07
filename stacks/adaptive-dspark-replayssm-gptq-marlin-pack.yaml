@@ -1,6 +1,6 @@
 version: 1
 name: adaptive-dspark-replayssm-gptq-marlin-pack
-output_branch: feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+output_branch: feat/pack/main
 status: active
 last_rebuilt: 2026-09-07
 

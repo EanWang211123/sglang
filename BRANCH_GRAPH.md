@@ -28,8 +28,8 @@ flowchart TD
     click branch_replayssm_dflash_dspark "https://github.com/sgl-project/sglang/pull/36683"
     branch_dspark_adaptive["Maintained feature / active<br/>feat/adaptive_spec_dspark/main<br/>b62ac30bb6"]
     click branch_dspark_adaptive "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/main"
-    branch_adaptive_dspark_replayssm_gptq_marlin_pack["Maintained feature / active<br/>feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16<br/>15f13b8f26"]
-    click branch_adaptive_dspark_replayssm_gptq_marlin_pack "https://github.com/EanWang211123/sglang/tree/feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16"
+    branch_adaptive_dspark_replayssm_gptq_marlin_pack["Maintained feature / active<br/>feat/pack/main<br/>15f13b8f26"]
+    click branch_adaptive_dspark_replayssm_gptq_marlin_pack "https://github.com/EanWang211123/sglang/tree/feat/pack/main"
     branch_dspark_tp_budget_sync -->|"direct base"| branch_dspark_adaptive
     branch_dspark_runtime_gamma -.->|"rebased patch / 4a7c602a7b"| branch_dspark_adaptive
     branch_dspark_adaptive -->|"direct base"| branch_adaptive_dspark_replayssm_gptq_marlin_pack
@@ -56,7 +56,7 @@ flowchart LR
     stack_adaptive_dspark_replayssm_gptq_marlin_pack_2["gptq-marlin-moe-bf16-w2-scales<br/>merged_branch<br/>15f13b8f26"]
     stack_adaptive_dspark_replayssm_gptq_marlin_pack_1 --> stack_adaptive_dspark_replayssm_gptq_marlin_pack_2
     click stack_adaptive_dspark_replayssm_gptq_marlin_pack_2 "https://github.com/sgl-project/sglang/pull/35955"
-    stack_output_adaptive_dspark_replayssm_gptq_marlin_pack["feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16<br/>active"]
+    stack_output_adaptive_dspark_replayssm_gptq_marlin_pack["feat/pack/main<br/>active"]
     stack_adaptive_dspark_replayssm_gptq_marlin_pack_2 --> stack_output_adaptive_dspark_replayssm_gptq_marlin_pack
 ```
 
