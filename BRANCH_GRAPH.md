@@ -30,7 +30,7 @@ flowchart TD
     click branch_dspark_adaptive "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/main"
     branch_adaptive_dspark_replayssm_gptq_marlin_pack["Maintained feature / active<br/>feat/pack/main<br/>15f13b8f26"]
     click branch_adaptive_dspark_replayssm_gptq_marlin_pack "https://github.com/EanWang211123/sglang/tree/feat/pack/main"
-    branch_xkernel_slo_aware_prefill_controller["Maintained feature / active<br/>xkernel/slo-aware-prefill-controller<br/>19f74b11f6"]
+    branch_xkernel_slo_aware_prefill_controller["Maintained feature / active<br/>xkernel/slo-aware-prefill-controller<br/>31368ab1b4"]
     click branch_xkernel_slo_aware_prefill_controller "https://github.com/EanWang211123/sglang/tree/xkernel/slo-aware-prefill-controller"
     branch_dspark_tp_budget_sync -->|"direct base"| branch_dspark_adaptive
     branch_dspark_runtime_gamma -.->|"rebased patch / 4a7c602a7b"| branch_dspark_adaptive
@@ -121,6 +121,8 @@ flowchart LR
     stack_xkernel_slo_aware_prefill_controller_9 --> stack_xkernel_slo_aware_prefill_controller_10
     stack_xkernel_slo_aware_prefill_controller_11["slo-aware-rebase-formatting<br/>feature_commit<br/>19f74b11f6"]
     stack_xkernel_slo_aware_prefill_controller_10 --> stack_xkernel_slo_aware_prefill_controller_11
+    stack_xkernel_slo_aware_prefill_controller_12["slo-aware-current-kv-lifecycle<br/>feature_commit<br/>31368ab1b4"]
+    stack_xkernel_slo_aware_prefill_controller_11 --> stack_xkernel_slo_aware_prefill_controller_12
     stack_output_xkernel_slo_aware_prefill_controller["xkernel/slo-aware-prefill-controller<br/>active"]
-    stack_xkernel_slo_aware_prefill_controller_11 --> stack_output_xkernel_slo_aware_prefill_controller
+    stack_xkernel_slo_aware_prefill_controller_12 --> stack_output_xkernel_slo_aware_prefill_controller
 ```

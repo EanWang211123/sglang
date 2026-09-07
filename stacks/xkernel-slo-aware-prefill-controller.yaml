@@ -79,6 +79,11 @@ components:
     inclusion: feature_commit
     integrated_commit: 19f74b11f6
 
+  - order: 12
+    id: slo-aware-current-kv-lifecycle
+    inclusion: feature_commit
+    integrated_commit: 31368ab1b4
+
 rebase_notes:
   - >-
     The SLO configuration fields were assigned to the current schedule config
@@ -96,6 +101,10 @@ rebase_notes:
     Old adaptive DSpark commits after the SLO series were omitted because the
     pack contains their newer equivalents. The compact prefill-plan race patch
     was also omitted because upstream contains the official #32467 fix.
+  - >-
+    SLO synthetic requests update ReqKvInfo directly and are released through
+    release_kv_cache with insertion disabled, so unified full/SWA and Mamba
+    allocator state follows the same teardown path as production requests.
 
 validation:
   completed:
@@ -104,6 +113,7 @@ validation:
     - Python compileall for python/sglang/srt
     - git diff --check
     - feat/pack/main is an ancestor of the output branch
+    - no legacy direct request KV lifecycle fields remain in SLO profiling
   unavailable:
     - >-
       GPU and broader integration tests on the current Windows host because

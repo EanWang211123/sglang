@@ -175,7 +175,7 @@ branches:
     composition_base:
       branch: feat/pack/main
       head: 15f13b8f26362f17a71ba78dd28a2747775ef15f
-    remote_head: 19f74b11f61fa75020020e6230c82cd72659b314
+    remote_head: 31368ab1b4d3ec8940708534705767bbfef0c384
     manifest: stacks/xkernel-slo-aware-prefill-controller.yaml
     source:
       repository: xkernel-factory/sglang
@@ -184,7 +184,8 @@ branches:
     summary: >-
       Rebase xkernel's SLO-aware prefill controller and required profiling
       compatibility fixes onto the adaptive DSpark, ReplaySSM, and GPTQ Marlin
-      feature pack while omitting superseded adaptive DSpark patches.
+      feature pack while omitting superseded adaptive DSpark patches and using
+      the current unified KV-cache lifecycle for startup profiling cleanup.
     maintenance:
       force_push_allowed: true
       last_rebased: 2026-09-07
