@@ -4638,7 +4638,14 @@ class Scheduler(
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
         req.skip_radix_cache_insert = True
-        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        # Enter the same prefix-cache lifecycle as regular requests (and the
+        # adaptive DSpark profiler).  Besides matching a prefix, this records
+        # last_node and the full/SWA lock metadata that release_kv_cache needs
+        # to release both KV slots and the req-to-token row.
+        req.init_next_round_input(self.tree_cache)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         return req
 
     def _new_slo_profile_batch(self, reqs: List[Req]) -> ScheduleBatch:
