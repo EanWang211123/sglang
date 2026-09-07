@@ -2,6 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from sglang.srt.speculative.dspark_components.dspark_profile import (
+    AdaptiveVerifyProfileConfig,
+    resolve_profile_grid,
+)
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -22,6 +26,35 @@ def _make_table() -> SpsCostTable:
         sample_steps_per_sec=[1000.0, 950.0, 500.0, 480.0],
         max_batch_tokens=128,
     )
+
+
+class TestAdaptiveProfileGrid(CustomTestCase):
+    def test_dp1_uses_eight_request_spacing(self):
+        batch_sizes, _ = resolve_profile_grid(
+            AdaptiveVerifyProfileConfig(),
+            max_batch_size_per_rank=24,
+            max_query_len_per_req=8,
+            dp_size=1,
+        )
+        self.assertEqual(batch_sizes, [1, 8, 16, 24])
+
+    def test_dp4_uses_two_request_spacing(self):
+        batch_sizes, _ = resolve_profile_grid(
+            AdaptiveVerifyProfileConfig(),
+            max_batch_size_per_rank=12,
+            max_query_len_per_req=8,
+            dp_size=4,
+        )
+        self.assertEqual(batch_sizes, [1, 2, 4, 6, 8, 10, 12])
+
+    def test_explicit_batch_sizes_are_not_resampled(self):
+        batch_sizes, _ = resolve_profile_grid(
+            AdaptiveVerifyProfileConfig(batch_sizes=[1, 3, 9]),
+            max_batch_size_per_rank=12,
+            max_query_len_per_req=8,
+            dp_size=4,
+        )
+        self.assertEqual(batch_sizes, [1, 3, 9])
 
 
 class TestSpsCostTableInvariants(CustomTestCase):
