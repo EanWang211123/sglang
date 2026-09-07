@@ -4418,13 +4418,15 @@ class Scheduler(
         if explicit_sizes is not None:
             raw_sizes = explicit_sizes
         else:
-            decode_config = self.server_args.cuda_graph_config.decode
+            # cuda_graph_config is a resolved exec.graph value in the current
+            # config system.  The raw ServerArgs field can legitimately remain
+            # None even when convenience flags such as
+            # --cuda-graph-max-bs-decode were provided.
+            decode_config = get_exec().graph.cuda_graph_config.decode
             if decode_config.bs:
                 raw_sizes = decode_config.bs
             else:
-                raw_sizes = self.server_args._generate_decode_cuda_graph_batch_sizes(
-                    decode_config.max_bs or self.max_running_requests
-                )
+                raw_sizes = [decode_config.max_bs or self.max_running_requests]
 
         max_by_tokens = max(1, self.max_total_num_tokens // max(context_len + 1, 1))
         max_by_req_slots = max(1, self.req_to_token_pool.available_size())
