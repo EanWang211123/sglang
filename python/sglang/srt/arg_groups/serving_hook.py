@@ -473,13 +473,9 @@ def handle_other_validations(server_args: Any):
         if cfg.slo_prefill_tpot_slo_ms <= 0:
             raise ValueError("--slo-prefill-tpot-slo-ms must be positive.")
         if cfg.slo_prefill_ttft_stat not in ("max", "mean", "p90"):
-            raise ValueError(
-                "--slo-prefill-ttft-stat must be one of max, mean, p90."
-            )
+            raise ValueError("--slo-prefill-ttft-stat must be one of max, mean, p90.")
         if cfg.slo_prefill_tpot_stat not in ("max", "mean", "p90"):
-            raise ValueError(
-                "--slo-prefill-tpot-stat must be one of max, mean, p90."
-            )
+            raise ValueError("--slo-prefill-tpot-stat must be one of max, mean, p90.")
         if (
             cfg.slo_prefill_initial_prefill_cost_ms_per_1k is not None
             and cfg.slo_prefill_initial_prefill_cost_ms_per_1k <= 0
@@ -491,9 +487,7 @@ def handle_other_validations(server_args: Any):
             cfg.slo_prefill_initial_decode_cost_ms is not None
             and cfg.slo_prefill_initial_decode_cost_ms <= 0
         ):
-            raise ValueError(
-                "--slo-prefill-initial-decode-cost-ms must be positive."
-            )
+            raise ValueError("--slo-prefill-initial-decode-cost-ms must be positive.")
         if cfg.slo_prefill_profile_decode_context_len <= 0:
             raise ValueError(
                 "--slo-prefill-profile-decode-context-len must be positive."
@@ -512,8 +506,7 @@ def handle_other_validations(server_args: Any):
                 "--slo-prefill-cache-hit-io-cost-ratio must be non-negative."
             )
         if cfg.slo_prefill_profile_decode_batch_sizes is not None and any(
-            batch_size <= 0
-            for batch_size in cfg.slo_prefill_profile_decode_batch_sizes
+            batch_size <= 0 for batch_size in cfg.slo_prefill_profile_decode_batch_sizes
         ):
             raise ValueError(
                 "--slo-prefill-profile-decode-batch-sizes values must be positive."

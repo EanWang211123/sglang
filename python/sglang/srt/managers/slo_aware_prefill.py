@@ -212,9 +212,7 @@ class SloAwarePrefillController:
         min_prefill_cost_s = self._estimate_prefill_cost(self.min_chunk_size)
         yield_guard_s = self._yield_guard_s(min_prefill_cost_s)
         ttft_slack_s = self._ttft_slack_s(ttft_pressure)
-        yield_rhs_s = (
-            self._active_decode_cost_s + min_prefill_cost_s + yield_guard_s
-        )
+        yield_rhs_s = self._active_decode_cost_s + min_prefill_cost_s + yield_guard_s
 
         if objective == "tpot" and has_decode_work:
             if self._can_yield_to_decode(ttft_pressure):
@@ -366,9 +364,7 @@ class SloAwarePrefillController:
         if context_len <= table[0][0] or len(table) == 1:
             return self._profiled_cost(table[0][1], batch_size)
 
-        for (left_ctx, left_points), (right_ctx, right_points) in zip(
-            table, table[1:]
-        ):
+        for (left_ctx, left_points), (right_ctx, right_points) in zip(table, table[1:]):
             if context_len <= right_ctx:
                 left_cost_s = self._profiled_cost(left_points, batch_size)
                 right_cost_s = max(
@@ -440,9 +436,7 @@ class SloAwarePrefillController:
         return [
             req
             for req in running_reqs
-            if not req.finished()
-            and not req.is_retracted
-            and len(req.output_ids) > 0
+            if not req.finished() and not req.is_retracted and len(req.output_ids) > 0
         ]
 
     def _decode_context_len(self, decode_reqs: Sequence["Req"]) -> int:
@@ -504,9 +498,7 @@ class SloAwarePrefillController:
             cache_hit_rate,
         )
 
-    def _estimate_future_prefill_tokens(
-        self, req: "Req"
-    ) -> tuple[int, int, float]:
+    def _estimate_future_prefill_tokens(self, req: "Req") -> tuple[int, int, float]:
         total_tokens = self._total_prefill_tokens(req)
         if total_tokens <= 0:
             return 0, 0, 0.0
@@ -557,9 +549,7 @@ class SloAwarePrefillController:
             + max(getattr(req, "cached_tokens_storage", 0), 0)
         )
         cached_tokens = max(cached_tokens, detailed_cached_tokens)
-        cached_tokens = max(
-            cached_tokens, getattr(req, "num_matched_prefix_tokens", 0)
-        )
+        cached_tokens = max(cached_tokens, getattr(req, "num_matched_prefix_tokens", 0))
         prefix_indices = getattr(req, "prefix_indices", None)
         if prefix_indices is not None:
             cached_tokens = max(cached_tokens, len(prefix_indices))
@@ -583,9 +573,7 @@ class SloAwarePrefillController:
                 )
                 decode_anchor = req.time_stats.last_decode_finish_time or start
                 if now > decode_anchor:
-                    tpot_s = max(
-                        tpot_s, (now - decode_anchor) / last_accept_len
-                    )
+                    tpot_s = max(tpot_s, (now - decode_anchor) / last_accept_len)
                 if last > start and len(req.output_ids) > 1:
                     decode_tokens = max(len(req.output_ids) - 1, 1)
                     tpot_s = max(tpot_s, (last - start) / decode_tokens)

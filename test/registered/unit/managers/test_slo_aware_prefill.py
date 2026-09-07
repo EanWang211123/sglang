@@ -152,9 +152,15 @@ class TestSloAwarePrefillController(unittest.TestCase):
         )
         running = SimpleNamespace(
             reqs=[
-                FakeReq(prefill_finished_s=0.03, last_decode_finish_s=0.02, output_len=2),
-                FakeReq(prefill_finished_s=0.05, last_decode_finish_s=0.04, output_len=2),
-                FakeReq(prefill_finished_s=0.07, last_decode_finish_s=0.06, output_len=2),
+                FakeReq(
+                    prefill_finished_s=0.03, last_decode_finish_s=0.02, output_len=2
+                ),
+                FakeReq(
+                    prefill_finished_s=0.05, last_decode_finish_s=0.04, output_len=2
+                ),
+                FakeReq(
+                    prefill_finished_s=0.07, last_decode_finish_s=0.06, output_len=2
+                ),
             ]
         )
 
@@ -674,6 +680,7 @@ class TestSloAwarePrefillController(unittest.TestCase):
 
         self.assertTrue(decision.allow_prefill)
         self.assertTrue(decision.yield_prefill_to_decode)
+
 
 if __name__ == "__main__":
     unittest.main()

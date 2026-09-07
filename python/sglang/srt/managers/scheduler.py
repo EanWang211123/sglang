@@ -3704,9 +3704,7 @@ class Scheduler(
                     default_prefill_max_requests=prefill_max_requests,
                 )
             )
-            slo_prefill_decision = self._sync_slo_prefill_decision(
-                slo_prefill_decision
-            )
+            slo_prefill_decision = self._sync_slo_prefill_decision(slo_prefill_decision)
             self.slo_prefill_log_ct += 1
             should_log_slo_prefill = (
                 self.slo_prefill_log_ct % self.slo_prefill_log_interval == 0
@@ -4380,9 +4378,7 @@ class Scheduler(
     def _slo_profile_prefill_size(self) -> int:
         assert self.slo_prefill_controller is not None
         upper = self.slo_prefill_controller.min_chunk_size
-        return max(
-            1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1)
-        )
+        return max(1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1))
 
     def _slo_profile_decode_context_lens_arg(self) -> List[int]:
         return self.server_args.slo_prefill_profile_decode_context_lens or [
@@ -4486,9 +4482,7 @@ class Scheduler(
             batch.prepare_for_extend()
             batch = self._prepare_slo_profile_forward_batch(batch)
             _, prefill_result = self._run_slo_profile_forward_result(batch)
-            bonus_tokens = self._apply_slo_profile_prefill_state(
-                batch, prefill_result
-            )
+            bonus_tokens = self._apply_slo_profile_prefill_state(batch, prefill_result)
 
             for _ in range(self._slo_decode_profile_warmup_iters()):
                 _, batch, bonus_tokens = self._run_slo_profile_decode_iteration(
@@ -4497,8 +4491,8 @@ class Scheduler(
 
             sample_costs_ms = []
             for _ in range(self._slo_decode_profile_sample_iters()):
-                cost_ms, batch, bonus_tokens = (
-                    self._run_slo_profile_decode_iteration(batch, bonus_tokens)
+                cost_ms, batch, bonus_tokens = self._run_slo_profile_decode_iteration(
+                    batch, bonus_tokens
                 )
                 sample_costs_ms.append(cost_ms)
             return sum(sample_costs_ms) / len(sample_costs_ms)
@@ -4514,9 +4508,7 @@ class Scheduler(
             return int(num_steps) + 1
         return None
 
-    def _profile_slo_spec_decode_cost(
-        self, batch_size: int, context_len: int
-    ) -> float:
+    def _profile_slo_spec_decode_cost(self, batch_size: int, context_len: int) -> float:
         if self.draft_worker is None:
             raise RuntimeError("Speculative SLO profiling requires draft_worker.")
         return self._profile_slo_decode_cost_impl(
@@ -4549,10 +4541,7 @@ class Scheduler(
     def _apply_slo_profile_prefill_state(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> torch.Tensor:
-        if (
-            not batch.spec_algorithm.is_none()
-            and result.next_draft_input is None
-        ):
+        if not batch.spec_algorithm.is_none() and result.next_draft_input is None:
             raise RuntimeError(
                 "Speculative SLO prefill profiling expected next_draft_input, got None."
             )
@@ -4588,9 +4577,7 @@ class Scheduler(
                 batch.seq_lens_cpu = result.new_seq_lens.cpu()
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         batch.input_ids = None
-        return torch.tensor(
-            bonus_token_ids, dtype=torch.int64, device=self.device
-        )
+        return torch.tensor(bonus_token_ids, dtype=torch.int64, device=self.device)
 
     def _apply_slo_profile_decode_state(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -4671,9 +4658,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
         )
 
-    def _prepare_slo_profile_forward_batch(
-        self, batch: ScheduleBatch
-    ) -> ScheduleBatch:
+    def _prepare_slo_profile_forward_batch(self, batch: ScheduleBatch) -> ScheduleBatch:
         if self.require_mlp_sync:
             batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
                 batch, need_sync=True
@@ -4713,9 +4698,7 @@ class Scheduler(
         return (time.perf_counter() - start) * 1e3, result
 
     def _synchronize_slo_profile_device(self) -> None:
-        synchronize = getattr(
-            torch.get_device_module(self.device), "synchronize", None
-        )
+        synchronize = getattr(torch.get_device_module(self.device), "synchronize", None)
         if synchronize is not None:
             synchronize()
 
@@ -4729,14 +4712,10 @@ class Scheduler(
 
         req_pool_idx = req.req_pool_idx
         try:
-            kv_allocated_len = (
-                req.kv.kv_allocated_len if req.kv is not None else 0
-            )
+            kv_allocated_len = req.kv.kv_allocated_len if req.kv is not None else 0
             kv_len = max(kv_allocated_len, req.kv_committed_len, 0)
             if kv_len > 0:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    req_pool_idx, :kv_len
-                ]
+                kv_indices = self.req_to_token_pool.req_to_token[req_pool_idx, :kv_len]
                 self.token_to_kv_pool_allocator.free(kv_indices)
             if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
                 self.req_to_token_pool, "free_mamba_cache"
