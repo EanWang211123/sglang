@@ -1,7 +1,7 @@
 version: 1
 repository: EanWang211123/sglang
 upstream_repository: sgl-project/sglang
-last_updated: 2026-09-01
+last_updated: 2026-09-07
 
 branches:
   - id: dflash-dp-attn
@@ -84,6 +84,8 @@ branches:
     maintenance:
       force_push_allowed: true
       last_remote_update: 2026-09-01
+    consumed_by:
+      - feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
 
   - id: replayssm-dflash-dspark
     name: feat/ssm-ring-replay/main
@@ -95,13 +97,15 @@ branches:
       number: 36683
       url: https://github.com/sgl-project/sglang/pull/36683
       title: "[Spec] Support ReplaySSM spec-verify for DFlash and DSPARK on hybrid GDN models"
-    remote_head: a69c58ed51e448e30046a14d10cd4bfd7d56bb1a
+    remote_head: 9b2e85bd43c78b80d5e498ff766189f272f611e1
     summary: >-
       Connect DFlash and DSPARK hybrid GDN verification to ReplaySSM's
       fold-every-commit state path while preserving non-ReplaySSM behavior.
     maintenance:
       force_push_allowed: true
-      last_remote_update: 2026-09-01
+      last_remote_update: 2026-09-07
+    consumed_by:
+      - feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
 
   - id: dspark-adaptive
     name: feat/adaptive_spec_dspark/main
@@ -112,7 +116,7 @@ branches:
     composition_base:
       branch: fix/fix-dspark-verlen-confict-tp-ranks
       head: b5f638520a0b8cf91950e26099c3ccee778d497d
-    remote_head: 4cef58178abed9104785ed557b4053be9f443843
+    remote_head: b62ac30bb6433fd2afc230c049c646a7a977bf58
     manifest: stacks/dspark-adaptive.yaml
     summary: >-
       Deployable DSpark adaptive scheduling feature combining runtime gamma,
@@ -121,11 +125,42 @@ branches:
     maintenance:
       force_push_allowed: true
       last_rebased: 2026-09-01
-      last_remote_update: 2026-09-03
+      last_remote_update: 2026-09-07
     dependencies:
       - branch: fix/fix-dspark-verlen-confict-tp-ranks
         relation: direct_base
       - branch: fix/fix-dspark-compact-confidence-head-with-vargamma
         relation: rebased_patch
         integrated_commit: 4a7c602a7b
+    consumed_by:
+      - feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+
+  - id: adaptive-dspark-replayssm-gptq-marlin-pack
+    name: feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+    remote: origin
+    type: maintained_feature
+    status: active
+    upstream_base: upstream/main
+    composition_base:
+      branch: feat/adaptive_spec_dspark/main
+      head: b62ac30bb6433fd2afc230c049c646a7a977bf58
+    remote_head: 15f13b8f26362f17a71ba78dd28a2747775ef15f
+    manifest: stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml
+    summary: >-
+      Deployable development pack combining adaptive DSpark scheduling,
+      ReplaySSM verification for hybrid GDN models, and GPTQ Marlin MoE BF16
+      plus TP act-order w2 scale fixes.
+    maintenance:
+      force_push_allowed: true
+      last_rebuilt: 2026-09-07
+      last_remote_update: 2026-09-07
+    dependencies:
+      - branch: feat/adaptive_spec_dspark/main
+        relation: direct_base
+      - branch: feat/ssm-ring-replay/main
+        relation: merged_branch
+        integrated_commit: db48a19247
+      - branch: fix/gptq-marlin-moe-bf16-w2-scales
+        relation: merged_branch
+        integrated_commit: 15f13b8f26
 

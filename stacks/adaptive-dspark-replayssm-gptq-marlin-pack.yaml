@@ -1,0 +1,48 @@
+version: 1
+name: adaptive-dspark-replayssm-gptq-marlin-pack
+output_branch: feat/pack/adaptive-dspark-ssm-ring-replay-gptq-marlin-moe-bf16
+status: active
+last_rebuilt: 2026-09-07
+
+base:
+  branch: feat/adaptive_spec_dspark/main
+  head_at_rebuild: b62ac30bb6433fd2afc230c049c646a7a977bf58
+
+components:
+  - order: 1
+    id: replayssm-dflash-dspark
+    source_branch: feat/ssm-ring-replay/main
+    source_pr: https://github.com/sgl-project/sglang/pull/36683
+    inclusion: merged_branch
+    integrated_head: 9b2e85bd43c78b80d5e498ff766189f272f611e1
+    integrated_commit: db48a192470c3ddf29ba2dc4db37f5225e17aa7a
+
+  - order: 2
+    id: gptq-marlin-moe-bf16-w2-scales
+    source_branch: fix/gptq-marlin-moe-bf16-w2-scales
+    source_pr: https://github.com/sgl-project/sglang/pull/35955
+    inclusion: merged_branch
+    integrated_head: 4af6f2bba95617014190ee247d77b5bcba749d9b
+    integrated_commit: 15f13b8f26362f17a71ba78dd28a2747775ef15f
+
+merge_notes:
+  - >-
+    Adaptive DSpark is the direct composition base. ReplaySSM is merged first
+    because it overlaps DSpark worker code; GPTQ Marlin MoE is merged second.
+  - >-
+    Both merges completed with the ort strategy and required no manual conflict
+    resolution.
+  - >-
+    The ReplaySSM source branch already contains newer upstream/main merge
+    commits, which are intentionally retained in this pack.
+
+validation:
+  completed:
+    - all three source heads are ancestors of the pack head
+    - targeted Python compile checks
+    - git diff --check
+    - branch registry render and freshness check
+  unavailable:
+    - >-
+      targeted pytest collection on the current Windows host because Python's
+      Unix-only resource module is unavailable

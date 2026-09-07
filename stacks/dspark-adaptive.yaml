@@ -2,7 +2,7 @@ version: 1
 name: dspark-adaptive
 output_branch: feat/adaptive_spec_dspark/main
 status: active
-last_rebuilt: 2026-09-03
+last_rebuilt: 2026-09-07
 
 base:
   branch: upstream/main
@@ -56,46 +56,13 @@ components:
   - order: 8
     id: dspark-online-startup-profile
     inclusion: feature_commit
-    integrated_commit: 7b91216041
+    integrated_commit: b62ac30bb6
     subject: "feat(dspark): profile adaptive verify costs at startup"
 
-  - order: 9
-    id: dspark-profile-worker-api-fix
-    inclusion: feature_commit
-    integrated_commit: cf593179d0
-    subject: "fix(dspark): use current spec algorithm field in profiler"
-
-  - order: 10
-    id: dspark-profile-pool-fix
-    inclusion: feature_commit
-    integrated_commit: 01dcb70cf3
-    subject: "fix(dspark): use target model runner pools for profiling"
-
-  - order: 11
-    id: dspark-profile-lifecycle-fix
-    inclusion: feature_commit
-    integrated_commit: ed0a00def8
-    subject: "fix(dspark): harden startup profiling lifecycle"
-
-  - order: 12
-    id: dspark-profile-grid-clamp
-    inclusion: feature_commit
-    integrated_commit: cda10685f9
-    subject: "fix(dspark): clamp startup profile grid to graph capacity"
-
-  - order: 13
-    id: dspark-profile-prefill-split
-    inclusion: feature_commit
-    integrated_commit: 8cf302673e
-    subject: "fix(dspark): split oversized profile prefills"
-
-  - order: 14
-    id: dspark-profile-decode-graph-eligibility
-    inclusion: feature_commit
-    integrated_commit: 4cef58178a
-    subject: "fix(dspark): preserve decode graph eligibility in profiling"
-
 rebase_notes:
+  - >-
+    The 2026-09-07 rebuild consolidated the startup profiler follow-up fixes
+    into b62ac30bb6.
   - >-
     The old compact prefill-plan race commit was omitted because upstream/main
     contains the official #32467 resolution.
