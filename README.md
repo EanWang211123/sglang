@@ -20,11 +20,13 @@ branch.
 | `feat/ssm-ring-replay/main` | Community PR | Support ReplaySSM verification for DFlash and DSpark on hybrid GDN models. |
 | `feat/adaptive_spec_dspark/main` | Maintained feature | Integrate DSpark runtime gamma, TP consistency, batch-aware adaptive graph tiers, and online startup cost profiling. |
 | `feat/pack/main` | Maintained feature | Combine adaptive DSpark, ReplaySSM, and GPTQ Marlin MoE BF16 fixes in one development branch. |
+| `xkernel/slo-aware-prefill-controller` | Maintained feature | Rebase xkernel's SLO-aware prefill controller onto `feat/pack/main`. |
 
 Machine-readable details live in [`branches.yaml`](branches.yaml). Composition
 details for the maintained features live in
 [`stacks/dspark-adaptive.yaml`](stacks/dspark-adaptive.yaml) and
-[`stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml`](stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml).
+[`stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml`](stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml), and
+[`stacks/xkernel-slo-aware-prefill-controller.yaml`](stacks/xkernel-slo-aware-prefill-controller.yaml).
 
 The generated branch and stack diagrams live in
 [`BRANCH_GRAPH.md`](BRANCH_GRAPH.md).

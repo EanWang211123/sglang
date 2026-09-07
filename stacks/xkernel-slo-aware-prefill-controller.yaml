@@ -1,0 +1,110 @@
+version: 1
+name: xkernel-slo-aware-prefill-controller
+output_branch: xkernel/slo-aware-prefill-controller
+status: active
+last_rebuilt: 2026-09-07
+
+base:
+  branch: feat/pack/main
+  head_at_rebuild: 15f13b8f26362f17a71ba78dd28a2747775ef15f
+
+source:
+  repository: xkernel-factory/sglang
+  branch: feature/slo-aware-prefill-controller
+  head_at_rebuild: 6aaca93a6aa0ff9b5486add650cd49ab504746d8
+
+components:
+  - order: 1
+    id: slo-aware-prefill-scheduling
+    inclusion: rebased_patch
+    source_commit: 024ec77030
+    integrated_commit: 0d98b9b4a4
+
+  - order: 2
+    id: slo-aware-prefill-tests
+    inclusion: rebased_patch
+    source_commit: 45a2139c80
+    integrated_commit: 2f08f1cacf
+
+  - order: 3
+    id: slo-aware-prefill-docs
+    inclusion: rebased_patch
+    source_commit: e3806c3e67
+    integrated_commit: d14b43945e
+
+  - order: 4
+    id: slo-aware-spec-decode-integration
+    inclusion: rebased_patch
+    source_commit: b4916df889
+    integrated_commit: bbb2be5ec8
+
+  - order: 5
+    id: slo-aware-glm52-dsa-seed-fix
+    inclusion: rebased_patch
+    source_commit: 5aa80b3719
+    integrated_commit: f812582793
+
+  - order: 6
+    id: slo-aware-tp-decision-sync
+    inclusion: rebased_patch
+    source_commit: 6eb91397c7
+    integrated_commit: 8bd264330c
+
+  - order: 7
+    id: slo-aware-tp-sync-optimization
+    inclusion: rebased_patch
+    source_commit: d34f1e6642
+    integrated_commit: bc3bf7e7c4
+
+  - order: 8
+    id: slo-aware-native-topk-profile-shape
+    inclusion: rebased_patch
+    source_commit: 07a83d37ec
+    integrated_commit: ed953cf434
+
+  - order: 9
+    id: slo-aware-pcg-integration
+    inclusion: rebased_patch
+    source_commit: 618e01f4c1
+    integrated_commit: 98fbe17a14
+
+  - order: 10
+    id: slo-aware-profile-kv-lifecycle
+    inclusion: rebased_patch
+    source_commit: 9984520ef2
+    integrated_commit: a221eaf697
+
+  - order: 11
+    id: slo-aware-rebase-formatting
+    inclusion: feature_commit
+    integrated_commit: 19f74b11f6
+
+rebase_notes:
+  - >-
+    The SLO configuration fields were assigned to the current schedule config
+    namespace, and validation was moved into the current serving validation hook.
+  - >-
+    The SLO initialization was combined with the current prefill-delayer setup;
+    current MLX imports, config-bag access, and PrefillAdder arguments were kept.
+  - >-
+    The SLO profile KV lifecycle fix was retained. Its DSpark draft conflict was
+    resolved by keeping the pack's graph metadata and non-padded-token handling.
+  - >-
+    The offline profile add/fix/revert sequence was omitted because its net diff
+    is empty.
+  - >-
+    Old adaptive DSpark commits after the SLO series were omitted because the
+    pack contains their newer equivalents. The compact prefill-plan race patch
+    was also omitted because upstream contains the official #32467 fix.
+
+validation:
+  completed:
+    - 27 SLO-aware prefill controller unit tests
+    - black check on rebased and conflict-resolved Python files
+    - Python compileall for python/sglang/srt
+    - git diff --check
+    - feat/pack/main is an ancestor of the output branch
+  unavailable:
+    - >-
+      GPU and broader integration tests on the current Windows host because
+      Linux and CUDA runtime dependencies are unavailable

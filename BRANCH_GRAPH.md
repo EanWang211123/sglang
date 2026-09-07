@@ -30,17 +30,20 @@ flowchart TD
     click branch_dspark_adaptive "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/main"
     branch_adaptive_dspark_replayssm_gptq_marlin_pack["Maintained feature / active<br/>feat/pack/main<br/>15f13b8f26"]
     click branch_adaptive_dspark_replayssm_gptq_marlin_pack "https://github.com/EanWang211123/sglang/tree/feat/pack/main"
+    branch_xkernel_slo_aware_prefill_controller["Maintained feature / active<br/>xkernel/slo-aware-prefill-controller<br/>19f74b11f6"]
+    click branch_xkernel_slo_aware_prefill_controller "https://github.com/EanWang211123/sglang/tree/xkernel/slo-aware-prefill-controller"
     branch_dspark_tp_budget_sync -->|"direct base"| branch_dspark_adaptive
     branch_dspark_runtime_gamma -.->|"rebased patch / 4a7c602a7b"| branch_dspark_adaptive
     branch_dspark_adaptive -->|"direct base"| branch_adaptive_dspark_replayssm_gptq_marlin_pack
     branch_replayssm_dflash_dspark -->|"merged branch / db48a19247"| branch_adaptive_dspark_replayssm_gptq_marlin_pack
     branch_gptq_marlin_moe_bf16_w2_scales -->|"merged branch / 15f13b8f26"| branch_adaptive_dspark_replayssm_gptq_marlin_pack
+    branch_adaptive_dspark_replayssm_gptq_marlin_pack -->|"direct base"| branch_xkernel_slo_aware_prefill_controller
     classDef base fill:#e8eef7,stroke:#607d9b,color:#17202a
     classDef pr fill:#fff3cd,stroke:#b58900,color:#3d3200
     classDef feature fill:#d9f7e8,stroke:#238636,color:#12351d
     class base_upstream_main base
     class branch_dflash_dp_attn,branch_dspark_tp_budget_sync,branch_dspark_runtime_gamma,branch_gptq_marlin_moe_bf16_w2_scales,branch_replayssm_dflash_dspark pr
-    class branch_dspark_adaptive,branch_adaptive_dspark_replayssm_gptq_marlin_pack feature
+    class branch_dspark_adaptive,branch_adaptive_dspark_replayssm_gptq_marlin_pack,branch_xkernel_slo_aware_prefill_controller feature
 ```
 
 ## Stack: `adaptive-dspark-replayssm-gptq-marlin-pack`
@@ -87,4 +90,37 @@ flowchart LR
     stack_dspark_adaptive_7 --> stack_dspark_adaptive_8
     stack_output_dspark_adaptive["feat/adaptive_spec_dspark/main<br/>active"]
     stack_dspark_adaptive_8 --> stack_output_dspark_adaptive
+```
+
+## Stack: `xkernel-slo-aware-prefill-controller`
+
+Source: [`xkernel-slo-aware-prefill-controller.yaml`](stacks/xkernel-slo-aware-prefill-controller.yaml)
+
+```mermaid
+flowchart LR
+    stack_base_xkernel_slo_aware_prefill_controller["feat/pack/main<br/>15f13b8f26"]
+    stack_xkernel_slo_aware_prefill_controller_1["slo-aware-prefill-scheduling<br/>rebased_patch<br/>0d98b9b4a4"]
+    stack_base_xkernel_slo_aware_prefill_controller --> stack_xkernel_slo_aware_prefill_controller_1
+    stack_xkernel_slo_aware_prefill_controller_2["slo-aware-prefill-tests<br/>rebased_patch<br/>2f08f1cacf"]
+    stack_xkernel_slo_aware_prefill_controller_1 --> stack_xkernel_slo_aware_prefill_controller_2
+    stack_xkernel_slo_aware_prefill_controller_3["slo-aware-prefill-docs<br/>rebased_patch<br/>d14b43945e"]
+    stack_xkernel_slo_aware_prefill_controller_2 --> stack_xkernel_slo_aware_prefill_controller_3
+    stack_xkernel_slo_aware_prefill_controller_4["slo-aware-spec-decode-integration<br/>rebased_patch<br/>bbb2be5ec8"]
+    stack_xkernel_slo_aware_prefill_controller_3 --> stack_xkernel_slo_aware_prefill_controller_4
+    stack_xkernel_slo_aware_prefill_controller_5["slo-aware-glm52-dsa-seed-fix<br/>rebased_patch<br/>f812582793"]
+    stack_xkernel_slo_aware_prefill_controller_4 --> stack_xkernel_slo_aware_prefill_controller_5
+    stack_xkernel_slo_aware_prefill_controller_6["slo-aware-tp-decision-sync<br/>rebased_patch<br/>8bd264330c"]
+    stack_xkernel_slo_aware_prefill_controller_5 --> stack_xkernel_slo_aware_prefill_controller_6
+    stack_xkernel_slo_aware_prefill_controller_7["slo-aware-tp-sync-optimization<br/>rebased_patch<br/>bc3bf7e7c4"]
+    stack_xkernel_slo_aware_prefill_controller_6 --> stack_xkernel_slo_aware_prefill_controller_7
+    stack_xkernel_slo_aware_prefill_controller_8["slo-aware-native-topk-profile-shape<br/>rebased_patch<br/>ed953cf434"]
+    stack_xkernel_slo_aware_prefill_controller_7 --> stack_xkernel_slo_aware_prefill_controller_8
+    stack_xkernel_slo_aware_prefill_controller_9["slo-aware-pcg-integration<br/>rebased_patch<br/>98fbe17a14"]
+    stack_xkernel_slo_aware_prefill_controller_8 --> stack_xkernel_slo_aware_prefill_controller_9
+    stack_xkernel_slo_aware_prefill_controller_10["slo-aware-profile-kv-lifecycle<br/>rebased_patch<br/>a221eaf697"]
+    stack_xkernel_slo_aware_prefill_controller_9 --> stack_xkernel_slo_aware_prefill_controller_10
+    stack_xkernel_slo_aware_prefill_controller_11["slo-aware-rebase-formatting<br/>feature_commit<br/>19f74b11f6"]
+    stack_xkernel_slo_aware_prefill_controller_10 --> stack_xkernel_slo_aware_prefill_controller_11
+    stack_output_xkernel_slo_aware_prefill_controller["xkernel/slo-aware-prefill-controller<br/>active"]
+    stack_xkernel_slo_aware_prefill_controller_11 --> stack_output_xkernel_slo_aware_prefill_controller
 ```

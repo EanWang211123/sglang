@@ -163,4 +163,33 @@ branches:
       - branch: fix/gptq-marlin-moe-bf16-w2-scales
         relation: merged_branch
         integrated_commit: 15f13b8f26
+    consumed_by:
+      - xkernel/slo-aware-prefill-controller
+
+  - id: xkernel-slo-aware-prefill-controller
+    name: xkernel/slo-aware-prefill-controller
+    remote: origin
+    type: maintained_feature
+    status: active
+    upstream_base: upstream/main
+    composition_base:
+      branch: feat/pack/main
+      head: 15f13b8f26362f17a71ba78dd28a2747775ef15f
+    remote_head: 19f74b11f61fa75020020e6230c82cd72659b314
+    manifest: stacks/xkernel-slo-aware-prefill-controller.yaml
+    source:
+      repository: xkernel-factory/sglang
+      branch: feature/slo-aware-prefill-controller
+      head: 6aaca93a6aa0ff9b5486add650cd49ab504746d8
+    summary: >-
+      Rebase xkernel's SLO-aware prefill controller and required profiling
+      compatibility fixes onto the adaptive DSpark, ReplaySSM, and GPTQ Marlin
+      feature pack while omitting superseded adaptive DSpark patches.
+    maintenance:
+      force_push_allowed: true
+      last_rebased: 2026-09-07
+      last_remote_update: 2026-09-07
+    dependencies:
+      - branch: feat/pack/main
+        relation: direct_base
 
