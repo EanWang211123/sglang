@@ -89,7 +89,6 @@ class AdaptiveVerifyPlanner:
         algorithm_label: str = "DSpark",
         sps_table_path: Optional[str] = None,
         align_verify_tokens_to_graph_tier: Optional[bool] = None,
-        profiling_enabled: Optional[bool] = None,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -109,12 +108,6 @@ class AdaptiveVerifyPlanner:
             if align_verify_tokens_to_graph_tier is None
             else bool(align_verify_tokens_to_graph_tier)
         )
-        self._profiling_enabled = (
-            envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
-            if profiling_enabled is None
-            else bool(profiling_enabled)
-        )
-
         self._confidence_head = (
             getattr(self.draft_model, "confidence_head", None)
             if self.draft_model is not None
@@ -466,7 +459,10 @@ class AdaptiveVerifyPlanner:
         if (
             self._is_verify_all
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-            and not self._profiling_enabled
+            and (
+                self._budget_planner is None
+                or self._budget_planner.forced_budget_frac is None
+            )
         ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
