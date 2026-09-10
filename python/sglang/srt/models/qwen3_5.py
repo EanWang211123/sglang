@@ -148,6 +148,7 @@ _gdn_decode_fused_proj_conv = (
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+_ragged_qk_diagnostic_keys = set()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -1288,7 +1289,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_cuda_fused(self, positions, hidden_states):
+    def forward_prepare_cuda_fused(
+        self, positions, hidden_states, forward_batch: Optional[ForwardBatch] = None
+    ):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -1297,6 +1300,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             q_gate, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        self._log_ragged_qk_contract(
+            forward_batch=forward_batch,
+            positions=positions,
+            hidden_states=hidden_states,
+            q_gate=q_gate,
+            k=k,
+        )
         q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
             q_gate,
             k,
@@ -1317,6 +1327,75 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
         return q, k, v, gate
+
+    def _log_ragged_qk_contract(
+        self, *, forward_batch, positions, hidden_states, q_gate, k
+    ) -> None:
+        if forward_batch is None or forward_batch.spec_info is None:
+            return
+        spec_info = forward_batch.spec_info
+        layout = getattr(spec_info, "ragged_verify_layout", None)
+        if layout is None:
+            return
+
+        in_capture = bool(get_is_capture_mode())
+        key = (
+            in_capture,
+            tuple(hidden_states.shape),
+            tuple(positions.shape),
+            int(layout.bs),
+            int(layout.graph_num_tokens),
+            layout.total_verify_tokens,
+        )
+        if key in _ragged_qk_diagnostic_keys:
+            return
+        _ragged_qk_diagnostic_keys.add(key)
+
+        def tensor_meta(value):
+            if value is None:
+                return None
+            return {
+                "shape": tuple(value.shape),
+                "stride": tuple(value.stride()),
+                "dtype": str(value.dtype),
+                "device": str(value.device),
+                "contiguous": value.is_contiguous(),
+            }
+
+        value_debug = {}
+        if not in_capture:
+            # These copies intentionally synchronize.  This is a temporary
+            # diagnostic emitted immediately before the failing fused kernel.
+            value_debug = {
+                "positions_min": positions.amin(dim=-1).detach().cpu().tolist(),
+                "positions_max": positions.amax(dim=-1).detach().cpu().tolist(),
+                "verify_lens": layout.verify_lens.detach().cpu().tolist(),
+                "qo_indptr": layout.qo_indptr_device.detach().cpu().tolist(),
+            }
+
+        logger.warning(
+            "[ragged-qk-contract] %s",
+            {
+                "capture": in_capture,
+                "hidden_states": tensor_meta(hidden_states),
+                "q_gate": tensor_meta(q_gate),
+                "k": tensor_meta(k),
+                "positions_arg": tensor_meta(positions),
+                "forward_positions": tensor_meta(forward_batch.positions),
+                "mrope_positions": tensor_meta(forward_batch.mrope_positions),
+                "input_ids": tensor_meta(forward_batch.input_ids),
+                "spec_positions": tensor_meta(getattr(spec_info, "positions", None)),
+                "cos_sin_cache": tensor_meta(self.rotary_emb.cos_sin_cache),
+                "mrope_axis_map": tensor_meta(
+                    getattr(self.rotary_emb, "axis_map", None)
+                ),
+                "layout_bs": int(layout.bs),
+                "layout_graph_num_tokens": int(layout.graph_num_tokens),
+                "layout_total_verify_tokens": layout.total_verify_tokens,
+                "layout_cap": layout.cap,
+                **value_debug,
+            },
+        )
 
     def forward_prepare_native(self, positions, hidden_states):
         if _use_aiter and isinstance(hidden_states, tuple):
@@ -1402,6 +1481,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             return self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
             return self.forward_prepare_fused_gate(
