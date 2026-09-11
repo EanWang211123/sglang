@@ -23,8 +23,22 @@ branches:
       force_push_allowed: true
       last_remote_update: 2026-09-11
     validation:
-      status: in_progress
-      scope: DSpark compact profiling and serving on hybrid GDN models
+      status: passed
+      date: 2026-09-11
+      hardware: 2 x NVIDIA H200
+      target_model: Qwen3.8-27B
+      scope: DSpark compact profiling, serving throughput, and GSM8K accuracy
+      serving:
+        concurrency: 48
+        static_throughput: 1457.2
+        compact_throughput: 1593.9
+        improvement: 9.4%
+      accuracy:
+        dataset: GSM8K
+        samples: 40
+        protocol: chat format without output truncation
+        static: 37/40
+        compact: 38/40
 
   - id: dflash-dp-attn
     name: feat/dflash/dp-attn
