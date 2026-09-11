@@ -1,9 +1,31 @@
 version: 1
 repository: EanWang211123/sglang
 upstream_repository: sgl-project/sglang
-last_updated: 2026-09-07
+last_updated: 2026-09-11
 
 branches:
+  - id: dspark-compact-ragged-verify
+    name: fix/dspark-sps-profiler-verify-all
+    remote: origin
+    type: community_pr
+    status: open
+    upstream_base: upstream/main
+    upstream_pr:
+      number: 38897
+      url: https://github.com/sgl-project/sglang/pull/38897
+      title: "Fix DSpark compact SPS profiling and ragged target verification"
+    remote_head: 8a8685ebccda7a403c5786a99431444a8d58134b
+    summary: >-
+      Honor profiler-pinned verify budgets without an SPS table, map compact
+      speculative mRoPE positions by request, and make hybrid GDN target verify
+      handle packed ragged layouts and CUDA Graph padding safely.
+    maintenance:
+      force_push_allowed: true
+      last_remote_update: 2026-09-11
+    validation:
+      status: in_progress
+      scope: DSpark compact profiling and serving on hybrid GDN models
+
   - id: dflash-dp-attn
     name: feat/dflash/dp-attn
     remote: origin
