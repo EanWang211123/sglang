@@ -32,6 +32,9 @@ details for the maintained features live in
 The generated branch and stack diagrams live in
 [`BRANCH_GRAPH.md`](BRANCH_GRAPH.md).
 
+The compact verify performance follow-up is documented in
+[`DSPARK_COMPACT_VERIFY_OPTIMIZATION.md`](DSPARK_COMPACT_VERIFY_OPTIMIZATION.md).
+
 ## Generate the branch graph
 
 Install the only dependency and render the graph from the YAML registry:
