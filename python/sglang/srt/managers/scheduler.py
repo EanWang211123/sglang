@@ -717,7 +717,7 @@ class Scheduler(
 
         if (
             self.slo_prefill_controller is not None
-            and not self.server_args.disable_slo_prefill_startup_profiling
+            and not get_schedule().disable_slo_prefill_startup_profiling
         ):
             self._profile_slo_prefill_costs()
 
@@ -1408,62 +1408,62 @@ class Scheduler(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
         )
         self.slo_prefill_controller: Optional[SloAwarePrefillController] = None
-        self.slo_prefill_log_interval = max(self.server_args.decode_log_interval, 1)
+        self.slo_prefill_log_interval = max(get_observability().decode_log_interval, 1)
         self.slo_prefill_log_ct = 0
         self.max_prefill_bs: int = 0
-        if self.server_args.enable_slo_aware_prefill:
-            if self.server_args.slo_prefill_ttft_slo_ms is None:
+        if get_schedule().enable_slo_aware_prefill:
+            if get_schedule().slo_prefill_ttft_slo_ms is None:
                 raise ValueError(
                     "--slo-prefill-ttft-slo-ms is required when "
                     "--enable-slo-aware-prefill is set."
                 )
-            if self.server_args.slo_prefill_tpot_slo_ms is None:
+            if get_schedule().slo_prefill_tpot_slo_ms is None:
                 raise ValueError(
                     "--slo-prefill-tpot-slo-ms is required when "
                     "--enable-slo-aware-prefill is set."
                 )
             self.slo_prefill_controller = SloAwarePrefillController(
-                ttft_slo_ms=self.server_args.slo_prefill_ttft_slo_ms,
-                tpot_slo_ms=self.server_args.slo_prefill_tpot_slo_ms,
+                ttft_slo_ms=get_schedule().slo_prefill_ttft_slo_ms,
+                tpot_slo_ms=get_schedule().slo_prefill_tpot_slo_ms,
                 base_chunked_prefill_size=self.chunked_prefill_size,
                 max_prefill_tokens=self.max_prefill_tokens,
                 page_size=self.page_size,
-                min_chunk_size=self.server_args.slo_prefill_min_chunk_size,
-                ttft_stat=self.server_args.slo_prefill_ttft_stat,
-                tpot_stat=self.server_args.slo_prefill_tpot_stat,
+                min_chunk_size=get_schedule().slo_prefill_min_chunk_size,
+                ttft_stat=get_schedule().slo_prefill_ttft_stat,
+                tpot_stat=get_schedule().slo_prefill_tpot_stat,
                 initial_prefill_cost_ms_per_1k=(
-                    self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k
+                    get_schedule().slo_prefill_initial_prefill_cost_ms_per_1k
                 ),
                 initial_decode_cost_ms=(
-                    self.server_args.slo_prefill_initial_decode_cost_ms
+                    get_schedule().slo_prefill_initial_decode_cost_ms
                 ),
-                yield_guard_ratio=self.server_args.slo_prefill_yield_guard_ratio,
+                yield_guard_ratio=get_schedule().slo_prefill_yield_guard_ratio,
                 cache_hit_io_cost_ratio=(
-                    self.server_args.slo_prefill_cache_hit_io_cost_ratio
+                    get_schedule().slo_prefill_cache_hit_io_cost_ratio
                 ),
             )
             logger.info(
                 "SLO-aware prefill enabled: "
-                f"ttft_slo_ms={self.server_args.slo_prefill_ttft_slo_ms}, "
-                f"tpot_slo_ms={self.server_args.slo_prefill_tpot_slo_ms}, "
-                f"ttft_stat={self.server_args.slo_prefill_ttft_stat}, "
-                f"tpot_stat={self.server_args.slo_prefill_tpot_stat}, "
+                f"ttft_slo_ms={get_schedule().slo_prefill_ttft_slo_ms}, "
+                f"tpot_slo_ms={get_schedule().slo_prefill_tpot_slo_ms}, "
+                f"ttft_stat={get_schedule().slo_prefill_ttft_stat}, "
+                f"tpot_stat={get_schedule().slo_prefill_tpot_stat}, "
                 f"base_chunked_prefill_size={self.chunked_prefill_size}, "
                 f"initial_prefill_cost_ms_per_1k="
-                f"{self.server_args.slo_prefill_initial_prefill_cost_ms_per_1k}, "
+                f"{get_schedule().slo_prefill_initial_prefill_cost_ms_per_1k}, "
                 f"initial_decode_cost_ms="
-                f"{self.server_args.slo_prefill_initial_decode_cost_ms}, "
+                f"{get_schedule().slo_prefill_initial_decode_cost_ms}, "
                 f"startup_profiling="
-                f"{not self.server_args.disable_slo_prefill_startup_profiling}, "
+                f"{not get_schedule().disable_slo_prefill_startup_profiling}, "
                 f"profile_decode_context_lens="
                 f"{self._slo_profile_decode_context_lens_arg()}, "
-                f"yield_guard_ratio={self.server_args.slo_prefill_yield_guard_ratio}, "
+                f"yield_guard_ratio={get_schedule().slo_prefill_yield_guard_ratio}, "
                 f"cache_hit_io_cost_ratio="
-                f"{self.server_args.slo_prefill_cache_hit_io_cost_ratio}, "
-                f"min_chunk_size={self.server_args.slo_prefill_min_chunk_size}, "
+                f"{get_schedule().slo_prefill_cache_hit_io_cost_ratio}, "
+                f"min_chunk_size={get_schedule().slo_prefill_min_chunk_size}, "
                 f"effective_min_chunk_size="
                 f"{self.slo_prefill_controller.min_chunk_size}, "
-                f"dp_attention={self.server_args.enable_dp_attention}, "
+                f"dp_attention={get_parallel().enable_dp_attention}, "
                 f"hicache={self.enable_hicache_storage}"
             )
         if get_schedule().enable_prefill_delayer:
@@ -3861,7 +3861,7 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
-        prefill_max_requests = self.server_args.prefill_max_requests
+        prefill_max_requests = get_schedule().prefill_max_requests
         if self.slo_prefill_controller is not None:
             slo_prefill_pressure_state = (
                 self.slo_prefill_controller.compute_pressure_state(
@@ -3912,7 +3912,7 @@ class Scheduler(
                     f"ttft_future_io_cost_ms="
                     f"{slo_prefill_decision.ttft_future_io_cost_s * 1e3:.3f}, "
                     f"cache_hit_io_cost_ratio="
-                    f"{self.server_args.slo_prefill_cache_hit_io_cost_ratio:.3f}, "
+                    f"{get_schedule().slo_prefill_cache_hit_io_cost_ratio:.3f}, "
                     f"ttft_cache_hit_rate="
                     f"{slo_prefill_decision.ttft_cache_hit_rate:.3f}, "
                     f"ttft_slack_ms={slo_prefill_decision.ttft_slack_s * 1e3:.3f}, "
@@ -4002,8 +4002,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -4380,7 +4381,7 @@ class Scheduler(
             ],
             dtype=torch.float32,
         )
-        if self.server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             sync_groups = (
                 (self.dp_tp_group, self.dp_tp_cpu_group),
                 (self.attn_cp_group, self.attn_cp_cpu_group),
@@ -4427,7 +4428,7 @@ class Scheduler(
             ],
             dtype=torch.int64,
         )
-        if self.server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             sync_groups = (
                 (self.dp_tp_group, self.dp_tp_cpu_group),
                 (self.attn_cp_group, self.attn_cp_cpu_group),
@@ -4542,7 +4543,7 @@ class Scheduler(
                 "SLO prefill startup cost profile (spec decode): "
                 "algorithm=%s, verify_num_draft_tokens=%s, Cp(ms)=%s, "
                 "Cd_mean(ms)=%s, Cd_warmup=%d, Cd_samples=%d",
-                self.server_args.speculative_algorithm,
+                get_spec().speculative_algorithm,
                 verify_tokens,
                 [(tokens, round(cost_ms, 3)) for tokens, cost_ms in prefill_points],
                 cd_log,
@@ -4574,16 +4575,16 @@ class Scheduler(
         return max(1, min(upper, self.max_prefill_tokens, self.max_req_input_len - 1))
 
     def _slo_profile_decode_context_lens_arg(self) -> List[int]:
-        return self.server_args.slo_prefill_profile_decode_context_lens or [
-            self.server_args.slo_prefill_profile_decode_context_len
+        return get_schedule().slo_prefill_profile_decode_context_lens or [
+            get_schedule().slo_prefill_profile_decode_context_len
         ]
 
     def _slo_profile_decode_context_lens(self) -> List[int]:
-        explicit_lens = self.server_args.slo_prefill_profile_decode_context_lens
+        explicit_lens = get_schedule().slo_prefill_profile_decode_context_lens
         raw_lens = (
             explicit_lens
             if explicit_lens is not None
-            else [self.server_args.slo_prefill_profile_decode_context_len]
+            else [get_schedule().slo_prefill_profile_decode_context_len]
         )
         max_context_len = max(
             1, min(self.max_req_input_len - 1, self.max_total_num_tokens - 1)
@@ -4607,7 +4608,7 @@ class Scheduler(
         ]
 
     def _slo_profile_decode_batch_sizes(self, context_len: int) -> List[int]:
-        explicit_sizes = self.server_args.slo_prefill_profile_decode_batch_sizes
+        explicit_sizes = get_schedule().slo_prefill_profile_decode_batch_sizes
         if explicit_sizes is not None:
             raw_sizes = explicit_sizes
         else:
@@ -4695,10 +4696,10 @@ class Scheduler(
             self._release_slo_profile_reqs(reqs)
 
     def _slo_profile_verify_num_draft_tokens(self) -> Optional[int]:
-        draft_tokens = self.server_args.speculative_num_draft_tokens
+        draft_tokens = get_spec().speculative_num_draft_tokens
         if draft_tokens is not None and draft_tokens > 0:
             return int(draft_tokens)
-        num_steps = self.server_args.speculative_num_steps
+        num_steps = get_spec().speculative_num_steps
         if num_steps is not None and num_steps > 0:
             return int(num_steps) + 1
         return None
