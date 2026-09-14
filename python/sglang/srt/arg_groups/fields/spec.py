@@ -94,7 +94,6 @@ class Spec(msgspec.Struct):
         "DSPARK compact verify only. Run startup adaptive-verify profiling with "
         "the built-in profile grid. --adaptive-verify-profile-config overrides "
         "the built-in parameters.",
-        NS("spec"),
     ] = False
     adaptive_verify_profile_config: A[
         Optional[str],
@@ -103,7 +102,6 @@ class Spec(msgspec.Struct):
         "verify-lens length) cells and installs the fitted two-dimensional SPS "
         "cost table. "
         "Keys: batch_sizes, seq_len, query_lens_per_req, n_warmup, n_measure.",
-        NS("spec"),
     ] = None
     speculative_dspark_cuda_graph_capture_config: A[
         Optional[str],
@@ -114,7 +112,6 @@ class Spec(msgspec.Struct):
         "query length is candidate + 1 and batch_size * (candidate + 1) produces "
         "a token-keyed graph tier. Duplicate tiers are captured once. Omit to "
         "retain the default decode.bs * verify-window tiers.",
-        NS("spec"),
     ] = None
     speculative_dspark_confidence_sts_path: A[
         Optional[str],
