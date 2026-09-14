@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -18,6 +19,46 @@ _GRID = [8, 16, 24, 32, 64]
 # The backend capability checks (supports_ragged_verify_graph) live in
 # test_ragged_verify_backend_capability.py: importing the backend modules
 # pulls GPU-only wheels, which fail to import on the CPU runners.
+
+
+class TestHostLayoutConstruction(CustomTestCase):
+    def test_uniform_layout_never_uploads_host_lengths(self):
+        # The old CUDA torch.tensor(list, device=...) path synchronizes the
+        # current stream. Uniform cache misses must use a device fill instead.
+        with patch.object(torch, "tensor", side_effect=AssertionError("host upload")):
+            for bs in (1, 3, 48):
+                layout = RaggedVerifyLayout.from_verify_lens(
+                    verify_lens_cpu=[8] * bs, device=_DEVICE, grid=[bs * 8 + 5]
+                )
+                self.assertEqual(layout.verify_lens.tolist(), [8] * bs)
+                self.assertEqual(
+                    layout.qo_indptr_device.tolist(), list(range(0, bs * 8 + 1, 8))
+                )
+                self.assertEqual(
+                    layout.extend_start_loc.tolist(), list(range(0, bs * 8, 8))
+                )
+                self.assertEqual(layout.total_verify_tokens, bs * 8)
+                self.assertEqual(layout.graph_num_tokens, bs * 8 + 5)
+                self.assertEqual(layout.verify_lens_cpu, [8] * bs)
+
+    def test_variable_cuda_layout_uses_pinned_nonblocking_upload(self):
+        host = Mock()
+        device_lengths = torch.tensor([8, 3, 5], dtype=torch.int32)
+        host.to.return_value = device_lengths
+        with patch.object(torch, "tensor", return_value=host) as make_host:
+            layout = RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=[8, 3, 5], device=torch.device("cuda:0"), grid=[24]
+            )
+        make_host.assert_called_once_with(
+            [8, 3, 5], dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        host.to.assert_called_once_with(
+            device=torch.device("cuda:0"), non_blocking=True
+        )
+        self.assertEqual(layout.verify_lens.tolist(), [8, 3, 5])
+        self.assertEqual(layout.qo_indptr_device.tolist(), [0, 8, 11, 16])
+        self.assertEqual(layout.total_verify_tokens, 16)
+        self.assertEqual(layout.graph_num_tokens, 24)
 
 
 class TestRaggedTargetVerifyGeometry(CustomTestCase):
