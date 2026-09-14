@@ -263,6 +263,25 @@ class DSparkVerifyPlanner:
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
         )
 
+    def _uniform_layout(
+        self,
+        *,
+        bs: int,
+        device: torch.device,
+        global_num_reqs: Optional[int],
+    ) -> Optional[RaggedVerifyLayout]:
+        key = (bs, global_num_reqs)
+        if key not in self._uniform_layout_cache:
+            self._uniform_layout_cache[key] = uniform_ragged_layout(
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                ragged_verify_mode=self._ragged_verify_mode,
+                model_runner=self.model_runner,
+                tier_num_reqs=global_num_reqs,
+            )
+        return self._uniform_layout_cache[key]
+
     def compute_confidence_tensor(
         self,
         *,
@@ -275,9 +294,9 @@ class DSparkVerifyPlanner:
             return None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
-            assert (
-                confidence_tap is not None
-            ), "dsv4 compute_confidence needs the compute_base_logits tap"
+            assert confidence_tap is not None, (
+                "dsv4 compute_confidence needs the compute_base_logits tap"
+            )
             with torch.inference_mode():
                 return compute_confidence_hook(
                     anchor_tokens=anchor_tokens,
@@ -450,45 +469,41 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        forced_budget_frac = (
-            self._budget_planner.forced_budget_frac
-            if self._budget_planner is not None
-            else None
-        )
         if (
             self._is_verify_all
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-            and not envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
-            and forced_budget_frac is None
+            and (
+                self._budget_planner is None
+                or self._budget_planner.forced_budget_frac is None
+            )
             and self._profile_verify_token_budget is None
         ):
-            # Verify-all: the uniform layout (or None, past the captured grid)
-            # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips. SPS
-            # profiling and explicit budget pins must still exercise the dynamic
-            # layout path even when the bootstrap SPS table is uninitialized.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
-            if key not in self._uniform_layout_cache:
-                self._uniform_layout_cache[key] = uniform_ragged_layout(
-                    bs=key[0],
-                    device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                    ragged_verify_mode=self._ragged_verify_mode,
-                    model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
-                )
-            return self._uniform_layout_cache[key]
+            return self._uniform_layout(
+                bs=int(req_pool_indices.shape[0]),
+                device=device,
+                global_num_reqs=global_num_reqs,
+            )
+        aligned_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+        local_bs = int(req_pool_indices.shape[0])
+        verify_floor = max(self._schedule_cfg.min_verify_len, 1)
+        full_budget = local_bs * (self.verify_num_draft_tokens - verify_floor)
+        if aligned_budget is not None and aligned_budget >= full_budget:
+            return self._uniform_layout(
+                bs=local_bs,
+                device=device,
+                global_num_reqs=global_num_reqs,
+            )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=aligned_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -496,13 +511,10 @@ class DSparkVerifyPlanner:
                 "the gathered hint and the local budget diverged"
             )
             if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-                return uniform_ragged_layout(
+                return self._uniform_layout(
                     bs=len(req_pool_indices),
                     device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                    ragged_verify_mode=self._ragged_verify_mode,
-                    model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
+                    global_num_reqs=global_num_reqs,
                 )
             return None
         bs = int(verify_lens.shape[0])
@@ -1078,7 +1090,6 @@ def _additive_step_time_tensor(
 
 
 class HostConfidenceBudgetPlanner:
-
     def __init__(
         self,
         *,

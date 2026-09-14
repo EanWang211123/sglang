@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import statistics
 from array import array
 from contextlib import contextmanager
@@ -39,6 +40,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps_fit import (
     fit_additive_sps_components,
     fit_additive_sps_table,
 )
+from sglang.srt.speculative.ragged_verify import round_up_grid
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +107,18 @@ def resolve_profile_grid(
     *,
     max_batch_size_per_rank: int,
     max_query_len_per_req: int,
+    dp_size: int = 1,
 ) -> tuple[list[int], list[int]]:
-    if max_batch_size_per_rank < 1 or max_query_len_per_req < 1:
+    if max_batch_size_per_rank < 1 or max_query_len_per_req < 1 or dp_size < 1:
         raise ValueError("resolved profile batch/query limits must be positive")
     if cfg.batch_sizes is None:
-        batch_sizes = [1, 4, 8]
-        batch_sizes.extend(range(16, max_batch_size_per_rank + 1, 8))
+        # Keep roughly eight global requests between probes.  Under DP
+        # attention, bs is per rank, so divide that spacing across DP ranks.
+        batch_size_step = max(1, math.ceil(8 / dp_size))
+        batch_sizes = [1]
+        batch_sizes.extend(
+            range(batch_size_step, max_batch_size_per_rank + 1, batch_size_step)
+        )
         batch_sizes.append(max_batch_size_per_rank)
         batch_sizes = [
             batch_size
@@ -149,6 +157,7 @@ def run_adaptive_verify_profile(
         cfg,
         max_batch_size_per_rank=max_running_requests,
         max_query_len_per_req=worker.verify_num_draft_tokens,
+        dp_size=get_parallel().attn_dp_size,
     )
     batch_sizes = _validate_profile_grid(worker, batch_sizes, query_lens)
     num_cells = len(batch_sizes) * len(query_lens)
@@ -175,6 +184,8 @@ def run_adaptive_verify_profile(
         cfg.n_warmup,
         cfg.n_measure,
     )
+    capture_tokens = ragged_capture_num_tokens(model_runner=worker.model_runner)
+    assert capture_tokens is not None
     cells = []
     with _profile_acceptance_override(worker):
         for batch_size in batch_sizes:
@@ -194,19 +205,27 @@ def run_adaptive_verify_profile(
                 finally:
                     worker._verify_planner.set_profile_verify_token_budget(None)
                 batch_tokens = batch_size * query_len
-                cells.append({"bs": batch_size, "M": batch_tokens, "T": step_seconds})
+                padded_batch_tokens = round_up_grid(batch_tokens, capture_tokens)
+                cells.append(
+                    {
+                        "bs": batch_size,
+                        "M": padded_batch_tokens,
+                        "T": step_seconds,
+                    }
+                )
                 logger.info(
                     "DSpark adaptive verify profile: bs=%d, query_len_per_req=%d, "
-                    "batch_tokens=%d, median=%.3fms",
+                    "batch_tokens=%d, graph_tokens=%d, median=%.3fms",
                     batch_size,
                     query_len,
                     batch_tokens,
+                    padded_batch_tokens,
                     step_seconds * 1000.0,
                 )
 
     table = fit_additive_sps_table(cells=cells)
-    _bias, _alpha, _theta, relative_errors, fit_stats = (
-        fit_additive_sps_components(cells)
+    _bias, _alpha, _theta, relative_errors, fit_stats = fit_additive_sps_components(
+        cells
     )
     worker._verify_planner.install_sps_table(table)
     logger.info(
