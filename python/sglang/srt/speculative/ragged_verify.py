@@ -124,7 +124,32 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         graph_num_tokens: int,
         device: torch.device,
     ) -> RaggedVerifyLayout:
-        verify_lens = torch.tensor(verify_lens_cpu, dtype=torch.int32, device=device)
+        device = torch.device(device)
+        if verify_lens_cpu and all(
+            length == verify_lens_cpu[0] for length in verify_lens_cpu
+        ):
+            # Cache misses can occur after DP/MoE work has been queued on the
+            # current stream. A blocking H2D copy here would wait for that work
+            # before this rank can enqueue target verify. Fill uniform rows on
+            # device instead; no host upload or stream synchronization is needed.
+            verify_lens = torch.full(
+                (len(verify_lens_cpu),),
+                verify_lens_cpu[0],
+                dtype=torch.int32,
+                device=device,
+            )
+        elif device.type == "cuda":
+            # Variable host layouts also must not drain the current stream.
+            # Use a fresh pinned source, never mutate it after enqueueing. The
+            # PyTorch pinned allocator tracks its lifetime through the copy.
+            verify_lens_host = torch.tensor(
+                verify_lens_cpu, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            verify_lens = verify_lens_host.to(device=device, non_blocking=True)
+        else:
+            verify_lens = torch.tensor(
+                verify_lens_cpu, dtype=torch.int32, device=device
+            )
         return cls._assemble_device(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
