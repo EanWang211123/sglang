@@ -2,82 +2,94 @@ version: 1
 name: dspark-adaptive
 output_branch: feat/adaptive_spec_dspark/main
 status: active
-last_rebuilt: 2026-09-07
-
+last_rebuilt: '2026-09-14'
 base:
   branch: upstream/main
   head_at_rebuild: 783af667fb
-
 components:
-  - order: 1
-    id: dspark-tp-budget-sync
-    source_branch: fix/fix-dspark-verlen-confict-tp-ranks
-    source_pr: https://github.com/sgl-project/sglang/pull/31195
-    inclusion: direct_base
-    integrated_head: b5f638520a0b8cf91950e26099c3ccee778d497d
-
-  - order: 2
-    id: dspark-runtime-gamma
-    source_branch: fix/fix-dspark-compact-confidence-head-with-vargamma
-    source_pr: https://github.com/sgl-project/sglang/pull/31016
-    inclusion: rebased_patch
-    integrated_commit: 4a7c602a7b
-
-  - order: 3
-    id: dspark-profiling-guard
-    inclusion: feature_commit
-    integrated_commit: 988846a4e0
-    subject: "fix: remove is_all_verify flag when dspark profiling"
-
-  - order: 4
-    id: dspark-batch-aware-graph-tier
-    inclusion: feature_commit
-    integrated_commit: f044291e72
-    subject: "feat : add batch-size-aware tier wthin compact graph"
-
-  - order: 5
-    id: dspark-pre-budget-token-tier
-    inclusion: feature_commit
-    integrated_commit: 4229b39483
-    subject: "[feat] add batched-token tier for pre budget compute"
-
-  - order: 6
-    id: dspark-draft-extend-ragged-guard
-    inclusion: feature_commit
-    integrated_commit: 1956aed8d8
-    subject: "fix : draft-extend graph ragged_verify_mode loss gaurd"
-
-  - order: 7
-    id: dspark-runtime-config-adaptation
-    inclusion: feature_commit
-    integrated_commit: dd72332235
-    subject: "fix(dspark): adapt graph tiers to runtime config"
-
-  - order: 8
-    id: dspark-online-startup-profile
-    inclusion: feature_commit
-    integrated_commit: b62ac30bb6
-    subject: "feat(dspark): profile adaptive verify costs at startup"
-
+- order: 1
+  id: dspark-tp-budget-sync
+  source_branch: fix/fix-dspark-verlen-confict-tp-ranks
+  source_pr: https://github.com/sgl-project/sglang/pull/31195
+  inclusion: direct_base
+  integrated_head: b5f638520a0b8cf91950e26099c3ccee778d497d
+- order: 2
+  id: dspark-runtime-gamma
+  source_branch: fix/fix-dspark-compact-confidence-head-with-vargamma
+  source_pr: https://github.com/sgl-project/sglang/pull/31016
+  inclusion: rebased_patch
+  integrated_commit: 4a7c602a7b
+- order: 3
+  id: dspark-profiling-guard
+  inclusion: feature_commit
+  integrated_commit: 988846a4e0
+  subject: 'fix: remove is_all_verify flag when dspark profiling'
+- order: 4
+  id: dspark-batch-aware-graph-tier
+  inclusion: feature_commit
+  integrated_commit: f044291e72
+  subject: 'feat : add batch-size-aware tier wthin compact graph'
+- order: 5
+  id: dspark-pre-budget-token-tier
+  inclusion: feature_commit
+  integrated_commit: 4229b39483
+  subject: '[feat] add batched-token tier for pre budget compute'
+- order: 6
+  id: dspark-draft-extend-ragged-guard
+  inclusion: feature_commit
+  integrated_commit: 1956aed8d8
+  subject: 'fix : draft-extend graph ragged_verify_mode loss gaurd'
+- order: 7
+  id: dspark-runtime-config-adaptation
+  inclusion: feature_commit
+  integrated_commit: dd72332235
+  subject: 'fix(dspark): adapt graph tiers to runtime config'
+- order: 8
+  id: dspark-online-startup-profile
+  inclusion: feature_commit
+  integrated_commit: b62ac30bb6
+  subject: 'feat(dspark): profile adaptive verify costs at startup'
+- order: 9
+  id: dspark-dp-padded-graph-tier
+  inclusion: feature_commit
+  integrated_commit: 781cac898321d2bc281652f9e2f6cef8f35fa9e5
+- order: 10
+  id: dspark-compact-ragged-verify
+  source_branch: fix/dspark-sps-profiler-verify-all
+  source_pr: https://github.com/sgl-project/sglang/pull/38897
+  inclusion: merged_branch
+  integrated_head: 6c5c125dca98446391486c6920a59a99e783ac03
+  integrated_commit: 536fed5ef8ce2df7baf13df27f68c5b7d8cb917f
+- order: 11
+  id: dspark-profile-config-field-migration
+  inclusion: feature_commit
+  integrated_commit: 74dc5793c997b52b8049c197a85474ae5bfb7b41
+- order: 12
+  id: dspark-merge-formatting
+  inclusion: feature_commit
+  integrated_commit: a09c88a379bc5f804abfa61a4d64a00e19050ba1
 rebase_notes:
-  - >-
-    The 2026-09-07 rebuild consolidated the startup profiler follow-up fixes
-    into b62ac30bb6.
-  - >-
-    The old compact prefill-plan race commit was omitted because upstream/main
-    contains the official #32467 resolution.
-  - >-
-    The old TP budget broadcast commit was omitted because the composition base
-    contains the newer SpecTpSync-based implementation from PR #31195.
-  - >-
-    Batch-aware graph capture was adapted to preserve current main's DSA dual
-    graphs, ragged layout staging, breakable graph events, and runtime config bags.
-
+- The 2026-09-07 rebuild consolidated the startup profiler follow-up fixes into b62ac30bb6.
+- 'The old compact prefill-plan race commit was omitted because upstream/main contains the official
+  #32467 resolution.'
+- 'The old TP budget broadcast commit was omitted because the composition base contains the newer
+  SpecTpSync-based implementation from PR #31195.'
+- Batch-aware graph capture was adapted to preserve current main's DSA dual graphs, ragged layout
+  staging, breakable graph events, and runtime config bags.
+- '2026-09-14: merged the full PR #38897 head, retaining its upstream history and all existing adaptive
+  commits. Migrated the three custom startup/graph-profile fields into arg_groups/fields/spec.py.
+  The verify-all shortcut respects forced fractions and startup token-budget pins; the full-budget
+  uniform optimization is retained. SGLANG_DSPARK_ENABLE_SPS_RECORD remains observability only.'
 validation:
   completed:
-    - black --check on affected Python files
-    - python compileall on affected Python files
-    - git diff --check
-    - mypy on the startup profiler module
+  - 14 CPU ragged-layout, merged-planner budget-path and config-field tests (package initialization
+    and Triton decorators bypassed; actual Torch CPU paths used)
+  - black check on conflict-resolved Python files
+  - Python compileall for python/sglang/srt
+  - ruff F821/F823 on conflict-resolved files
+  - 'git diff --check against PR #38897'
+  - 'PR #38897 and the previous output head are ancestors of the output'
   unavailable:
-    - full pytest on the current Windows host because the Linux resource module is unavailable
+  - full pytest on the current Windows host because the Linux resource module is unavailable
+backup_tag: backup/downstream-20260914/dspark
+output_head: a09c88a379bc5f804abfa61a4d64a00e19050ba1

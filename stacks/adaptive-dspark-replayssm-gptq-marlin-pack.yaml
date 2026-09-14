@@ -2,47 +2,44 @@ version: 1
 name: adaptive-dspark-replayssm-gptq-marlin-pack
 output_branch: feat/pack/main
 status: active
-last_rebuilt: 2026-09-07
-
+last_rebuilt: '2026-09-14'
 base:
   branch: feat/adaptive_spec_dspark/main
-  head_at_rebuild: b62ac30bb6433fd2afc230c049c646a7a977bf58
-
+  head_at_rebuild: a09c88a379bc5f804abfa61a4d64a00e19050ba1
 components:
-  - order: 1
-    id: replayssm-dflash-dspark
-    source_branch: feat/ssm-ring-replay/main
-    source_pr: https://github.com/sgl-project/sglang/pull/36683
-    inclusion: merged_branch
-    integrated_head: 9b2e85bd43c78b80d5e498ff766189f272f611e1
-    integrated_commit: db48a192470c3ddf29ba2dc4db37f5225e17aa7a
-
-  - order: 2
-    id: gptq-marlin-moe-bf16-w2-scales
-    source_branch: fix/gptq-marlin-moe-bf16-w2-scales
-    source_pr: https://github.com/sgl-project/sglang/pull/35955
-    inclusion: merged_branch
-    integrated_head: 4af6f2bba95617014190ee247d77b5bcba749d9b
-    integrated_commit: 15f13b8f26362f17a71ba78dd28a2747775ef15f
-
+- order: 1
+  id: replayssm-dflash-dspark
+  source_branch: feat/ssm-ring-replay/main
+  source_pr: https://github.com/sgl-project/sglang/pull/36683
+  inclusion: merged_branch
+  integrated_head: 5c07ac58bba76390b9a01cca5001894539e2a5ec
+  integrated_commit: eb57fc87b1e7084a140b14da409d7ba22e9b9bd1
+- order: 2
+  id: gptq-marlin-moe-bf16-w2-scales
+  source_branch: fix/gptq-marlin-moe-bf16-w2-scales
+  source_pr: https://github.com/sgl-project/sglang/pull/35955
+  inclusion: merged_branch
+  integrated_head: 97df61e7e3555e7c37118902f1a21775d9e3b75d
+  integrated_commit: 635ca6d8162152819b0429ade60ced63c1fa8fe8
 merge_notes:
-  - >-
-    Adaptive DSpark is the direct composition base. ReplaySSM is merged first
-    because it overlaps DSpark worker code; GPTQ Marlin MoE is merged second.
-  - >-
-    Both merges completed with the ort strategy and required no manual conflict
-    resolution.
-  - >-
-    The ReplaySSM source branch already contains newer upstream/main merge
-    commits, which are intentionally retained in this pack.
-
+- '2026-09-14: retained the existing pack history and merged updated adaptive DSpark, then PR #36683,
+  then PR #35955. Subsequent DSpark field/format fixes were propagated by merge.'
+- ReplaySSM conflicts keep the latest fold/commit hooks and post-verify sequence lengths, its static-only
+  DSPARK GDN ring-write guard, and the newer PLE request-pool helper. Obsolete GPTQ scheme-attach
+  tests were removed as upstream did; the new GPTQ regression tests are retained.
+- Decode graph capture retains custom source batch sizes and token tiers while switching to upstream
+  attention graph variants.
+- Inherited upstream whitespace in docs/src/snippets/configs/zai-org/glm-5.2.jsx is retained; integration
+  changes pass git diff --check against the latest GPTQ PR head.
 validation:
   completed:
-    - all three source heads are ancestors of the pack head
-    - targeted Python compile checks
-    - git diff --check
-    - branch registry render and freshness check
+  - 12 ReplaySSM commit/configuration CPU tests using the existing isolated harness
+  - 4 GPTQ BF16/TP/act-order CPU tests using the existing isolated harness
+  - 14 ragged/planner/config CPU tests on the final downstream tree
+  - Python compileall, black, ruff F821/F823 on conflict-resolved files
+  - git diff --check against the latest GPTQ PR head
+  - 'latest adaptive DSpark, PR #36683, PR #35955 and previous pack head are ancestors of the output'
   unavailable:
-    - >-
-      targeted pytest collection on the current Windows host because Python's
-      Unix-only resource module is unavailable
+  - Linux/CUDA serving, graph replay and model integration tests on this Windows host
+backup_tag: backup/downstream-20260914/pack
+output_head: 1d3938724d77a1e3d2938a7201c21dd1bd7313ac
