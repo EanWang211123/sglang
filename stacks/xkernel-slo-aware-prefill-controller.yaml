@@ -5,7 +5,7 @@ status: active
 last_rebuilt: '2026-09-14'
 base:
   branch: feat/pack/main
-  head_at_rebuild: 1d3938724d77a1e3d2938a7201c21dd1bd7313ac
+  head_at_rebuild: d56eaf7e0ef3bc80ae8de0cc93bd5c5fe8945c04
 source:
   repository: xkernel-factory/sglang
   branch: feature/slo-aware-prefill-controller
@@ -93,6 +93,10 @@ components:
   id: slo-feature-pack-final-propagation
   inclusion: feature_commit
   integrated_commit: 1ef9b11aec5f22526eb685594f85b6e14854039e
+- order: 19
+  id: ragged-layout-nonblocking-host-construction
+  inclusion: feature_commit
+  integrated_commit: 5ac9a8d74e1f0cc55fdc790d29ba30129d0bcd7d
 rebase_notes:
 - The SLO configuration fields were assigned to the current schedule config namespace, and validation
   was moved into the current serving validation hook.
@@ -113,6 +117,12 @@ rebase_notes:
 - Kept the current scheduler stage decorator and sampling-mask abort handling; SLO decode timing
   records the actual accepted-token count. Kept normal-tensor DSA seed allocation and adopted upstream
   dsa_seed_topk_width. DSpark draft keeps its device lookup and upstream original_global_num_tokens_cpu.
+- '2026-09-14 hang investigation: DP0 blocked in RaggedVerifyLayout._assemble while other ranks waited
+  for decode copy_done. Uniform host lengths now use torch.full on device; variable CUDA host lengths
+  use a fresh pinned CPU tensor and non_blocking upload. CPU metadata, token tiers and padding semantics
+  are retained. The synchronization site is confirmed by py-spy; a DP/MoE/overlap collective wait
+  cycle remains a hypothesis until GPU reproduction. Existing device-to-host budget/length fallback
+  synchronizations are outside this patch.'
 validation:
   completed:
   - 27 SLO controller unit tests
@@ -122,8 +132,14 @@ validation:
   - ruff F821/F823 on conflict-resolved files
   - git diff --check against the latest GPTQ PR head
   - latest feat/pack/main and previous SLO head are ancestors of the output
+  - 'Layout upload follow-up: 16 CPU layout/planner/config tests including uniform no-host-upload
+    and mocked CUDA pinned/nonblocking upload regressions; final tree also passes 27 SLO, 12 ReplaySSM
+    and 4 GPTQ tests, black, compile and ruff checks.'
   unavailable:
   - GPU and broader integration tests on the current Windows host because Linux and CUDA runtime
     dependencies are unavailable
+  - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
+    hang.
 backup_tag: backup/downstream-20260914/slo
-output_head: 1ef9b11aec5f22526eb685594f85b6e14854039e
+output_head: 5ac9a8d74e1f0cc55fdc790d29ba30129d0bcd7d
+layout_upload_backup_tag: backup/layout-upload-20260914/slo

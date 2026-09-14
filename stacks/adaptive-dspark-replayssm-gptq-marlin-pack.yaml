@@ -5,7 +5,7 @@ status: active
 last_rebuilt: '2026-09-14'
 base:
   branch: feat/adaptive_spec_dspark/main
-  head_at_rebuild: a09c88a379bc5f804abfa61a4d64a00e19050ba1
+  head_at_rebuild: 9b5515cd617b7e9267f1ae068d0290602784b1b7
 components:
 - order: 1
   id: replayssm-dflash-dspark
@@ -21,6 +21,10 @@ components:
   inclusion: merged_branch
   integrated_head: 97df61e7e3555e7c37118902f1a21775d9e3b75d
   integrated_commit: 635ca6d8162152819b0429ade60ced63c1fa8fe8
+- order: 3
+  id: ragged-layout-nonblocking-host-construction
+  inclusion: feature_commit
+  integrated_commit: d56eaf7e0ef3bc80ae8de0cc93bd5c5fe8945c04
 merge_notes:
 - '2026-09-14: retained the existing pack history and merged updated adaptive DSpark, then PR #36683,
   then PR #35955. Subsequent DSpark field/format fixes were propagated by merge.'
@@ -31,6 +35,12 @@ merge_notes:
   attention graph variants.
 - Inherited upstream whitespace in docs/src/snippets/configs/zai-org/glm-5.2.jsx is retained; integration
   changes pass git diff --check against the latest GPTQ PR head.
+- '2026-09-14 hang investigation: DP0 blocked in RaggedVerifyLayout._assemble while other ranks waited
+  for decode copy_done. Uniform host lengths now use torch.full on device; variable CUDA host lengths
+  use a fresh pinned CPU tensor and non_blocking upload. CPU metadata, token tiers and padding semantics
+  are retained. The synchronization site is confirmed by py-spy; a DP/MoE/overlap collective wait
+  cycle remains a hypothesis until GPU reproduction. Existing device-to-host budget/length fallback
+  synchronizations are outside this patch.'
 validation:
   completed:
   - 12 ReplaySSM commit/configuration CPU tests using the existing isolated harness
@@ -39,7 +49,13 @@ validation:
   - Python compileall, black, ruff F821/F823 on conflict-resolved files
   - git diff --check against the latest GPTQ PR head
   - 'latest adaptive DSpark, PR #36683, PR #35955 and previous pack head are ancestors of the output'
+  - 'Layout upload follow-up: 16 CPU layout/planner/config tests including uniform no-host-upload
+    and mocked CUDA pinned/nonblocking upload regressions; final tree also passes 27 SLO, 12 ReplaySSM
+    and 4 GPTQ tests, black, compile and ruff checks.'
   unavailable:
   - Linux/CUDA serving, graph replay and model integration tests on this Windows host
+  - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
+    hang.
 backup_tag: backup/downstream-20260914/pack
-output_head: 1d3938724d77a1e3d2938a7201c21dd1bd7313ac
+output_head: d56eaf7e0ef3bc80ae8de0cc93bd5c5fe8945c04
+layout_upload_backup_tag: backup/layout-upload-20260914/pack

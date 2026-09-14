@@ -68,6 +68,10 @@ components:
   id: dspark-merge-formatting
   inclusion: feature_commit
   integrated_commit: a09c88a379bc5f804abfa61a4d64a00e19050ba1
+- order: 13
+  id: ragged-layout-nonblocking-host-construction
+  inclusion: feature_commit
+  integrated_commit: 9b5515cd617b7e9267f1ae068d0290602784b1b7
 rebase_notes:
 - The 2026-09-07 rebuild consolidated the startup profiler follow-up fixes into b62ac30bb6.
 - 'The old compact prefill-plan race commit was omitted because upstream/main contains the official
@@ -80,6 +84,12 @@ rebase_notes:
   commits. Migrated the three custom startup/graph-profile fields into arg_groups/fields/spec.py.
   The verify-all shortcut respects forced fractions and startup token-budget pins; the full-budget
   uniform optimization is retained. SGLANG_DSPARK_ENABLE_SPS_RECORD remains observability only.'
+- '2026-09-14 hang investigation: DP0 blocked in RaggedVerifyLayout._assemble while other ranks waited
+  for decode copy_done. Uniform host lengths now use torch.full on device; variable CUDA host lengths
+  use a fresh pinned CPU tensor and non_blocking upload. CPU metadata, token tiers and padding semantics
+  are retained. The synchronization site is confirmed by py-spy; a DP/MoE/overlap collective wait
+  cycle remains a hypothesis until GPU reproduction. Existing device-to-host budget/length fallback
+  synchronizations are outside this patch.'
 validation:
   completed:
   - 14 CPU ragged-layout, merged-planner budget-path and config-field tests (package initialization
@@ -89,7 +99,13 @@ validation:
   - ruff F821/F823 on conflict-resolved files
   - 'git diff --check against PR #38897'
   - 'PR #38897 and the previous output head are ancestors of the output'
+  - 'Layout upload follow-up: 16 CPU layout/planner/config tests including uniform no-host-upload
+    and mocked CUDA pinned/nonblocking upload regressions; final tree also passes 27 SLO, 12 ReplaySSM
+    and 4 GPTQ tests, black, compile and ruff checks.'
   unavailable:
   - full pytest on the current Windows host because the Linux resource module is unavailable
+  - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
+    hang.
 backup_tag: backup/downstream-20260914/dspark
-output_head: a09c88a379bc5f804abfa61a4d64a00e19050ba1
+output_head: 9b5515cd617b7e9267f1ae068d0290602784b1b7
+layout_upload_backup_tag: backup/layout-upload-20260914/dspark
