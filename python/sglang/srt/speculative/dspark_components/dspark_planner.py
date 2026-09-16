@@ -89,7 +89,6 @@ class AdaptiveVerifyPlanner:
         algorithm_label: str = "DSpark",
         sps_table_path: Optional[str] = None,
         align_verify_tokens_to_graph_tier: Optional[bool] = None,
-        profiling_enabled: Optional[bool] = None,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -109,12 +108,6 @@ class AdaptiveVerifyPlanner:
             if align_verify_tokens_to_graph_tier is None
             else bool(align_verify_tokens_to_graph_tier)
         )
-        self._profiling_enabled = (
-            envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.get()
-            if profiling_enabled is None
-            else bool(profiling_enabled)
-        )
-
         self._confidence_head = (
             getattr(self.draft_model, "confidence_head", None)
             if self.draft_model is not None
@@ -281,6 +274,25 @@ class AdaptiveVerifyPlanner:
         return (
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
         )
+
+    def _uniform_layout(
+        self,
+        *,
+        bs: int,
+        device: torch.device,
+        global_num_reqs: Optional[int],
+    ) -> Optional[RaggedVerifyLayout]:
+        key = (bs, global_num_reqs)
+        if key not in self._uniform_layout_cache:
+            self._uniform_layout_cache[key] = uniform_ragged_layout(
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                ragged_verify_mode=self._ragged_verify_mode,
+                model_runner=self.model_runner,
+                tier_num_reqs=global_num_reqs,
+            )
+        return self._uniform_layout_cache[key]
 
     def compute_confidence_tensor(
         self,
@@ -466,33 +478,37 @@ class AdaptiveVerifyPlanner:
         if (
             self._is_verify_all
             and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
-            and not self._profiling_enabled
+            and (
+                self._budget_planner is None
+                or self._budget_planner.forced_budget_frac is None
+            )
         ):
-            # Verify-all: the uniform layout (or None, past the captured grid)
-            # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
-            if key not in self._uniform_layout_cache:
-                self._uniform_layout_cache[key] = uniform_ragged_layout(
-                    bs=key[0],
-                    device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                    ragged_verify_mode=self._ragged_verify_mode,
-                    model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
-                )
-            return self._uniform_layout_cache[key]
+            return self._uniform_layout(
+                bs=int(req_pool_indices.shape[0]),
+                device=device,
+                global_num_reqs=global_num_reqs,
+            )
+        aligned_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+        local_bs = int(req_pool_indices.shape[0])
+        verify_floor = max(self._schedule_cfg.min_verify_len, 1)
+        full_budget = local_bs * (self.verify_num_draft_tokens - verify_floor)
+        if aligned_budget is not None and aligned_budget >= full_budget:
+            return self._uniform_layout(
+                bs=local_bs,
+                device=device,
+                global_num_reqs=global_num_reqs,
+            )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=aligned_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -500,13 +516,10 @@ class AdaptiveVerifyPlanner:
                 "the gathered hint and the local budget diverged"
             )
             if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-                return uniform_ragged_layout(
+                return self._uniform_layout(
                     bs=len(req_pool_indices),
                     device=device,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                    ragged_verify_mode=self._ragged_verify_mode,
-                    model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
+                    global_num_reqs=global_num_reqs,
                 )
             return None
         bs = int(verify_lens.shape[0])
