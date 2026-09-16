@@ -5,7 +5,7 @@ status: active
 last_rebuilt: '2026-09-16'
 base:
   branch: feat/pack/main
-  head_at_rebuild: 48e1f187bf
+  head_at_rebuild: 11c7f83062
 source:
   repository: xkernel-factory/sglang
   branch: feature/slo-aware-prefill-controller
@@ -100,7 +100,7 @@ components:
 - order: 20
   id: uniform-layout-dp-tier-preservation
   inclusion: feature_commit
-  integrated_commit: e82ccc05e6
+  integrated_commit: 071daadbd5
 rebase_notes:
 - The SLO configuration fields were assigned to the current schedule config namespace, and validation
   was moved into the current serving validation hook.
@@ -145,5 +145,5 @@ validation:
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
 backup_tag: backup/downstream-20260914/slo
-output_head: e82ccc05e6
+output_head: 071daadbd5
 layout_upload_backup_tag: backup/layout-upload-20260914/slo

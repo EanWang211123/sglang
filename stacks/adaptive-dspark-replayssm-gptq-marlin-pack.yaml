@@ -5,7 +5,7 @@ status: active
 last_rebuilt: '2026-09-16'
 base:
   branch: feat/adaptive_spec_dspark/main
-  head_at_rebuild: fe5297c62b
+  head_at_rebuild: f8ab245882
 components:
 - order: 1
   id: replayssm-dflash-dspark
@@ -28,7 +28,7 @@ components:
 - order: 4
   id: uniform-layout-dp-tier-preservation
   inclusion: merged_branch
-  integrated_commit: 48e1f187bf
+  integrated_commit: 11c7f83062
 merge_notes:
 - '2026-09-14: retained the existing pack history and merged updated adaptive DSpark, then PR #36683,
   then PR #35955. Subsequent DSpark field/format fixes were propagated by merge.'
@@ -61,5 +61,5 @@ validation:
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
 backup_tag: backup/downstream-20260914/pack
-output_head: 48e1f187bf
+output_head: 11c7f83062
 layout_upload_backup_tag: backup/layout-upload-20260914/pack

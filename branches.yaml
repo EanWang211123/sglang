@@ -142,7 +142,7 @@ branches:
   composition_base:
     branch: fix/fix-dspark-verlen-confict-tp-ranks
     head: b5f638520a0b8cf91950e26099c3ccee778d497d
-  remote_head: fe5297c62b
+  remote_head: f8ab245882
   manifest: stacks/dspark-adaptive.yaml
   summary: Deployable DSpark adaptive scheduling feature combining runtime gamma, TP-consistent verify
     budgets, batch-size-aware compact graph capture, graph-tier-aware budget selection, and online
@@ -171,8 +171,8 @@ branches:
   upstream_base: upstream/main
   composition_base:
     branch: feat/adaptive_spec_dspark/main
-    head: fe5297c62b
-  remote_head: 48e1f187bf
+    head: f8ab245882
+  remote_head: 11c7f83062
   manifest: stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml
   summary: Deployable development pack combining adaptive DSpark scheduling, ReplaySSM verification
     for hybrid GDN models, and GPTQ Marlin MoE BF16 plus TP act-order w2 scale fixes.
@@ -199,8 +199,8 @@ branches:
   upstream_base: upstream/main
   composition_base:
     branch: feat/pack/main
-    head: 48e1f187bf
-  remote_head: e82ccc05e6
+    head: 11c7f83062
+  remote_head: 071daadbd5
   manifest: stacks/xkernel-slo-aware-prefill-controller.yaml
   source:
     repository: xkernel-factory/sglang

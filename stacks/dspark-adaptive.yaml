@@ -111,5 +111,5 @@ validation:
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
 backup_tag: backup/downstream-20260914/dspark
-output_head: fe5297c62b
+output_head: f8ab245882
 layout_upload_backup_tag: backup/layout-upload-20260914/dspark
