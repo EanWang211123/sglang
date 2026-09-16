@@ -269,8 +269,9 @@ class DSparkVerifyPlanner:
         bs: int,
         device: torch.device,
         global_num_reqs: Optional[int],
+        tier_num_tokens: Optional[int] = None,
     ) -> Optional[RaggedVerifyLayout]:
-        key = (bs, global_num_reqs)
+        key = (bs, global_num_reqs, tier_num_tokens)
         if key not in self._uniform_layout_cache:
             self._uniform_layout_cache[key] = uniform_ragged_layout(
                 bs=bs,
@@ -279,6 +280,7 @@ class DSparkVerifyPlanner:
                 ragged_verify_mode=self._ragged_verify_mode,
                 model_runner=self.model_runner,
                 tier_num_reqs=global_num_reqs,
+                tier_num_tokens=tier_num_tokens,
             )
         return self._uniform_layout_cache[key]
 
@@ -482,6 +484,7 @@ class DSparkVerifyPlanner:
                 bs=int(req_pool_indices.shape[0]),
                 device=device,
                 global_num_reqs=global_num_reqs,
+                tier_num_tokens=dp_tier_num_tokens,
             )
         aligned_budget = self._budget_aligned_to_graph_tier(
             req_pool_indices=req_pool_indices,
@@ -497,6 +500,7 @@ class DSparkVerifyPlanner:
                 bs=local_bs,
                 device=device,
                 global_num_reqs=global_num_reqs,
+                tier_num_tokens=dp_tier_num_tokens,
             )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
@@ -515,6 +519,7 @@ class DSparkVerifyPlanner:
                     bs=len(req_pool_indices),
                     device=device,
                     global_num_reqs=global_num_reqs,
+                    tier_num_tokens=dp_tier_num_tokens,
                 )
             return None
         bs = int(verify_lens.shape[0])
@@ -780,6 +785,7 @@ def uniform_ragged_layout(
     ragged_verify_mode: RaggedVerifyMode,
     model_runner,
     tier_num_reqs: Optional[int] = None,
+    tier_num_tokens: Optional[int] = None,
 ) -> Optional[RaggedVerifyLayout]:
     tier_num_reqs = bs if tier_num_reqs is None else tier_num_reqs
     if ragged_layout_exceeds_captured_grid(
@@ -799,6 +805,7 @@ def uniform_ragged_layout(
         ragged_verify_mode=ragged_verify_mode,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_num_tokens=tier_num_tokens,
     )
     return RaggedVerifyLayout.from_verify_lens(
         verify_lens_cpu=verify_lens_cpu,
