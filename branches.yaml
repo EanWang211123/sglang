@@ -1,7 +1,7 @@
 version: 1
 repository: EanWang211123/sglang
 upstream_repository: sgl-project/sglang
-last_updated: '2026-09-14'
+last_updated: '2026-09-16'
 branches:
 - id: dspark-compact-ragged-verify
   name: fix/dspark-sps-profiler-verify-all
@@ -133,6 +133,48 @@ branches:
     last_remote_update: '2026-09-14'
   consumed_by:
   - feat/pack/main
+- id: dflash-compact
+  name: feat/adaptive_spec_dspark/dflash_compact
+  remote: origin
+  type: maintained_feature
+  status: active
+  upstream_base: upstream/main
+  composition_base:
+    branch: upstream/main
+    head: 69777c4d36c05a061ae53ffb5b0627ff64218e76
+  remote_head: 7abdda01800818f68616a36cf492e5efdd05ec97
+  summary: >-
+    Add adaptive compact verification to DFlash while keeping the focused DFlash adaptation
+    independent from the shared DSpark and hybrid-GDN fixes in PR #38897.
+  maintenance:
+    force_push_allowed: true
+    last_remote_update: '2026-09-16'
+  consumed_by:
+  - dflash_compact_fixin
+- id: dflash-compact-fixin
+  name: dflash_compact_fixin
+  remote: origin
+  type: maintained_feature
+  status: active
+  upstream_base: upstream/main
+  composition_base:
+    branch: feat/adaptive_spec_dspark/dflash_compact
+    head: 7abdda01800818f68616a36cf492e5efdd05ec97
+  remote_head: fe6776356964fb4e6ae116b19ed862ef4551519a
+  manifest: stacks/dflash-compact-fixin.yaml
+  summary: >-
+    Combine the isolated DFlash adaptive compact implementation with the complete PR #38897
+    profiler-budget, ragged mRoPE, and hybrid-GDN target-verify fixes.
+  maintenance:
+    force_push_allowed: true
+    last_rebuilt: '2026-09-16'
+    last_remote_update: '2026-09-16'
+  dependencies:
+  - branch: feat/adaptive_spec_dspark/dflash_compact
+    relation: direct_base
+  - branch: fix/dspark-sps-profiler-verify-all
+    relation: merged_branch
+    integrated_commit: fe6776356964fb4e6ae116b19ed862ef4551519a
 - id: dspark-adaptive
   name: feat/adaptive_spec_dspark/main
   remote: origin

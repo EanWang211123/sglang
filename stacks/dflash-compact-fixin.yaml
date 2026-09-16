@@ -1,0 +1,36 @@
+version: 1
+name: dflash-compact-fixin
+output_branch: dflash_compact_fixin
+status: active
+last_rebuilt: '2026-09-16'
+base:
+  branch: feat/adaptive_spec_dspark/dflash_compact
+  head_at_rebuild: 7abdda01800818f68616a36cf492e5efdd05ec97
+components:
+- order: 1
+  id: dspark-compact-ragged-verify
+  source_branch: fix/dspark-sps-profiler-verify-all
+  source_pr: https://github.com/sgl-project/sglang/pull/38897
+  inclusion: merged_branch
+  integrated_head: 6c5c125dca98446391486c6920a59a99e783ac03
+  integrated_commit: fe6776356964fb4e6ae116b19ed862ef4551519a
+merge_notes:
+- The DFlash-only branch remains at 7abdda0180; the three prior copied fixes were removed from that
+  branch before this integration branch was created.
+- >-
+  The planner conflict keeps DFlash's shared AdaptiveVerifyPlanner interface and adopts PR #38897's
+  forced-budget and full-budget uniform-layout decisions.
+- Removed the obsolete profiling_enabled planner state so SPS recording remains observability-only
+  and layout selection follows the actual forced budget pin.
+- Kept the PR's layer-aware get_indexer_metadata implementation and removed the duplicate generic
+  delegation produced by the automatic merge.
+validation:
+  completed:
+  - Python compileall for all changed runtime files
+  - ruff check for all changed files, ignoring the test file's pre-existing E402 registration layout
+  - git diff --check
+  - PR #38897 head and the DFlash compact base are both parents of the merge result
+  unavailable:
+  - Targeted pytest collection on Windows because SGLang imports the Linux-only resource module
+  - GPU verification of DFlash compact profiling and hybrid-GDN ragged verification
+output_head: fe6776356964fb4e6ae116b19ed862ef4551519a
