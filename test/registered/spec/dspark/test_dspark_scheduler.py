@@ -511,6 +511,25 @@ def _fake_model_runner(capture_num_tokens, max_bs):
 
 
 class TestBudgetTierSelection(CustomTestCase):
+    def test_uniform_layout_uses_dp_tier_hint(self):
+        from sglang.srt.speculative.dspark_components.dspark_planner import (
+            uniform_ragged_layout,
+        )
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        model_runner = _fake_model_runner([8, 16, 24, 40, 56, 80], max_bs=128)
+        layout = uniform_ragged_layout(
+            bs=4,
+            device=torch.device("cpu"),
+            verify_num_draft_tokens=8,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            model_runner=model_runner,
+            tier_num_reqs=9,
+            tier_num_tokens=56,
+        )
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.graph_num_tokens, 56)
+
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
         from sglang.srt.speculative.dspark_components.dspark_planner import (
             verify_layout_graph_num_tokens_floor,
