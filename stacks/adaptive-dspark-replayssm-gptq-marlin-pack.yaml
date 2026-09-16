@@ -2,10 +2,10 @@ version: 1
 name: adaptive-dspark-replayssm-gptq-marlin-pack
 output_branch: feat/pack/main
 status: active
-last_rebuilt: '2026-09-14'
+last_rebuilt: '2026-09-16'
 base:
   branch: feat/adaptive_spec_dspark/main
-  head_at_rebuild: 9b5515cd617b7e9267f1ae068d0290602784b1b7
+  head_at_rebuild: fe5297c62b
 components:
 - order: 1
   id: replayssm-dflash-dspark
@@ -25,6 +25,10 @@ components:
   id: ragged-layout-nonblocking-host-construction
   inclusion: feature_commit
   integrated_commit: d56eaf7e0ef3bc80ae8de0cc93bd5c5fe8945c04
+- order: 4
+  id: uniform-layout-dp-tier-preservation
+  inclusion: merged_branch
+  integrated_commit: 48e1f187bf
 merge_notes:
 - '2026-09-14: retained the existing pack history and merged updated adaptive DSpark, then PR #36683,
   then PR #35955. Subsequent DSpark field/format fixes were propagated by merge.'
@@ -57,5 +61,5 @@ validation:
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
 backup_tag: backup/downstream-20260914/pack
-output_head: d56eaf7e0ef3bc80ae8de0cc93bd5c5fe8945c04
+output_head: 48e1f187bf
 layout_upload_backup_tag: backup/layout-upload-20260914/pack

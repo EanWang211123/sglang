@@ -2,10 +2,10 @@ version: 1
 name: xkernel-slo-aware-prefill-controller
 output_branch: xkernel/slo-aware-prefill-controller
 status: active
-last_rebuilt: '2026-09-14'
+last_rebuilt: '2026-09-16'
 base:
   branch: feat/pack/main
-  head_at_rebuild: d56eaf7e0ef3bc80ae8de0cc93bd5c5fe8945c04
+  head_at_rebuild: 48e1f187bf
 source:
   repository: xkernel-factory/sglang
   branch: feature/slo-aware-prefill-controller
@@ -97,6 +97,10 @@ components:
   id: ragged-layout-nonblocking-host-construction
   inclusion: feature_commit
   integrated_commit: 5ac9a8d74e1f0cc55fdc790d29ba30129d0bcd7d
+- order: 20
+  id: uniform-layout-dp-tier-preservation
+  inclusion: feature_commit
+  integrated_commit: e82ccc05e6
 rebase_notes:
 - The SLO configuration fields were assigned to the current schedule config namespace, and validation
   was moved into the current serving validation hook.
@@ -141,5 +145,5 @@ validation:
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
 backup_tag: backup/downstream-20260914/slo
-output_head: 5ac9a8d74e1f0cc55fdc790d29ba30129d0bcd7d
+output_head: e82ccc05e6
 layout_upload_backup_tag: backup/layout-upload-20260914/slo

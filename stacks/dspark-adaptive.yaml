@@ -2,7 +2,7 @@ version: 1
 name: dspark-adaptive
 output_branch: feat/adaptive_spec_dspark/main
 status: active
-last_rebuilt: '2026-09-14'
+last_rebuilt: '2026-09-16'
 base:
   branch: upstream/main
   head_at_rebuild: 783af667fb
@@ -72,6 +72,10 @@ components:
   id: ragged-layout-nonblocking-host-construction
   inclusion: feature_commit
   integrated_commit: 9b5515cd617b7e9267f1ae068d0290602784b1b7
+- order: 14
+  id: uniform-layout-dp-tier-preservation
+  inclusion: feature_commit
+  integrated_commit: fe5297c62b
 rebase_notes:
 - The 2026-09-07 rebuild consolidated the startup profiler follow-up fixes into b62ac30bb6.
 - 'The old compact prefill-plan race commit was omitted because upstream/main contains the official
@@ -107,5 +111,5 @@ validation:
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
 backup_tag: backup/downstream-20260914/dspark
-output_head: 9b5515cd617b7e9267f1ae068d0290602784b1b7
+output_head: fe5297c62b
 layout_upload_backup_tag: backup/layout-upload-20260914/dspark
