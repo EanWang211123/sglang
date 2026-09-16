@@ -484,7 +484,6 @@ class DSparkVerifyPlanner:
                 bs=int(req_pool_indices.shape[0]),
                 device=device,
                 global_num_reqs=global_num_reqs,
-                tier_num_tokens=dp_tier_num_tokens,
             )
         aligned_budget = self._budget_aligned_to_graph_tier(
             req_pool_indices=req_pool_indices,
