@@ -1,6 +1,6 @@
 version: 1
 name: dflash-compact-fixin
-output_branch: dflash_compact_fixin
+output_branch: feat/adaptive_spec_dspark/dflash_compact_fixin
 status: active
 last_rebuilt: '2026-09-16'
 base:

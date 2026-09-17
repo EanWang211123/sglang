@@ -150,9 +150,9 @@ branches:
     force_push_allowed: true
     last_remote_update: '2026-09-16'
   consumed_by:
-  - dflash_compact_fixin
+  - feat/adaptive_spec_dspark/dflash_compact_fixin
 - id: dflash-compact-fixin
-  name: dflash_compact_fixin
+  name: feat/adaptive_spec_dspark/dflash_compact_fixin
   remote: origin
   type: maintained_feature
   status: active

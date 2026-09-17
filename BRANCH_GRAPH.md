@@ -31,8 +31,8 @@ flowchart TD
     click branch_replayssm_dflash_dspark "https://github.com/sgl-project/sglang/pull/36683"
     branch_dflash_compact["Maintained feature / active<br/>feat/adaptive_spec_dspark/dflash_compact<br/>7abdda0180"]
     click branch_dflash_compact "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/dflash_compact"
-    branch_dflash_compact_fixin["Maintained feature / active<br/>dflash_compact_fixin<br/>fe67763569"]
-    click branch_dflash_compact_fixin "https://github.com/EanWang211123/sglang/tree/dflash_compact_fixin"
+    branch_dflash_compact_fixin["Maintained feature / active<br/>feat/adaptive_spec_dspark/dflash_compact_fixin<br/>fe67763569"]
+    click branch_dflash_compact_fixin "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/dflash_compact_fixin"
     branch_dspark_adaptive["Maintained feature / active<br/>feat/adaptive_spec_dspark/main<br/>f8ab245882"]
     click branch_dspark_adaptive "https://github.com/EanWang211123/sglang/tree/feat/adaptive_spec_dspark/main"
     branch_adaptive_dspark_replayssm_gptq_marlin_pack["Maintained feature / active<br/>feat/pack/main<br/>11c7f83062"]
@@ -87,7 +87,7 @@ flowchart LR
     stack_dflash_compact_fixin_1["dspark-compact-ragged-verify<br/>merged_branch<br/>fe67763569"]
     stack_base_dflash_compact_fixin --> stack_dflash_compact_fixin_1
     click stack_dflash_compact_fixin_1 "https://github.com/sgl-project/sglang/pull/38897"
-    stack_output_dflash_compact_fixin["dflash_compact_fixin<br/>active"]
+    stack_output_dflash_compact_fixin["feat/adaptive_spec_dspark/dflash_compact_fixin<br/>active"]
     stack_dflash_compact_fixin_1 --> stack_output_dflash_compact_fixin
 ```
 

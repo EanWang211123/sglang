@@ -20,7 +20,7 @@ branch.
 | `fix/gptq-marlin-moe-bf16-w2-scales` | Community PR | Fix BF16 and TP act-order w2 scale handling in GPTQ Marlin MoE. |
 | `feat/ssm-ring-replay/main` | Community PR | Support ReplaySSM verification for DFlash and DSpark on hybrid GDN models. |
 | `feat/adaptive_spec_dspark/dflash_compact` | Maintained feature | Keep the focused adaptive compact DFlash implementation independent from shared DSpark/GDN fixes. |
-| `dflash_compact_fixin` | Maintained feature | Merge PR #38897 into the isolated adaptive compact DFlash branch. |
+| `feat/adaptive_spec_dspark/dflash_compact_fixin` | Maintained feature | Merge PR #38897 into the isolated adaptive compact DFlash branch. |
 | `feat/adaptive_spec_dspark/main` | Maintained feature | Integrate DSpark runtime gamma, TP consistency, batch-aware adaptive graph tiers, and online startup cost profiling. |
 | `feat/pack/main` | Maintained feature | Combine adaptive DSpark, ReplaySSM, and GPTQ Marlin MoE BF16 fixes in one development branch. |
 | `xkernel/slo-aware-prefill-controller` | Maintained feature | Rebase xkernel's SLO-aware prefill controller onto `feat/pack/main`. |
