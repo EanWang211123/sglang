@@ -1,7 +1,7 @@
 version: 1
 repository: EanWang211123/sglang
 upstream_repository: sgl-project/sglang
-last_updated: '2026-09-16'
+last_updated: 2026-09-21
 branches:
 - id: dspark-compact-ragged-verify
   name: fix/dspark-sps-profiler-verify-all
@@ -13,13 +13,13 @@ branches:
     number: 38897
     url: https://github.com/sgl-project/sglang/pull/38897
     title: Fix DSpark compact SPS profiling and ragged target verification
-  remote_head: 6c5c125dca98446391486c6920a59a99e783ac03
+  remote_head: 41d8f7062e9e3bd39590c97da29e39e431ada387
   summary: Honor profiler-pinned verify budgets without an SPS table, map compact speculative mRoPE
     positions by request, and make hybrid GDN target verify handle packed ragged layouts and CUDA
     Graph padding safely.
   maintenance:
     force_push_allowed: true
-    last_remote_update: '2026-09-14'
+    last_remote_update: '2026-09-21'
   validation:
     status: passed
     date: 2026-09-11
@@ -49,14 +49,14 @@ branches:
     number: 29506
     url: https://github.com/sgl-project/sglang/pull/29506
     title: '[FEAT][SpecDecode] Add DP attention support for DFLASH speculative decoding'
-  remote_head: 33f020fe8deae0fe4ab27fe8297b560bfffce9ac
+  remote_head: efddaf1dc1398e585929a43dab3ed1e1da7b01f6
   summary: Run the DFlash draft and speculative state synchronization inside each DP rank's attention-TP
     group, keep IDLE ranks in full-TP target verify, align the DP-local CUDA graph path, and trim
     EP-padded target hidden rows.
   maintenance:
     force_push_allowed: true
-    last_rebased: 2026-09-01
-    last_remote_update: '2026-09-14'
+    last_rebased: 2026-09-21
+    last_remote_update: '2026-09-21'
   validation:
     status: passed
     date: 2026-09-01
@@ -125,12 +125,12 @@ branches:
     number: 36683
     url: https://github.com/sgl-project/sglang/pull/36683
     title: '[Spec] Support ReplaySSM spec-verify for DFlash and DSPARK on hybrid GDN models'
-  remote_head: 5c07ac58bba76390b9a01cca5001894539e2a5ec
+  remote_head: 532c68914d2387df1212e71a960fea778d2af1cc
   summary: Connect DFlash and DSPARK hybrid GDN verification to ReplaySSM's fold-every-commit state
     path while preserving non-ReplaySSM behavior.
   maintenance:
     force_push_allowed: true
-    last_remote_update: '2026-09-14'
+    last_remote_update: '2026-09-21'
   consumed_by:
   - feat/pack/main
 - id: dflash-compact
@@ -141,14 +141,14 @@ branches:
   upstream_base: upstream/main
   composition_base:
     branch: upstream/main
-    head: 69777c4d36c05a061ae53ffb5b0627ff64218e76
-  remote_head: 7abdda01800818f68616a36cf492e5efdd05ec97
+    head: 176dbcb85d
+  remote_head: c98b6a99c4165bf7ef93b8058613c2c063e0515f
   summary: >-
     Add adaptive compact verification to DFlash while keeping the focused DFlash adaptation
     independent from the shared DSpark and hybrid-GDN fixes in PR #38897.
   maintenance:
     force_push_allowed: true
-    last_remote_update: '2026-09-16'
+    last_remote_update: '2026-09-21'
   consumed_by:
   - feat/adaptive_spec_dspark/dflash_compact_fixin
 - id: dflash-compact-fixin
@@ -159,22 +159,22 @@ branches:
   upstream_base: upstream/main
   composition_base:
     branch: feat/adaptive_spec_dspark/dflash_compact
-    head: 7abdda01800818f68616a36cf492e5efdd05ec97
-  remote_head: fe6776356964fb4e6ae116b19ed862ef4551519a
+    head: c98b6a99c4165bf7ef93b8058613c2c063e0515f
+  remote_head: 749fcd2142e76230f46fff9df823e977eec74603
   manifest: stacks/dflash-compact-fixin.yaml
   summary: >-
     Combine the isolated DFlash adaptive compact implementation with the complete PR #38897
     profiler-budget, ragged mRoPE, and hybrid-GDN target-verify fixes.
   maintenance:
     force_push_allowed: true
-    last_rebuilt: '2026-09-16'
-    last_remote_update: '2026-09-16'
+    last_rebuilt: '2026-09-21'
+    last_remote_update: '2026-09-21'
   dependencies:
   - branch: feat/adaptive_spec_dspark/dflash_compact
     relation: direct_base
   - branch: fix/dspark-sps-profiler-verify-all
     relation: merged_branch
-    integrated_commit: fe6776356964fb4e6ae116b19ed862ef4551519a
+    integrated_commit: 749fcd2142e76230f46fff9df823e977eec74603
 - id: dspark-adaptive
   name: feat/adaptive_spec_dspark/main
   remote: origin
@@ -184,7 +184,7 @@ branches:
   composition_base:
     branch: fix/fix-dspark-verlen-confict-tp-ranks
     head: b5f638520a0b8cf91950e26099c3ccee778d497d
-  remote_head: f8ab245882
+  remote_head: 9ec2f85e0d3558c30fb631dd237cc02aee7cfb38
   manifest: stacks/dspark-adaptive.yaml
   summary: Deployable DSpark adaptive scheduling feature combining runtime gamma, TP-consistent verify
     budgets, batch-size-aware compact graph capture, graph-tier-aware budget selection, and online
@@ -192,8 +192,8 @@ branches:
   maintenance:
     force_push_allowed: true
     last_rebased: 2026-09-01
-    last_remote_update: '2026-09-16'
-    last_rebuilt: '2026-09-16'
+    last_remote_update: '2026-09-21'
+    last_rebuilt: '2026-09-21'
   dependencies:
   - branch: fix/fix-dspark-verlen-confict-tp-ranks
     relation: direct_base
@@ -202,7 +202,7 @@ branches:
     integrated_commit: 4a7c602a7b
   - branch: fix/dspark-sps-profiler-verify-all
     relation: merged_branch
-    integrated_commit: 536fed5ef8ce2df7baf13df27f68c5b7d8cb917f
+    integrated_commit: 9ec2f85e0d3558c30fb631dd237cc02aee7cfb38
   consumed_by:
   - feat/pack/main
 - id: adaptive-dspark-replayssm-gptq-marlin-pack
@@ -213,21 +213,21 @@ branches:
   upstream_base: upstream/main
   composition_base:
     branch: feat/adaptive_spec_dspark/main
-    head: f8ab245882
-  remote_head: 11c7f83062
+    head: 9ec2f85e0d3558c30fb631dd237cc02aee7cfb38
+  remote_head: 236535af21eae55c78771ffdfafcb38d1b4da1b9
   manifest: stacks/adaptive-dspark-replayssm-gptq-marlin-pack.yaml
   summary: Deployable development pack combining adaptive DSpark scheduling, ReplaySSM verification
     for hybrid GDN models, and GPTQ Marlin MoE BF16 plus TP act-order w2 scale fixes.
   maintenance:
     force_push_allowed: true
-    last_rebuilt: '2026-09-16'
-    last_remote_update: '2026-09-16'
+    last_rebuilt: '2026-09-21'
+    last_remote_update: '2026-09-21'
   dependencies:
   - branch: feat/adaptive_spec_dspark/main
     relation: direct_base
   - branch: feat/ssm-ring-replay/main
     relation: merged_branch
-    integrated_commit: eb57fc87b1e7084a140b14da409d7ba22e9b9bd1
+    integrated_commit: 236535af21eae55c78771ffdfafcb38d1b4da1b9
   - branch: fix/gptq-marlin-moe-bf16-w2-scales
     relation: merged_branch
     integrated_commit: 635ca6d8162152819b0429ade60ced63c1fa8fe8
@@ -241,8 +241,8 @@ branches:
   upstream_base: upstream/main
   composition_base:
     branch: feat/pack/main
-    head: 11c7f83062
-  remote_head: 071daadbd5
+    head: 236535af21eae55c78771ffdfafcb38d1b4da1b9
+  remote_head: d89b7d9d1080dca8d34e16f08eda7b336bb8b211
   manifest: stacks/xkernel-slo-aware-prefill-controller.yaml
   source:
     repository: xkernel-factory/sglang
@@ -254,8 +254,8 @@ branches:
   maintenance:
     force_push_allowed: true
     last_rebased: 2026-09-07
-    last_remote_update: '2026-09-16'
-    last_rebuilt: '2026-09-16'
+    last_remote_update: '2026-09-21'
+    last_rebuilt: '2026-09-21'
   dependencies:
   - branch: feat/pack/main
     relation: direct_base

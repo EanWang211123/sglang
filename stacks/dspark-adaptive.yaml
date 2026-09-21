@@ -2,10 +2,10 @@ version: 1
 name: dspark-adaptive
 output_branch: feat/adaptive_spec_dspark/main
 status: active
-last_rebuilt: '2026-09-16'
+last_rebuilt: '2026-09-21'
 base:
   branch: upstream/main
-  head_at_rebuild: 783af667fb
+  head_at_rebuild: 176dbcb85d
 components:
 - order: 1
   id: dspark-tp-budget-sync
@@ -58,8 +58,8 @@ components:
   source_branch: fix/dspark-sps-profiler-verify-all
   source_pr: https://github.com/sgl-project/sglang/pull/38897
   inclusion: merged_branch
-  integrated_head: 6c5c125dca98446391486c6920a59a99e783ac03
-  integrated_commit: 536fed5ef8ce2df7baf13df27f68c5b7d8cb917f
+  integrated_head: 41d8f7062e9e3bd39590c97da29e39e431ada387
+  integrated_commit: 9ec2f85e0d3558c30fb631dd237cc02aee7cfb38
 - order: 11
   id: dspark-profile-config-field-migration
   inclusion: feature_commit
@@ -96,7 +96,7 @@ rebase_notes:
   synchronizations are outside this patch.'
 validation:
   completed:
-  - 14 CPU ragged-layout, merged-planner budget-path and config-field tests (package initialization
+  - 16 CPU ragged-layout, merged-planner budget-path and config-field tests (package initialization
     and Triton decorators bypassed; actual Torch CPU paths used)
   - black check on conflict-resolved Python files
   - Python compileall for python/sglang/srt
@@ -110,6 +110,6 @@ validation:
   - full pytest on the current Windows host because the Linux resource module is unavailable
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
-backup_tag: backup/downstream-20260914/dspark
-output_head: f8ab245882
+backup_tag: backup/rebase-20260921/dspark-main
+output_head: 9ec2f85e0d3558c30fb631dd237cc02aee7cfb38
 layout_upload_backup_tag: backup/layout-upload-20260914/dspark

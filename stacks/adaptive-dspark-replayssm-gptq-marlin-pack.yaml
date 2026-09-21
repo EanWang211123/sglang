@@ -2,18 +2,18 @@ version: 1
 name: adaptive-dspark-replayssm-gptq-marlin-pack
 output_branch: feat/pack/main
 status: active
-last_rebuilt: '2026-09-16'
+last_rebuilt: '2026-09-21'
 base:
   branch: feat/adaptive_spec_dspark/main
-  head_at_rebuild: f8ab245882
+  head_at_rebuild: 9ec2f85e0d3558c30fb631dd237cc02aee7cfb38
 components:
 - order: 1
   id: replayssm-dflash-dspark
   source_branch: feat/ssm-ring-replay/main
   source_pr: https://github.com/sgl-project/sglang/pull/36683
   inclusion: merged_branch
-  integrated_head: 5c07ac58bba76390b9a01cca5001894539e2a5ec
-  integrated_commit: eb57fc87b1e7084a140b14da409d7ba22e9b9bd1
+  integrated_head: 532c68914d2387df1212e71a960fea778d2af1cc
+  integrated_commit: 236535af21eae55c78771ffdfafcb38d1b4da1b9
 - order: 2
   id: gptq-marlin-moe-bf16-w2-scales
   source_branch: fix/gptq-marlin-moe-bf16-w2-scales
@@ -29,6 +29,10 @@ components:
   id: uniform-layout-dp-tier-preservation
   inclusion: merged_branch
   integrated_commit: 11c7f83062
+- order: 5
+  id: current-main-stack-refresh
+  inclusion: merged_branch
+  integrated_commit: 236535af21eae55c78771ffdfafcb38d1b4da1b9
 merge_notes:
 - '2026-09-14: retained the existing pack history and merged updated adaptive DSpark, then PR #36683,
   then PR #35955. Subsequent DSpark field/format fixes were propagated by merge.'
@@ -49,7 +53,7 @@ validation:
   completed:
   - 12 ReplaySSM commit/configuration CPU tests using the existing isolated harness
   - 4 GPTQ BF16/TP/act-order CPU tests using the existing isolated harness
-  - 14 ragged/planner/config CPU tests on the final downstream tree
+  - 16 ragged/planner/config CPU tests on the final downstream tree
   - Python compileall, black, ruff F821/F823 on conflict-resolved files
   - git diff --check against the latest GPTQ PR head
   - 'latest adaptive DSpark, PR #36683, PR #35955 and previous pack head are ancestors of the output'
@@ -60,6 +64,6 @@ validation:
   - Linux/CUDA serving, graph replay and model integration tests on this Windows host
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
-backup_tag: backup/downstream-20260914/pack
-output_head: 11c7f83062
+backup_tag: backup/rebase-20260921/pack-main
+output_head: 236535af21eae55c78771ffdfafcb38d1b4da1b9
 layout_upload_backup_tag: backup/layout-upload-20260914/pack

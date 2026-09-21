@@ -2,10 +2,10 @@ version: 1
 name: xkernel-slo-aware-prefill-controller
 output_branch: xkernel/slo-aware-prefill-controller
 status: active
-last_rebuilt: '2026-09-16'
+last_rebuilt: '2026-09-21'
 base:
   branch: feat/pack/main
-  head_at_rebuild: 11c7f83062
+  head_at_rebuild: 236535af21eae55c78771ffdfafcb38d1b4da1b9
 source:
   repository: xkernel-factory/sglang
   branch: feature/slo-aware-prefill-controller
@@ -101,6 +101,10 @@ components:
   id: uniform-layout-dp-tier-preservation
   inclusion: feature_commit
   integrated_commit: 071daadbd5
+- order: 21
+  id: current-main-pack-refresh
+  inclusion: merged_branch
+  integrated_commit: d89b7d9d1080dca8d34e16f08eda7b336bb8b211
 rebase_notes:
 - The SLO configuration fields were assigned to the current schedule config namespace, and validation
   was moved into the current serving validation hook.
@@ -130,7 +134,7 @@ rebase_notes:
 validation:
   completed:
   - 27 SLO controller unit tests
-  - 12 ReplaySSM, 4 GPTQ and 14 ragged/planner/config CPU tests on the final downstream tree
+  - 12 ReplaySSM, 4 GPTQ and 16 ragged/planner/config CPU tests on the final downstream tree
   - black check on conflict-resolved Python files
   - Python compileall for python/sglang/srt
   - ruff F821/F823 on conflict-resolved files
@@ -144,6 +148,6 @@ validation:
     dependencies are unavailable
   - GPU verification that this patch resolves the reported DeepSeek-V4 DSPARK DP4/TP4 compact overlap
     hang.
-backup_tag: backup/downstream-20260914/slo
-output_head: 071daadbd5
+backup_tag: backup/rebase-20260921/xkernel-slo
+output_head: d89b7d9d1080dca8d34e16f08eda7b336bb8b211
 layout_upload_backup_tag: backup/layout-upload-20260914/slo
